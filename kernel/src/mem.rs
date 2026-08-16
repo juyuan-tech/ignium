@@ -147,12 +147,35 @@ impl BuddyAllocator {
             m.order = MAX_ORDER as u8;
             m.used = true; // 永久占用,永不出链
         }
-        // 整区按 order-12 块入链。
+        // 只把**完整落在 real_count 内**的块入链(HIGH#1):尾部
+        // 跨入补齐页的"半块"绝不出现在空闲链表 —— 否则分配该块会
+        // 把超出物理 RAM 的补齐页交给使用者(自检前的静默损坏源)。
         let mut idx = 0usize;
-        while idx < padded {
+        while idx + order_size <= count {
             self.push(idx, MAX_ORDER);
             idx += order_size;
         }
+    }
+
+    /// 预留一段物理区间(如 FDT):标记为永久占用,分配器永不触碰,
+    /// 释放也会被拒绝。
+    ///
+    /// # Safety
+    /// `addr`/`size` 必须在分配区范围内;重复预留安全(幂等)。
+    pub unsafe fn reserve_region(&mut self, addr: usize, size: usize) -> Result<(), ()> {
+        let start = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let end = (addr + size) / PAGE_SIZE * PAGE_SIZE;
+        let region_end = self.base + self.real_count * PAGE_SIZE;
+        if start < self.base || end > region_end || start >= end {
+            return Err(());
+        }
+        for i in ((start - self.base) / PAGE_SIZE)..((end - self.base) / PAGE_SIZE) {
+            let m = self.meta(i);
+            // order = 0xFF 哨兵:free() 的 order>MAX_ORDER 检查直接拒绝。
+            m.order = u8::MAX;
+            m.used = true;
+        }
+        Ok(())
     }
 
     /// 分配一个 `order` 阶块,返回物理地址;无足够内存返回 None。
@@ -292,9 +315,16 @@ pub fn alloc_pages(order: usize) -> Option<usize> {
 ///
 /// # 契约
 /// `addr` 必须是 `alloc_pages` 原样返回的地址;其他输入(内页、
-/// 未分配页、越界页)返回 Err。
+/// 未分配页、预留区、越界页)返回 Err。
 pub fn free_pages(addr: usize) -> Result<(), ()> {
     allocator().free(addr)
+}
+
+/// 预留物理区间(永久占用,分配器永不触碰)。
+///
+/// 用于保护引导器数据结构(如 FDT)等必须在分配区内的保留区域。
+pub fn reserve_region(addr: usize, size: usize) -> Result<(), ()> {
+    unsafe { allocator().reserve_region(addr, size) }
 }
 
 /// 分配器自检:验证分配/释放/合并/对齐,失败返回错误描述。

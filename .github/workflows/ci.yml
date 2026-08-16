@@ -34,8 +34,8 @@ jobs:
       # 启动冒烟:跑满 10s 收集完整输出,断言:
       # 1) "M0: boot ok"(成功启动)
       # 2) "buddy allocator selftest ok"(物理内存分配器自检通过)
-      # 3) "uptime:"(定时器中断 + sret 恢复链路存活 —— 否则定时器
-      #    静默失效也会被放行,pro 审计 #8)
+      # 3) >= 2 条 "uptime:"(定时器中断持续存活;单条可能是
+      #    "第一跳后定时器死亡"的假阳性,pro 审计 #6)
       # 4) 无 "KERNEL PANIC"/"TRAP:"(启动后无故障)
       - name: Boot test in QEMU
         run: |
@@ -43,5 +43,5 @@ jobs:
           -kernel target/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-ci.log 2>&1 || true
           grep -q "M0: boot ok" /tmp/ignium-ci.log
           grep -q "buddy allocator selftest ok" /tmp/ignium-ci.log
-          grep -q "uptime:" /tmp/ignium-ci.log
+          test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log

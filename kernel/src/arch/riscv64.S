@@ -36,34 +36,34 @@
 .align 4                    # stvec 要求 4 字节对齐(直接模式下低 2 位必须为 0)
 .globl trap_vector
 trap_vector:
-    # 1) 重建内核 gp(H1):被中断的上下文(未来用户态)可能持有任意
-    #    gp;后续任何可被链接器松弛成 gp 相对的访存(la 等)与
-    #    trap_handler 的全局访问都必须落在内核 gp 上。
-    #    norelax 防止本指令自身被松弛为 gp 相对寻址(变成 no-op)。
-    .option norelax
-    la gp, __global_pointer$
-    .option relax
-    # 2) t6 ← 陷阱栈顶(sscratch),被中断的 t6 暂存于 sscratch。
+    # t6 ← 陷阱栈顶/外层帧底(sscratch),被中断的 t6 暂存于 sscratch。
     csrrw t6, sscratch, t6
-    # 3) 嵌套检测(H2):正常状态下 sscratch == 陷阱栈顶;若为帧底
-    #    (handler 活跃),直接停机 —— 不做栈上压帧(嵌套帧会覆盖
-    #    外层 handler 活跃栈)。可恢复嵌套陷阱是 M1+ 工作(需
-    #    per-hart 应急栈),当前"嵌套即停机"是明确且安全的语义。
-    la t0, _trap_stack_top
-    bne t6, t0, 4f
     # 在陷阱栈上预留帧(t6 = 帧基址)。
     addi t6, t6, -TRAP_FRAME_SIZE
-    # 先保存原始 t0(t0 即将被用作临时寄存器)。
+    # 先保存原始 t0(t0 即将被用作临时寄存器;顺序至关重要,
+    # 任何"先 clobber 后保存"都会使 dump 显示假值)。
     sd t0, 4*8(t6)
     # 取出被中断的 t6(暂存在 sscratch)并写入帧槽 30。
     csrr t0, sscratch
     sd t0, 30*8(t6)
-    # 更新陷阱栈顶 = 本帧底:嵌套陷阱将向下压新帧(写入被限制在
-    # 陷阱栈内,不会破坏任意内存)。
+    # 嵌套检测(H2):第一层陷阱的帧底 == 陷阱栈顶 - 帧长。
+    # 若不等 → handler 已活跃(第二层 trap)→ 停机。此时帧写入
+    # 位置在外层 handler 活跃栈上方,无重叠;外层将停机,无害。
+    # 只用已入帧的 t0(不能再用其他未保存寄存器)。
+    la t0, _trap_stack_top
+    addi t0, t0, -TRAP_FRAME_SIZE
+    bne t6, t0, 4f
+    # 保存被中断的 gp,然后重载内核 gp(H1):此后任何可被松弛成
+    # gp 相对的访存与 trap_handler 的全局访问都落在内核 gp 上;
+    # 恢复路径会把被中断的 gp 还给原上下文。norelax 防自松弛。
+    sd gp, 2*8(t6)
+    .option norelax
+    la gp, __global_pointer$
+    .option relax
+    # 更新陷阱栈顶 = 本帧底(供下一层嵌套检测使用)。
     csrw sscratch, t6
     sd ra, 0*8(t6)
     sd sp, 1*8(t6)
-    sd gp, 2*8(t6)
     sd tp, 3*8(t6)
     sd t1, 5*8(t6)
     sd t2, 6*8(t6)

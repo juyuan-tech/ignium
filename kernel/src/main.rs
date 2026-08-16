@@ -56,6 +56,12 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     );
     // 物理内存初始化 + 自检(须在 irq_enable 之前:分配器暂非并发安全)。
     mem::init();
+    // 预留 FDT 区域(HIGH#2):OpenSBI 把 FDT 放在可分配区内,
+    // 不预留会被未来的页表/堆分配覆盖。M1.5 解析 FDT 后按实际
+    // 大小预留(当前按保守 1MB)。
+    if mem::reserve_region(fdt as usize, 1024 * 1024).is_err() {
+        warn!("failed to reserve FDT region at {:#x}", fdt as usize);
+    }
     match mem::self_test() {
         Ok(()) => info!(
             "M1: buddy allocator selftest ok ({} KiB managed)",

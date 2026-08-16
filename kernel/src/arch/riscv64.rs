@@ -56,6 +56,7 @@ const CS_SSTATUS: usize = 32;
 const CS_SEPC: usize = 33;
 const CS_SCAUSE: usize = 34;
 const CS_STVAL: usize = 35;
+// 36 个槽 = 31 GPR + 4 CSR + 1 个未用槽(索引 31,对齐填充;LOW#8)。
 const TRAP_FRAME_WORDS: usize = 36;
 
 // 编译期锁定帧尺寸:riscv64.S 用 .equ TRAP_FRAME_SIZE, 288 与之对应
@@ -143,20 +144,23 @@ pub fn cpu_state() -> CpuState {
 /// 使用显式立即数形式 `csrci`(而非 `csrc` + 立即数):`csrc/csrs`
 /// 是寄存器形式伪指令,整数操作数依赖汇编器推断,跨汇编器行为
 /// 存在歧义(pro 审计 #1 争议点);`csrci/csrsi` 语义唯一。
+///
+/// 注意:不带 `nomem` —— 中断状态切换必须作为编译器的内存屏障,
+/// 防止指令被重排跨越开关中断点(pro 审计 #5)。
 #[inline]
 pub fn irq_disable() {
     unsafe {
-        asm!("csrci sstatus, 2", options(nomem, nostack));
+        asm!("csrci sstatus, 2", options(nostack));
     }
 }
 
 /// 打开全局中断(S 模式:置位 sstatus.SIE,位 1)。
 /// 调用前必须已配置好所有中断源与 trap 向量,否则中断可能打到
-/// 未初始化路径。见 `irq_disable` 关于立即数形式的说明。
+/// 未初始化路径。屏障语义同 `irq_disable`。
 #[inline]
 pub fn irq_enable() {
     unsafe {
-        asm!("csrsi sstatus, 2", options(nomem, nostack));
+        asm!("csrsi sstatus, 2", options(nostack));
     }
 }
 
@@ -192,17 +196,17 @@ static TIMER_DEADLINE: AtomicUsize = AtomicUsize::new(0);
 pub fn sanitize_csr() {
     unsafe {
         // 关闭全部超级中断使能(含可能的残留位)。
-        asm!("csrw sie, zero", options(nomem, nostack));
+        asm!("csrw sie, zero", options(nostack));
         // 清可写的挂起位:SSIP(位1)、STIP(位5);SEIP(位9)为
         // 只读,由硬件管理,无法也不应在此清除。
-        asm!("csrw sip, zero", options(nomem, nostack));
+        asm!("csrw sip, zero", options(nostack));
         // 清 sstatus 保护相关位:SUM(位18)+ MXR(位19)+ FS(位13-14)。
         // 高位超出 csrci 5 位立即数范围,必须用寄存器形式 csrc
         // (寄存器形式无歧义,正是 csrc 的本义)。
         asm!(
             "csrc sstatus, {mask}",
             mask = in(reg) 0xC6000usize,
-            options(nomem, nostack)
+            options(nostack)
         );
     }
 }
