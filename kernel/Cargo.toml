@@ -9,5 +9,5 @@ version = "0.1.0"
 edition = "2021"
 description = "Ignium (炬元微内核): a from-scratch Rust microkernel with OpenHarmony ecosystem compatibility, RISC-V first"
 license = "Apache-2.0"
-repository = "https://github.com/xiesuna/ignium"
+repository = "https://github.com/juyuan-tech/ignium"
 authors = ["商丘炬元科技有限公司"]
