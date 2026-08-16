@@ -32,11 +32,16 @@ SECTIONS
         *(.sbss*)
         *(COMMON)
         . = ALIGN(16);
+        _stack_bottom = .;
         . += STACK_SIZE;
         _stack_top = .;
-        _stack_size = STACK_SIZE;
     }
     . = ALIGN(4K);
     _end = .;
     _kernel_end = .;
+
+    /DISCARD/ : {
+        *(.eh_frame)
+        *(.comment)
+    }
 }

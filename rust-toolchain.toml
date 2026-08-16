@@ -1,4 +1,4 @@
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 targets = ["riscv64gc-unknown-none-elf"]
 components = ["rust-src", "llvm-tools"]

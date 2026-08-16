@@ -34,8 +34,16 @@ pub fn init() {
     write_u8(UART_MCR, 0x03);
 }
 
+const TX_WAIT_LIMIT: u32 = 0x1_0000;
+
 pub fn putc(c: u8) {
-    while !is_transmit_empty() {}
+    let mut spins = 0;
+    while !is_transmit_empty() {
+        spins += 1;
+        if spins > TX_WAIT_LIMIT {
+            return;
+        }
+    }
     write_u8(UART_BASE, c);
 }
 
