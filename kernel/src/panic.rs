@@ -14,11 +14,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::{self, CpuState};
 use crate::error;
 
-// 链接脚本符号(kernel/linker.ld):栈区边界。extern 声明读取的是
-// 符号的**地址**,因此用 `&符号 as usize` 取地址值。
+// 链接脚本符号(kernel/linker.ld):栈区边界。
+// 说明:extern 声明**仅用于取符号地址**(`&_stack_bottom as usize`),
+// 从不解引用该 extern 本身;后续的扫描用裸指针 volatile 逐字节读,
+// 无类型化读的 provenance 问题(pro 审计 max #5)。
 extern "C" {
     static _stack_bottom: u8;
     static _stack_top: u8;
+    static _trap_stack_bottom: u8;
+    static _trap_stack_top: u8;
 }
 
 /// 双 panic 保护:第一次进入置位;第二次(panic 中再 panic)直接停机。
@@ -48,10 +52,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 /// 返回栈区物理边界 `(bottom, top)`。
-fn stack_bounds() -> (usize, usize) {
-    let bottom = unsafe { &_stack_bottom as *const u8 as usize };
-    let top = unsafe { &_stack_top as *const u8 as usize };
-    (bottom, top)
+/// 定位 sp 所在的栈区(boot 栈或 trap 栈),返回其 `(bottom, top)`。
+///
+/// panic 可能发生在两个栈上:主上下文(引导栈)或 trap_handler
+/// (陷阱栈)。水位扫描必须针对**当前栈**,否则会得到误导性结果
+/// (pro 审计 max #6:旧实现只扫引导栈,陷阱栈 panic 时报 0 已用)。
+fn current_stack_bounds(sp: usize) -> (usize, usize) {
+    let boot_bottom = unsafe { &_stack_bottom as *const u8 as usize };
+    let boot_top = unsafe { &_stack_top as *const u8 as usize };
+    let trap_bottom = unsafe { &_trap_stack_bottom as *const u8 as usize };
+    let trap_top = unsafe { &_trap_stack_top as *const u8 as usize };
+    if sp >= trap_bottom && sp < trap_top {
+        (trap_bottom, trap_top)
+    } else {
+        (boot_bottom, boot_top)
+    }
 }
 
 /// 计算栈水位 = 栈顶到"最深被使用字节"的距离(字节)。
@@ -60,8 +75,8 @@ fn stack_bounds() -> (usize, usize) {
 /// 该地址曾被写过。从栈底向上第一个非零字节 ≈ 历史最深栈帧底。
 /// 按**字节**扫描(pro 审计 #13:usize 类型读取带严格 provenance
 /// 的活跃栈内存存在可疑性;panic 路径的性能开销可忽略)。
-fn stack_watermark() -> usize {
-    let (bottom, top) = stack_bounds();
+fn stack_watermark(sp: usize) -> usize {
+    let (bottom, top) = current_stack_bounds(sp);
     let mut probe = bottom;
     while probe < top {
         if unsafe { core::ptr::read_volatile(probe as *const u8) } != 0 {
@@ -81,8 +96,8 @@ fn dump_cpu(state: CpuState) {
     error!("--- CPU state ---");
     error!("tick: {}", crate::logger::tick());
     error!("note: ra/sp 与 CSR 为 panic 上下文 best-effort 值;故障点帧见 trap dump");
-    let (bottom, top) = stack_bounds();
     let sp = state.sp;
+    let (bottom, top) = current_stack_bounds(sp);
     if sp < bottom || sp >= top {
         // sp 出界是栈溢出/内存破坏的强信号,必须醒目提示。
         error!(
@@ -92,7 +107,7 @@ fn dump_cpu(state: CpuState) {
     }
     error!(
         "stack watermark: {} / {} bytes used, uart dropped: {}",
-        stack_watermark(),
+        stack_watermark(sp),
         top - bottom,
         crate::uart::dropped()
     );

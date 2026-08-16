@@ -42,6 +42,7 @@ global_asm!(include_str!("entry.S"));
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     arch::irq_disable();
+    arch::sanitize_csr();
     uart::init();
     arch::init_traps();
     arch::enable_timer();
@@ -66,7 +67,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         let t = crate::logger::tick();
         if t - last_tick >= 100 {
             last_tick = t;
-            info!("uptime: {} ticks ({} ms)", t, t * 10);
+            // saturating_mul:overflow-checks 开启下,极端 tick 值
+            // (u64 千年量级)也不会触发 panic(pro 审计 max #10)。
+            info!("uptime: {} ticks ({} ms)", t, t.saturating_mul(10));
         }
     }
 }

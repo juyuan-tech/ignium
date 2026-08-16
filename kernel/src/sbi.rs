@@ -22,8 +22,8 @@ const SBI_EXT_TIME: usize = 0x5449_4D45;
 ///
 /// # Safety
 /// 仅用于编程 S 模式定时器;调用后 a0/a1 被 SBI 覆写,已声明为
-/// 输出操作数。不可从中断关闭期间的不可重入上下文调用本函数
-/// (ecall 本身是可重入的,但嵌套定时器语义未定义)。
+/// 输出操作数。**ISR 内可调用**(定时器中断处理正是主调用方):
+/// 该上下文中断关闭、ecall 自身不重入,无嵌套语义问题。
 #[inline]
 pub fn set_timer(stime_value: usize) -> usize {
     let error: usize;

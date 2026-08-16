@@ -36,8 +36,11 @@ make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 
 ```
 [000000] [INFO ] Ignium 炬元微内核 v0.1.0 booting
-[000000] [INFO ] M0: boot ok - arch: riscv64, machine: qemu-virt
-[000000] [WARN ] timer not yet enabled; tick stays at 0 until M1
+[000000] [INFO ] M0: boot ok - arch: riscv64, machine: qemu-virt, hartid=0, fdt=0x87e00000
+[000000] [INFO ] M1: timer enabled (10000us interval), interrupts on
+[000100] [INFO ] uptime: 100 ticks (1000 ms)
+[000200] [INFO ] uptime: 200 ticks (2000 ms)
+...
 ```
 
 ## 日志系统

@@ -58,6 +58,10 @@ const CS_SCAUSE: usize = 34;
 const CS_STVAL: usize = 35;
 const TRAP_FRAME_WORDS: usize = 36;
 
+// 编译期锁定帧尺寸:riscv64.S 用 .equ TRAP_FRAME_SIZE, 288 与之对应
+// (汇编无法引用 Rust 常量,用断言防止两侧漂移,pro 审计 max #4)。
+const _: () = assert!(TRAP_FRAME_WORDS * 8 == 288);
+
 /// CPU 寄存器快照,panic/诊断输出用。
 ///
 /// `#[repr(C)]`:字段顺序与 `cpu_state_asm` 的写入偏移一一对应
@@ -177,6 +181,31 @@ pub const TIMER_INTERVAL: usize = 100_000;
 /// 截止,产生持续漂移;前者只加固定间隔,节拍无累积误差。
 /// 仅定时器 ISR 写入(fetch_add),启动时初始化一次。
 static TIMER_DEADLINE: AtomicUsize = AtomicUsize::new(0);
+
+/// 清洗中断/特权相关 CSR 到已知安全状态(pro 审计 max #1)。
+///
+/// 背景:引导器或热重启可能遗留 `sie`/`sip` 的置位位与 `sstatus`
+/// 的保护相关位(SUM/MXR/FS)。`enable_timer` 用 OR 设置 STIE 会
+/// 保留这些残留 —— 未处理的中断会在 `irq_enable` 后立刻触发停机。
+///
+/// 必须在 `enable_timer` 之前调用(在 `kernel_main` 早期)。
+pub fn sanitize_csr() {
+    unsafe {
+        // 关闭全部超级中断使能(含可能的残留位)。
+        asm!("csrw sie, zero", options(nomem, nostack));
+        // 清可写的挂起位:SSIP(位1)、STIP(位5);SEIP(位9)为
+        // 只读,由硬件管理,无法也不应在此清除。
+        asm!("csrw sip, zero", options(nomem, nostack));
+        // 清 sstatus 保护相关位:SUM(位18)+ MXR(位19)+ FS(位13-14)。
+        // 高位超出 csrci 5 位立即数范围,必须用寄存器形式 csrc
+        // (寄存器形式无歧义,正是 csrc 的本义)。
+        asm!(
+            "csrc sstatus, {mask}",
+            mask = in(reg) 0xC6000usize,
+            options(nomem, nostack)
+        );
+    }
+}
 
 /// 使能超级定时器中断(STIE)并编程第一次定时器中断。
 ///

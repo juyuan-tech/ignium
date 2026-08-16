@@ -91,10 +91,14 @@ trap_vector:
     csrr a2, stval
     mv a3, t6
     # 处理器自身栈:帧下方预留 2KB(trap_handler 的 error! 输出链
-    # 实测 < 1KB,2KB 留足余量)。嵌套陷阱会压向更深处,仍在陷阱栈内;
-    # 极端溢出(handler 深度 > 2KB)写入越过陷阱栈底进入引导栈顶,
-    # 仍是内核保留区,不破坏内核数据(pro 审计 #3 加固)。
-    addi sp, t6, -2048
+    # 实测 < 1KB,2KB 留足余量)。**强制校验余量在陷阱栈内**:
+    # 若 sp 计算值越过陷阱栈底,说明栈已近耗尽(嵌套过深),此时
+    # 调用 handler 会把数据写进引导栈顶 —— 改为安全停机
+    # (pro 审计 max #2)。
+    la t0, _trap_stack_bottom
+    addi t1, t6, -2048
+    bltu t1, t0, 2f
+    mv sp, t1
     call trap_handler
     # trap_handler 返回 a0:
     #   a0 = 帧指针 → 恢复该帧并 sret 继续执行
@@ -150,6 +154,11 @@ trap_vector:
     # ===== 停机路径(trap_handler 返回 0)=====
 1:
     j 1b
+    # ===== 陷阱栈耗尽路径(handler 头寸不足,安全停机)=====
+2:
+    csrci sstatus, 2
+    wfi
+    j 2b
 
 # ---------------------------------------------------------------------------
 # cpu_state_asm:CpuState 快照读取(纯汇编实现)。

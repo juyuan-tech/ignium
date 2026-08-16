@@ -18,12 +18,18 @@ QEMU     ?= qemu-system-riscv64
 # 不要改为 -bios none:那会让 CPU 跳到 0x80000000 而非内核入口。
 QEMUARGS  = -M virt -m 128M -nographic -bios default
 
+# llvm-objcopy 由 rustup 的 llvm-tools 组件提供,位于工具链 sysroot 内,
+# 不在 PATH 上 —— 自动定位(pro 审计 #9:旧写法 rust-objcopy 找不到)。
+SYSROOT  := $(shell rustc --print sysroot)
+HOST     := $(shell rustc -vV | sed -n 's/host: //p')
+OBJCOPY  := $(SYSROOT)/lib/rustlib/$(HOST)/bin/llvm-objcopy
+
 build:
 	cargo build --release
 
 # 生成裸二进制(烧录物理设备用;QEMU 直接用 ELF 即可)
 bin: build
-	rust-objcopy -O binary $(KERNEL_ELF) $(KERNEL_BIN)
+	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_BIN)
 
 qemu: build
 	$(QEMU) $(QEMUARGS) -kernel $(KERNEL_ELF)
