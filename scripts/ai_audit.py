@@ -122,8 +122,8 @@ def call_api(key, prompt, retries=3):
                 {"role": "system", "content": "You are a senior OS kernel security reviewer."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
-            "max_tokens": 16384,
+            "max_tokens": 65536,
+            "reasoning_effort": "max",
             "stream": False,
         }
     ).encode("utf-8")
@@ -137,7 +137,22 @@ def call_api(key, prompt, retries=3):
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+            msg = data["choices"][0]["message"]
+            content = (msg.get("content") or "").strip()
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            usage = data.get("usage", {})
+            print(
+                f"tokens: in={usage.get('prompt_tokens', '?')} "
+                f"out={usage.get('completion_tokens', '?')} "
+                f"(reasoning={len(reasoning)} chars)"
+            )
+            if not content:
+                raise RuntimeError(
+                    "empty final answer from model "
+                    f"(reasoning produced {len(reasoning)} chars; "
+                    "likely max_tokens exhausted by thinking)"
+                )
+            return content
         except urllib.error.HTTPError as e:
             last = e
             print(f"attempt {attempt + 1}: HTTP {e.code}", file=sys.stderr)
