@@ -13,6 +13,7 @@ global_asm!(include_str!("entry.S"));
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
+    arch::irq_disable();
     uart::init();
     crate::logger::set_level(crate::logger::Level::Info);
     info!("Ignium 炬元微内核 v{} booting", env!("CARGO_PKG_VERSION"));

@@ -25,15 +25,26 @@ pub fn cpu_state() -> CpuState {
         satp: 0,
     };
     unsafe {
-        asm!("mv {}, ra", out(reg) s.ra);
-        asm!("mv {}, sp", out(reg) s.sp);
-        asm!("mv {}, gp", out(reg) s.gp);
-        asm!("mv {}, tp", out(reg) s.tp);
-        asm!("csrr {}, sstatus", out(reg) s.sstatus);
-        asm!("csrr {}, sepc", out(reg) s.sepc);
-        asm!("csrr {}, scause", out(reg) s.scause);
-        asm!("csrr {}, stval", out(reg) s.stval);
-        asm!("csrr {}, satp", out(reg) s.satp);
+        asm!(
+            "mv {ra_o}, ra",
+            "mv {sp_o}, sp",
+            "mv {gp_o}, gp",
+            "mv {tp_o}, tp",
+            "csrr {sstatus_o}, sstatus",
+            "csrr {sepc_o}, sepc",
+            "csrr {scause_o}, scause",
+            "csrr {stval_o}, stval",
+            "csrr {satp_o}, satp",
+            ra_o = out(reg) s.ra,
+            sp_o = out(reg) s.sp,
+            gp_o = out(reg) s.gp,
+            tp_o = out(reg) s.tp,
+            sstatus_o = out(reg) s.sstatus,
+            sepc_o = out(reg) s.sepc,
+            scause_o = out(reg) s.scause,
+            stval_o = out(reg) s.stval,
+            satp_o = out(reg) s.satp,
+        );
     }
     s
 }

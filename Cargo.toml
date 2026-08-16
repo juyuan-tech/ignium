@@ -6,5 +6,9 @@ description = "Ignium (炬元微内核): a from-scratch Rust microkernel with Op
 license = "Apache-2.0"
 repository = ""
 
+[profile.dev]
+panic = "abort"
+overflow-checks = true
+
 [profile.release]
 panic = "abort"

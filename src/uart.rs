@@ -29,6 +29,7 @@ pub fn init() {
     write_u8(UART_BASE, 0x0C);
     write_u8(UART_IER, 0x00);
     write_u8(UART_LCR, 0x03);
+    write_u8(UART_IER, 0x00);
     write_u8(UART_FCR, 0x07);
     write_u8(UART_MCR, 0x03);
 }

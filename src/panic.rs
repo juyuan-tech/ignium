@@ -16,6 +16,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 fn dump_cpu(state: CpuState) {
     error!("--- CPU state ---");
+    error!("tick: {}", crate::logger::tick());
     error!(
         "ra={:#x} sp={:#x} gp={:#x} tp={:#x}",
         state.ra, state.sp, state.gp, state.tp
