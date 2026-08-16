@@ -1,0 +1,53 @@
+name: Bug report
+description: 报告内核缺陷(崩溃、错误行为、安全问题)
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 提交前检查
+        - [ ] 已阅读 CONTRIBUTING.md 与 AGENTS.md
+        - [ ] 搜索过已有 Issue(避免重复)
+        - [ ] 确认不是已知限制(见 ROADMAP.md 当前阶段)
+  - type: input
+    id: env
+    attributes:
+      label: 运行环境
+      description: QEMU 版本 / 物理硬件 / 构建工具链版本
+      placeholder: "qemu-system-riscv64 8.2.2, rustc 1.97.1"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 预期行为与实际行为的差异
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志/输出
+      description: 完整的 QEMU 输出(含 panic dump,若触发)
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 最小复现路径(分支/提交/命令)
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: 严重程度
+      options:
+        - CRITICAL(数据破坏/系统不可用)
+        - HIGH(功能损坏)
+        - MEDIUM(部分场景异常)
+        - LOW(文档/质量)
+    validations:
+      required: true

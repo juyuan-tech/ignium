@@ -1,15 +1,22 @@
-[package]
-name = "ignium-kernel"
-version = "0.1.0"
-edition = "2021"
-description = "Ignium (炬元微内核): a from-scratch Rust microkernel with OpenHarmony ecosystem compatibility, RISC-V first"
-license = "Apache-2.0"
-repository = ""
+# Ignium workspace(团队协作根配置)。
+#
+# 布局:kernel/ 为内核 crate;未来用户态服务(OpenHarmony 兼容层、
+# 文件系统、网络)以独立 crate 加入 members,互不耦合。
+#
+# 统一构建配置:任何 profile 变更必须全项目一致(内核 crate 不允许 unwind)。
+
+[workspace]
+resolver = "2"
+members = ["kernel"]
 
 [profile.dev]
+# 内核没有 unwinder,panic 一律 abort(默认 unwind 会链接失败)。
 panic = "abort"
+# 开发阶段开启溢出检查,尽早暴露整数溢出。
 overflow-checks = true
 
 [profile.release]
 panic = "abort"
+# 发布构建同样开启:内核阶段安全优先;若 M2+ 性能基准显示 IPC 路径
+# 受溢出检查影响,再按子系统局部禁用并记录理由。
 overflow-checks = true

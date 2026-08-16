@@ -1,9 +1,15 @@
+# Ignium CI:每个 push/PR 全量门禁。
+#
+# 门禁清单:编译(dev+release) → clippy(-D warnings)→ 格式检查 →
+# QEMU 启动冒烟。新增质量门禁时在此追加,保持与本地 make 目标等价。
+
 name: CI
 
 on:
   push:
   pull_request:
 
+# 最小权限:CI 只读仓库内容,不需要写权限。
 permissions:
   contents: read
 
@@ -12,14 +18,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 工具链版本与 rust-toolchain.toml 严格一致(团队纪律:改版本两处同步)。
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: riscv64gc-unknown-none-elf
           components: llvm-tools, clippy, rustfmt
+      # QEMU 提供 qemu-system-riscv64(启动冒烟测试依赖)。
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
       - run: cargo build --release
       - run: cargo clippy --release -- -D warnings
       - run: cargo fmt --check
+      # 启动冒烟:10s 超时 + 断言 M0 日志(与 make test 等价)。
       - name: Boot test in QEMU
         run: |
           timeout 10 qemu-system-riscv64 -M virt -m 128M -nographic -bios default \

@@ -1,5 +1,18 @@
+# Cargo 构建配置(workspace 根)。
+#
+# 说明:
+# - `build.target`:全 workspace 默认交叉编译到 RISC-V 裸机目标。
+#   本地开发/调试如需原生构建,用 `--target` 显式覆盖。
+# - `rustflags`:把链接脚本传给链接器。
+#   **路径相对于运行 cargo 的工作目录(workspace 根)**,若移动
+#   文件结构必须同步修改;从子目录运行 cargo 可能解析失败。
+
 [build]
 target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
-rustflags = ["-C", "link-arg=-Tlinker.ld"]
+# 链接脚本 kernel/linker.ld 已显式收纳全部段 + /DISCARD/ 工具链噪音段;
+# 新出现的段会在链接时告警,团队 review 时必须显式处理(见 AGENTS.md)。
+rustflags = [
+  "-C", "link-arg=-Tkernel/linker.ld",
+]

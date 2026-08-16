@@ -1,4 +1,9 @@
+# 工具链锁定:团队与 CI 必须使用完全相同的 Rust 版本,否则
+# 代码生成/链接行为漂移会产生"本地过、CI 挂"类问题。
+# 升级版本时:1) 改这里;2) 同步改 .github/workflows/ci.yml;3) 全量验证。
+
 [toolchain]
 channel = "1.97.1"
 targets = ["riscv64gc-unknown-none-elf"]
-components = ["rust-src", "llvm-tools"]
+# clippy/rustfmt 是 CI 门禁,本地与 CI 必须一致可用。
+components = ["rust-src", "llvm-tools", "clippy", "rustfmt"]

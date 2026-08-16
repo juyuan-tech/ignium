@@ -1,0 +1,23 @@
+# 编辑器统一配置(团队协作:所有编辑器遵守同一缩进/换行)
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{rs,md,toml,yml,yaml}]
+indent_style = space
+indent_size = 4
+
+[Makefile]
+indent_style = tab
+
+[*.S]
+indent_style = tab
+
+[*.ld]
+indent_style = space
+indent_size = 4

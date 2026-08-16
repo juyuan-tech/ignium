@@ -1,0 +1,13 @@
+# Ignium 内核 crate(微内核唯一特权层)。
+#
+# 构建目标 riscv64gc-unknown-none-elf 由 workspace 级 .cargo/config.toml
+# 与 rust-toolchain.toml 决定;链接脚本 kernel/linker.ld 由 rustflags 传入。
+
+[package]
+name = "ignium-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Ignium (炬元微内核): a from-scratch Rust microkernel with OpenHarmony ecosystem compatibility, RISC-V first"
+license = "Apache-2.0"
+repository = "https://github.com/xiesuna/ignium"
+authors = ["商丘炬元科技有限公司"]

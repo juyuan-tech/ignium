@@ -1,0 +1,26 @@
+name: Feature request
+description: 提出新功能或改进建议
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: 动机
+      description: 要解决什么问题,服务哪个场景(含与 OpenHarmony 生态的关联)
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 方案设想
+      description: 接口/行为/模块归属建议(可引用 DESIGN.md 的架构约束)
+    validations:
+      required: true
+  - type: input
+    id: milestone
+    attributes:
+      label: 期望归属
+      description: 对应 ROADMAP 哪个阶段/里程碑
+    validations:
+      required: true

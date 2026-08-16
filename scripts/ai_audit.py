@@ -28,10 +28,11 @@ MODEL = os.environ.get("IGNIUM_AUDIT_MODEL", "deepseek-v4-pro")
 TIMEOUT = 600
 
 GLOBS = [
-    "src/**/*.rs",
-    "src/**/*.S",
+    "kernel/src/**/*.rs",
+    "kernel/src/**/*.S",
+    "kernel/Cargo.toml",
+    "kernel/linker.ld",
     "Cargo.toml",
-    "linker.ld",
     "Makefile",
     "rust-toolchain.toml",
     ".cargo/config.toml",

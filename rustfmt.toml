@@ -1,0 +1,7 @@
+# rustfmt 配置:显式声明,避免不同 rustfmt 版本产生差异。
+# 与 cargo fmt --check(CI 门禁)保持一致。
+
+edition = "2021"
+max_width = 100
+use_small_heuristics = "Default"
+reorder_imports = true

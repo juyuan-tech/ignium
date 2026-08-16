@@ -57,23 +57,34 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 ```
 
 - 密钥只走环境变量/一次性文件,不入库、不发给模型
-- 报告保存至 `docs/audit-reports/<时间戳>-deepseek-chat.md`
+- 报告保存至 `docs/audit-reports/<时间戳>-<模型>.md`(用法见 scripts/README.md)
 
 ## 仓库结构
 
 ```
-├── src/
-│   ├── main.rs          # 入口 + 启动日志
-│   ├── entry.S          # _start,清零 bss,跳转 kernel_main
-│   ├── logger.rs        # 分级日志系统(error/warn/info/debug/trace + tick)
-│   ├── panic.rs         # panic 处理:位置/消息/CPU 状态 dump
-│   ├── uart.rs          # NS16550 串口驱动(初始化 + println! + 日志输出)
-│   └── arch/            # 架构隔离层(riscv64 / 未来 x86_64)
-├── linker.ld            # 链接脚本(QEMU virt 0x80200000)
-├── Makefile             # build / qemu / gdb / test / clippy / fmt
-├── docs/DESIGN.md       # 架构设计原则
-└── ROADMAP.md           # 12 个月串行路线
+├── kernel/                 # 内核 crate(唯一特权层,workspace 成员)
+│   ├── src/
+│   │   ├── main.rs         # 入口 + 启动顺序(依赖关系见注释)
+│   │   ├── entry.S         # _start:satp 清零/TLB 冲刷/清 BSS/设栈
+│   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)
+│   │   ├── panic.rs        # panic:位置/消息/CPU dump/栈水位/双 panic 保护
+│   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + 有界发送)
+│   │   └── arch/           # 架构隔离层(riscv64 / 未来 x86_64)
+│   ├── Cargo.toml
+│   └── linker.ld           # 链接脚本(栈独立于镜像,孤儿段报错)
+├── scripts/                # 工具(ai_audit.py 外部 AI 审计)
+├── docs/                   # DESIGN.md / audit-reports/
+├── .github/                # CI + Issue/PR 模板
+├── AGENTS.md               # AI 协作者与团队执行规范
+├── CONTRIBUTING.md         # 贡献指南
+└── SECURITY.md             # 漏洞报告政策
 ```
+
+## 团队协作
+
+- 加入团队前必读:`CONTRIBUTING.md`(流程)、`AGENTS.md`(红线)、`docs/DESIGN.md`(架构)
+- 质量门禁:clippy 零警告 / fmt / QEMU 冒烟(CI 与本地 `make` 等价)
+- 工具链锁定 1.97.1(rust-toolchain.toml 与 CI 双端同步)
 
 ## 路线
 
