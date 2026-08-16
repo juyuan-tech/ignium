@@ -1,0 +1,10 @@
+[package]
+name = "ignium-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Ignium (炬元微内核): a from-scratch Rust microkernel with OpenHarmony ecosystem compatibility, RISC-V first"
+license = "Apache-2.0"
+repository = ""
+
+[profile.release]
+panic = "abort"
