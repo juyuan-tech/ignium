@@ -16,6 +16,7 @@
 mod arch;
 mod logger;
 mod panic;
+mod sbi;
 mod uart;
 
 use core::arch::global_asm;
@@ -35,12 +36,15 @@ global_asm!(include_str!("entry.S"));
 /// 2. `uart::init` —— 日志基础设施,必须先于任何输出
 /// 3. `arch::init_traps` —— stvec 装好之前发生异常会跳到地址 0
 ///    (不可恢复),因此必须尽早;但必须在 uart 之后(陷阱日志依赖串口)
-/// 4. `logger::set_level` —— 日志级别,先于任何日志调用
+/// 4. `arch::enable_timer` —— 定时器中断源(STIE),必须晚于陷阱向量
+/// 5. `logger::set_level` —— 日志级别,先于任何日志调用
+/// 6. `arch::irq_enable` —— 最后才开全局中断(中断源全部就绪之后)
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     arch::irq_disable();
     uart::init();
     arch::init_traps();
+    arch::enable_timer();
     crate::logger::set_level(crate::logger::Level::Info);
     info!("Ignium 炬元微内核 v{} booting", env!("CARGO_PKG_VERSION"));
     debug!("uart console initialized (tick={})", crate::logger::tick());
@@ -48,9 +52,20 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         "M0: boot ok - arch: riscv64, machine: qemu-virt, hartid={}, fdt={:#x}",
         hartid, fdt as usize
     );
-    warn!("timer not yet enabled; tick stays at 0 until M1");
-    // 空闲循环:无任务可跑时进入 wfi 等待(中断关闭期间等效空转)。
+    arch::irq_enable();
+    info!(
+        "M1: timer enabled ({}us interval), interrupts on",
+        arch::TIMER_INTERVAL / 10
+    );
+    // 空闲循环:wfi 被定时器中断唤醒,tick 由中断处理递增。
+    // 每 100 tick(1s)输出一次 uptime,验证中断/恢复链路与节拍精度。
+    let mut last_tick = 0u64;
     loop {
         arch::wait_for_interrupt();
+        let t = crate::logger::tick();
+        if t - last_tick >= 100 {
+            last_tick = t;
+            info!("uptime: {} ticks ({} ms)", t, t * 10);
+        }
     }
 }

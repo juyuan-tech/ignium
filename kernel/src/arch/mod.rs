@@ -1,9 +1,10 @@
 //! 架构隔离层。
 //!
 //! # 契约(所有架构必须实现,通用代码只能通过本模块访问硬件)
-//! - `init_traps` / `trap_handler` —— 陷阱向量安装与处理
+//! - `init_traps` / `trap_handler` —— 陷阱向量安装与处理(中断分发)
 //! - `cpu_state` —— 诊断用寄存器快照
-//! - `irq_disable` —— 关全局中断
+//! - `irq_disable` / `irq_enable` —— 关/开全局中断
+//! - `enable_timer` / `get_time` / `TIMER_INTERVAL` —— 周期定时器
 //! - `wait_for_interrupt` / `halt` —— 空闲等待 / 停机
 //! - `CpuState` —— 快照数据结构(repr(C),与汇编 ABI 对齐)
 //!

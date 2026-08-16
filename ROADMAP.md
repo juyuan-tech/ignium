@@ -21,8 +21,8 @@
 
 | 任务 | 产出/验收 |
 |---|---|
-| trap/异常处理(stvec,中断/异常区分,寄存器 dump) | 非法指令触发可诊断 panic |
-| 定时器中断(SBI set_timer)+ 时钟计数 | 1ms 中断递增 |
+| trap/异常处理(stvec,中断/异常区分,寄存器 dump) | ✅ 完成:陷阱栈 + 可重入 + 完整帧 + sret 恢复 |
+| 定时器中断(SBI set_timer)+ 时钟计数 | ✅ 完成:10ms 节拍,uptime 每秒 +100 tick 实测 |
 | 物理内存 buddy allocator | 分配/释放单测通过 |
 | Sv39 页表 + 内核自身映射 | arch_mmu_map 接口 |
 | 内核堆(slab)+ alloc 稳定 | 内核内 Vec 可用 |

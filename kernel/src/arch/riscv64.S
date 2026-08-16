@@ -90,7 +90,58 @@ trap_vector:
     # 进入引导栈顶 —— 仍是内核保留区,不破坏内核数据。
     addi sp, t6, -1024
     call trap_handler
-    # trap_handler 返回类型为 !,此处不可达;防御性死循环。
+    # trap_handler 返回 a0:
+    #   a0 = 帧指针 → 恢复该帧并 sret 继续执行
+    #   a0 = 0      → 不可恢复,停机
+    beqz a0, 1f
+    # ===== 恢复路径 =====
+    mv t6, a0
+    # 先把 sscratch 恢复为陷阱栈顶(帧底 + 帧大小 320),供下次 trap 使用。
+    # 不这样做会导致陷阱栈顶每次 trap 都向下漂移,最终耗尽。
+    addi t0, t6, 320
+    csrw sscratch, t0
+    # 恢复 sstatus:清掉 SIE 位再写回 —— sret 时硬件用 SPIE(硬件在
+    # trap 入口置 1)恢复 SIE,从而"原子地"重新使能中断,避免在
+    # sret 前被打断(被打断时帧已部分恢复,会产生双重恢复错误)。
+    ld t0, 32*8(t6)
+    andi t0, t0, -3
+    csrw sstatus, t0
+    ld t0, 33*8(t6)
+    csrw sepc, t0
+    # 恢复 GPR;t6 必须最后恢复(帧基址在 t6 中,先恢复会丢地址)。
+    ld ra, 0*8(t6)
+    ld sp, 1*8(t6)
+    ld gp, 2*8(t6)
+    ld tp, 3*8(t6)
+    ld t0, 4*8(t6)
+    ld t1, 5*8(t6)
+    ld t2, 6*8(t6)
+    ld s0, 7*8(t6)
+    ld s1, 8*8(t6)
+    ld a0, 9*8(t6)
+    ld a1, 10*8(t6)
+    ld a2, 11*8(t6)
+    ld a3, 12*8(t6)
+    ld a4, 13*8(t6)
+    ld a5, 14*8(t6)
+    ld a6, 15*8(t6)
+    ld a7, 16*8(t6)
+    ld s2, 17*8(t6)
+    ld s3, 18*8(t6)
+    ld s4, 19*8(t6)
+    ld s5, 20*8(t6)
+    ld s6, 21*8(t6)
+    ld s7, 22*8(t6)
+    ld s8, 23*8(t6)
+    ld s9, 24*8(t6)
+    ld s10, 25*8(t6)
+    ld s11, 26*8(t6)
+    ld t3, 27*8(t6)
+    ld t4, 28*8(t6)
+    ld t5, 29*8(t6)
+    ld t6, 30*8(t6)
+    sret
+    # ===== 停机路径(trap_handler 返回 0)=====
 1:
     j 1b
 

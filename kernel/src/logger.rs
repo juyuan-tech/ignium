@@ -80,7 +80,6 @@ pub fn tick() -> u64 {
 }
 
 /// tick 递增(M1 定时器中断回调;仅此处可修改 TICK)。
-#[allow(dead_code)]
 pub fn tick_up() {
     TICK.fetch_add(1, Ordering::Relaxed);
 }

@@ -141,6 +141,43 @@ pub fn irq_disable() {
     }
 }
 
+/// 打开全局中断(S 模式:置位 sstatus.SIE,位 1)。
+/// 调用前必须已配置好所有中断源与 trap 向量,否则中断可能打到
+/// 未初始化路径。
+#[inline]
+pub fn irq_enable() {
+    unsafe {
+        asm!("csrs sstatus, {imm}", imm = const 2, options(nomem, nostack));
+    }
+}
+
+/// 读取 mtimer 计数器(S 模式经 OpenSBI 委托,`csrr time` 直读)。
+/// 单位:OpenSBI 平台时钟周期(QEMU virt = 10 MHz)。
+pub fn get_time() -> usize {
+    let t: usize;
+    unsafe {
+        asm!("csrr {}, time", out(reg) t, options(nomem, nostack));
+    }
+    t
+}
+
+/// 定时器节拍间隔(10ms):mtimer 10 MHz 下 = 100,000 周期。
+pub const TIMER_INTERVAL: usize = 100_000;
+
+/// 使能超级定时器中断(STIE)并编程第一次定时器中断。
+///
+/// 调用顺序要求:必须在 `init_traps` 之后(否则定时器中断无陷阱向量
+/// 可达);在 `irq_enable` 之前(先布好中断源,再开全局中断)。
+pub fn enable_timer() {
+    unsafe {
+        // sie.STIE = bit 5(超级定时器中断使能)。
+        // 注意:csrs/csrc 的立即数仅 5 位(0..31),位 5(0x20)必须
+        // 走寄存器操作数形式。
+        asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nomem, nostack));
+    }
+    crate::sbi::set_timer(get_time() + TIMER_INTERVAL);
+}
+
 /// 空闲等待:wfi 令 CPU 进入低功耗等待;若中断被使能,等待可被唤醒。
 #[inline]
 pub fn wait_for_interrupt() {
@@ -156,7 +193,13 @@ pub fn halt() -> ! {
     }
 }
 
-/// 陷阱处理入口,由 trap_vector(汇编)以 C ABI 调用,永不返回。
+/// 中断位(scause 最高位):置 1 表示中断,置 0 表示同步异常。
+const INTERRUPT_BIT: usize = 1 << (usize::BITS - 1);
+
+/// 超级定时器中断 cause 编号(RISC-V 特权规范)。
+const CAUSE_SUPERVISOR_TIMER: usize = 5;
+
+/// 陷阱处理入口,由 trap_vector(汇编)以 C ABI 调用。
 ///
 /// # 参数
 /// - `scause`:异常/中断原因编码(最高位为 1 表示中断)。
@@ -164,21 +207,25 @@ pub fn halt() -> ! {
 /// - `stval`:trap 相关附加信息(如非法访存地址)。
 /// - `frame`:陷阱栈上帧的基址(布局见 riscv64.S 头部注释)。
 ///
+/// # 返回值(汇编恢复路径使用)
+/// - 返回 `frame`(非空):恢复该帧并 `sret` 继续执行被中断的上下文。
+/// - 返回 `null` / 停机:不恢复,直接停机(不可恢复故障)。
+///
 /// # Safety
 /// `frame` 必须指向陷阱栈范围内的有效帧(由汇编压入);调用前会
 /// 校验边界,非法指针直接停机而不是解引用(pro 审计 #7)。
 ///
-/// M0 阶段:仅做完整诊断输出后停机。M1 将按 scause 分发:
-/// 中断 → 对应设备处理(定时器/串口),异常 → 输出帧并停机。
+/// # 中断上下文约束
+/// 处理器在 trap 入口自动清除 SIE,本函数执行期间中断保持关闭,
+/// 因此不会嵌套(嵌套异常仍由陷阱栈吸收)。定时器中断处理路径
+/// **禁止日志输出**(无锁日志不允许 ISR 交错,见 logger 模块注释)。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn trap_handler(
     scause: usize,
     sepc: usize,
     stval: usize,
     frame: *mut usize,
-) -> ! {
-    use gpr::*;
-
+) -> *mut usize {
     // 帧指针完整性校验:必须在陷阱栈内、且容纳整个帧。
     let f = frame as usize;
     let bottom = unsafe { &_trap_stack_bottom as *const u8 as usize };
@@ -192,11 +239,36 @@ pub unsafe extern "C" fn trap_handler(
         halt()
     }
 
+    if scause & INTERRUPT_BIT != 0 {
+        // ===== 中断路径 =====
+        match scause & !INTERRUPT_BIT {
+            CAUSE_SUPERVISOR_TIMER => {
+                // 定时器节拍:tick 递增 + 重排下一次中断。
+                crate::logger::tick_up();
+                crate::sbi::set_timer(get_time() + TIMER_INTERVAL);
+                // 恢复被中断的上下文继续执行。
+                frame
+            }
+            other => {
+                // 未处理的中断:输出诊断并停机。
+                error!("TRAP: unhandled interrupt cause={other}, sepc={sepc:#x}");
+                dump_trap_frame(frame);
+                halt()
+            }
+        }
+    } else {
+        // ===== 同步异常路径 =====
+        error!("TRAP: exception scause={scause:#x} sepc={sepc:#x} stval={stval:#x}");
+        dump_trap_frame(frame);
+        halt()
+    }
+}
+
+/// 输出陷阱帧完整寄存器 dump(故障点的忠实快照)。
+fn dump_trap_frame(frame: *mut usize) {
+    use gpr::*;
+
     let regs = unsafe { core::slice::from_raw_parts(frame, TRAP_FRAME_WORDS) };
-    error!(
-        "TRAP: scause={:#x} sepc={:#x} stval={:#x}",
-        scause, sepc, stval
-    );
     error!(
         "ra={:#x} sp={:#x} gp={:#x} tp={:#x}",
         regs[X_RA], regs[X_SP], regs[X_GP], regs[X_TP]
@@ -230,5 +302,4 @@ pub unsafe extern "C" fn trap_handler(
         "sstatus={:#x} sepc_f={:#x} scause_f={:#x} stval_f={:#x}",
         regs[CS_SSTATUS], regs[CS_SEPC], regs[CS_SCAUSE], regs[CS_STVAL]
     );
-    halt()
 }
