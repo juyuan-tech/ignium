@@ -31,11 +31,15 @@ jobs:
       - run: cargo build --release
       - run: cargo clippy --release -- -D warnings
       - run: cargo fmt --check
-      # 启动冒烟:跑满 10s 收集完整输出,断言成功启动且无后续故障
-      # (早期 grep -q 会提前杀掉 QEMU,掩盖启动后的崩溃)。
+      # 启动冒烟:跑满 10s 收集完整输出,断言:
+      # 1) "M0: boot ok"(成功启动)
+      # 2) "uptime:"(定时器中断 + sret 恢复链路存活 —— 否则定时器
+      #    静默失效也会被放行,pro 审计 #8)
+      # 3) 无 "KERNEL PANIC"/"TRAP:"(启动后无故障)
       - name: Boot test in QEMU
         run: |
           timeout 10 qemu-system-riscv64 -M virt -m 128M -nographic -bios default \
           -kernel target/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-ci.log 2>&1 || true
           grep -q "M0: boot ok" /tmp/ignium-ci.log
+          grep -q "uptime:" /tmp/ignium-ci.log
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log

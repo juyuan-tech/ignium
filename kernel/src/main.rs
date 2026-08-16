@@ -58,7 +58,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         arch::TIMER_INTERVAL / 10
     );
     // 空闲循环:wfi 被定时器中断唤醒,tick 由中断处理递增。
-    // 每 100 tick(1s)输出一次 uptime,验证中断/恢复链路与节拍精度。
+    // 每 100 tick(1s)输出一次 uptime 心跳,验证中断/恢复链路与
+    // 节拍精度。注意:M1 验证用;调度器就绪后应移除或降级为 debug。
     let mut last_tick = 0u64;
     loop {
         arch::wait_for_interrupt();

@@ -26,15 +26,19 @@
 # 陷阱栈与引导栈在 linker.ld 中定义(均位于 _kernel_end 之后的保留区)。
 # ---------------------------------------------------------------------------
 
+# 陷阱帧大小(字节)= TRAP_FRAME_WORDS(36)*8 = 288。
+# 与 riscv64.rs 的 TRAP_FRAME_WORDS 必须一致;入口预留与恢复路径
+# 共用本常量,消除"两个魔法数漂移"风险(pro 审计 #2)。
+.equ TRAP_FRAME_SIZE, 288
+
 .section .text
 .align 4                    # stvec 要求 4 字节对齐(直接模式下低 2 位必须为 0)
 .globl trap_vector
 trap_vector:
     # t6 ← 陷阱栈顶(sscratch),被中断的 t6 暂存于 sscratch。
     csrrw t6, sscratch, t6
-    # 在陷阱栈上预留帧(t6 = 帧基址)。320 = TRAP_FRAME_WORDS(36)*8
-    # 加 32 字节余量,与 riscv64.rs 的帧定义及恢复路径的 +320 保持一致。
-    addi t6, t6, -320
+    # 在陷阱栈上预留帧(t6 = 帧基址)。
+    addi t6, t6, -TRAP_FRAME_SIZE
     # 先保存原始 t0(t0 即将被用作临时寄存器)。
     sd t0, 4*8(t6)
     # 取出被中断的 t6(暂存在 sscratch)并写入帧槽 30。
@@ -86,10 +90,11 @@ trap_vector:
     csrr a1, sepc
     csrr a2, stval
     mv a3, t6
-    # 处理器自身栈:帧下方预留 1KB(嵌套陷阱会压向更深处,仍在
-    # 陷阱栈内)。若 handler 递归深度超过预留,写入会越过陷阱栈底
-    # 进入引导栈顶 —— 仍是内核保留区,不破坏内核数据。
-    addi sp, t6, -1024
+    # 处理器自身栈:帧下方预留 2KB(trap_handler 的 error! 输出链
+    # 实测 < 1KB,2KB 留足余量)。嵌套陷阱会压向更深处,仍在陷阱栈内;
+    # 极端溢出(handler 深度 > 2KB)写入越过陷阱栈底进入引导栈顶,
+    # 仍是内核保留区,不破坏内核数据(pro 审计 #3 加固)。
+    addi sp, t6, -2048
     call trap_handler
     # trap_handler 返回 a0:
     #   a0 = 帧指针 → 恢复该帧并 sret 继续执行
@@ -97,9 +102,9 @@ trap_vector:
     beqz a0, 1f
     # ===== 恢复路径 =====
     mv t6, a0
-    # 先把 sscratch 恢复为陷阱栈顶(帧底 + 帧大小 320),供下次 trap 使用。
+    # 先把 sscratch 恢复为陷阱栈顶(帧底 + 帧大小),供下次 trap 使用。
     # 不这样做会导致陷阱栈顶每次 trap 都向下漂移,最终耗尽。
-    addi t0, t6, 320
+    addi t0, t6, TRAP_FRAME_SIZE
     csrw sscratch, t0
     # 恢复 sstatus:清掉 SIE 位再写回 —— sret 时硬件用 SPIE(硬件在
     # trap 入口置 1)恢复 SIE,从而"原子地"重新使能中断,避免在

@@ -25,7 +25,10 @@ import urllib.request
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API_URL = os.environ.get("IGNIUM_AUDIT_URL", "https://api.deepseek.com/chat/completions")
 MODEL = os.environ.get("IGNIUM_AUDIT_MODEL", "deepseek-v4-pro")
-TIMEOUT = 600
+# 推理强度:max 最彻底(耗时最长,可达 20+ 分钟);high 较快。
+# 按项目要求,默认使用 max;可经 env 临时调低。
+EFFORT = os.environ.get("IGNIUM_AUDIT_EFFORT", "max")
+TIMEOUT = 900
 
 GLOBS = [
     "kernel/src/**/*.rs",
@@ -124,7 +127,7 @@ def call_api(key, prompt, retries=3):
                 {"role": "user", "content": prompt},
             ],
             "max_tokens": 65536,
-            "reasoning_effort": "max",
+            "reasoning_effort": EFFORT,
             "stream": False,
         }
     ).encode("utf-8")

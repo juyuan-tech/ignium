@@ -36,8 +36,9 @@ SECTIONS
         *(.srodata*)
     }
 
-    /* 可写数据;锚点 __global_pointer$ 放在 .data 前部(gp 相对寻址范围
-     * 为 ±2KB,位置偏前可覆盖更多静态数据) */
+    /* 可写数据;锚点 __global_pointer$ 放在 .data 末尾(.sdata 之后):
+     * gp 相对寻址覆盖 ±2KB,位于末尾时其后的小数据(.sbss 等)与
+     * 其前的 .sdata 都在范围内(pro 审计 #7 注释修正) */
     . = ALIGN(4K);
     _data_start = .;
     .data : {
@@ -76,7 +77,9 @@ SECTIONS
 
     /* 陷阱栈:异常处理器专用栈(trap_vector 在其上压帧)。
      * 与引导栈分离:处理器绝不在被中断者的 sp 上运行,
-     * 也避免 handler 深度使用引导栈(pro 审计 #2)。 */
+     * 也避免 handler 深度使用引导栈(pro 审计 #2)。
+     * 多核:唤醒副核前必须改为 per-hart 陷阱栈数组
+     * (按 hartid/tp 索引),本单栈仅适用于单核阶段。 */
     .trap_stack (NOLOAD) : {
         _trap_stack_bottom = .;
         . += TRAP_STACK_SIZE;

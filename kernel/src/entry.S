@@ -16,9 +16,14 @@
 .section .text.entry
 .globl _start
 _start:
-    # 清除全局中断使能:在第一条 S 模式指令就确定中断状态,
-    # 避免 BSS 清零期间被遗留中断打断(pro 审计 LOW)。
-    csrc sstatus, 2
+    # 清除全局中断使能(csrci 立即数形式,无跨汇编器歧义):
+    # 在第一条 S 模式指令就确定中断状态,避免 BSS 清零期间被遗留
+    # 中断打断(pro 审计 LOW)。
+    csrci sstatus, 2
+    # tp = hartid:RISC-V 内核惯例(多核 per-hart 状态的基础)。
+    # 后续多核代码以 tp 索引 per-hart 陷阱栈/上下文,当前阶段无使用方,
+    # 但提前建立约定避免迁移成本。
+    mv tp, a0
     # 若上一级引导(或 SBI)遗留了分页开启状态,不清 satp 会带着
     # 残留页表执行,立即崩溃。写入 0 = Bare 模式(直接物理寻址)。
     csrw satp, zero

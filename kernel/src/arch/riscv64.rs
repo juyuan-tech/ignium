@@ -7,6 +7,7 @@ use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error;
+use crate::warn;
 
 // 架构汇编:引导陷阱向量(trap_vector)与 CPU 状态读取(cpu_state_asm)。
 // 具体约定见 riscv64.S 头部注释。
@@ -16,7 +17,6 @@ global_asm!(include_str!("riscv64.S"));
 ///
 /// **ABI 常量契约**:汇编保存顺序与这里的索引必须同步修改,
 /// 否则诊断 dump 会把寄存器标签全部错位(pro 审计 #1)。
-#[allow(dead_code)] // 常量由 trap_handler 打印代码使用,部分暂未全部引用
 mod gpr {
     pub const X_RA: usize = 0; // x1
     pub const X_SP: usize = 1; // x2
@@ -135,20 +135,24 @@ pub fn cpu_state() -> CpuState {
 }
 
 /// 关闭全局中断(S 模式:清除 sstatus.SIE,位 1)。
+///
+/// 使用显式立即数形式 `csrci`(而非 `csrc` + 立即数):`csrc/csrs`
+/// 是寄存器形式伪指令,整数操作数依赖汇编器推断,跨汇编器行为
+/// 存在歧义(pro 审计 #1 争议点);`csrci/csrsi` 语义唯一。
 #[inline]
 pub fn irq_disable() {
     unsafe {
-        asm!("csrc sstatus, {imm}", imm = const 2, options(nomem, nostack));
+        asm!("csrci sstatus, 2", options(nomem, nostack));
     }
 }
 
 /// 打开全局中断(S 模式:置位 sstatus.SIE,位 1)。
 /// 调用前必须已配置好所有中断源与 trap 向量,否则中断可能打到
-/// 未初始化路径。
+/// 未初始化路径。见 `irq_disable` 关于立即数形式的说明。
 #[inline]
 pub fn irq_enable() {
     unsafe {
-        asm!("csrs sstatus, {imm}", imm = const 2, options(nomem, nostack));
+        asm!("csrsi sstatus, 2", options(nomem, nostack));
     }
 }
 
@@ -187,7 +191,10 @@ pub fn enable_timer() {
     }
     let deadline = get_time() + TIMER_INTERVAL;
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
-    crate::sbi::set_timer(deadline);
+    // 首次编程失败则告警(此后 tick 冻结,uptime 日志会进一步暴露)。
+    if crate::sbi::set_timer(deadline) != 0 {
+        warn!("sbi_set_timer failed at boot");
+    }
 }
 
 /// 空闲等待:wfi 令 CPU 进入低功耗等待;若中断被使能,等待可被唤醒。

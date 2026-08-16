@@ -17,21 +17,26 @@ const SBI_EXT_TIME: usize = 0x5449_4D45;
 /// 编程定时器:在 `stime_value`(绝对时间,mtimer 周期)触发
 /// 超级定时器中断(STIE)。替代已废弃的 legacy sbi_set_timer。
 ///
+/// 返回 SBI 错误码(0 = SBI_SUCCESS)。调用方应检查返回值;
+/// ISR 内可忽略(失败表现为 tick 冻结,由 uptime 暴露)。
+///
 /// # Safety
 /// 仅用于编程 S 模式定时器;调用后 a0/a1 被 SBI 覆写,已声明为
 /// 输出操作数。不可从中断关闭期间的不可重入上下文调用本函数
 /// (ecall 本身是可重入的,但嵌套定时器语义未定义)。
 #[inline]
-pub fn set_timer(stime_value: usize) {
+pub fn set_timer(stime_value: usize) -> usize {
+    let error: usize;
     unsafe {
         core::arch::asm!(
             "ecall",
             in("a7") SBI_EXT_TIME,
             in("a6") 0,
             in("a0") stime_value,
-            lateout("a0") _,
+            lateout("a0") error,
             lateout("a1") _,
             options(nostack)
         );
     }
+    error
 }
