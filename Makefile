@@ -33,11 +33,16 @@ qemu: build
 gdb: build
 	$(QEMU) $(QEMUARGS) -kernel $(KERNEL_ELF) -s -S
 
-# 冒烟测试:启动 10s 内断言出现 "M0: boot ok"。
-# 说明:这是"能启动"级验证;崩溃注入/压力测试见 ROADMAP 阶段 4。
+# 冒烟测试:运行满 10s,收集完整输出,断言:
+#   1) 出现 "M0: boot ok"(成功启动)
+#   2) 未出现 "KERNEL PANIC" 或 "TRAP:"(启动后无故障)
+# 说明:早期 grep -q 会在匹配后立刻 SIGPIPE 杀掉 QEMU,掩盖其后的
+# 崩溃 —— 必须等 QEMU 跑满再统一断言(pro 审计 #11)。
 test: build
-	@timeout 10 $(QEMU) $(QEMUARGS) -kernel $(KERNEL_ELF) 2>&1 | grep -q "M0: boot ok" \
-		&& echo "TEST PASS" || (echo "TEST FAIL"; exit 1)
+	@timeout 10 $(QEMU) $(QEMUARGS) -kernel $(KERNEL_ELF) > /tmp/ignium-test.log 2>&1 || true
+	@grep -q "M0: boot ok" /tmp/ignium-test.log \
+		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
+		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)
 
 clean:
 	cargo clean

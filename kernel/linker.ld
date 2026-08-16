@@ -12,6 +12,7 @@ ENTRY(_start)
 
 BASE_ADDRESS = 0x80200000;      /* QEMU virt 上 OpenSBI 跳转内核的地址 */
 STACK_SIZE = 64K;               /* 引导栈大小;M1 引入守护页后缩小 */
+TRAP_STACK_SIZE = 16K;          /* 陷阱栈大小(异常处理器专用) */
 
 SECTIONS
 {
@@ -63,12 +64,29 @@ SECTIONS
 
     /* 引导栈:NOLOAD(不占镜像文件),位于 _kernel_end 之后。
      * entry.S 的清零循环以 _stack_top 为界,栈区因此也被清零,
-     * 这是 panic 栈水位检测成立的前提。 */
+     * 这是 panic 栈水位检测成立的前提。
+     * 栈向下增长;下方紧邻 _kernel_end(内核数据)——
+     * M1 引入 MMU 后须在 _kernel_end 与栈之间加不可映射守护页。
+     * 溢出防护:栈水位(p后诊断)+ M1 守护页(事前防护)。 */
     .stack (NOLOAD) : {
         _stack_bottom = .;
         . += STACK_SIZE;
         _stack_top = .;
     }
+
+    /* 陷阱栈:异常处理器专用栈(trap_vector 在其上压帧)。
+     * 与引导栈分离:处理器绝不在被中断者的 sp 上运行,
+     * 也避免 handler 深度使用引导栈(pro 审计 #2)。 */
+    .trap_stack (NOLOAD) : {
+        _trap_stack_bottom = .;
+        . += TRAP_STACK_SIZE;
+        _trap_stack_top = .;
+    }
+
+    /* M1 物理分配器的起点:栈区/陷阱栈区属于保留区,
+     * 分配器必须从 _alloc_start 之后取页(pro 审计 #4)。 */
+    . = ALIGN(4K);
+    _alloc_start = .;
 
     /* 孤儿段策略:显式丢弃工具链噪音段;调试/属性段显式收纳
      * (否则 --orphan-handling=error 会打断 debug 构建) */

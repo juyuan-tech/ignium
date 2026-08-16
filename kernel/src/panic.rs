@@ -58,15 +58,16 @@ fn stack_bounds() -> (usize, usize) {
 ///
 /// 原理:boot 时栈区被 BSS 清零循环清零;此后任何非零字节都意味着
 /// 该地址曾被写过。从栈底向上第一个非零字节 ≈ 历史最深栈帧底。
-/// 按 usize(8 字节)扫描而非逐字节:栈底 16 字节对齐,无未对齐风险。
+/// 按**字节**扫描(pro 审计 #13:usize 类型读取带严格 provenance
+/// 的活跃栈内存存在可疑性;panic 路径的性能开销可忽略)。
 fn stack_watermark() -> usize {
     let (bottom, top) = stack_bounds();
     let mut probe = bottom;
     while probe < top {
-        if unsafe { core::ptr::read_volatile(probe as *const usize) } != 0 {
+        if unsafe { core::ptr::read_volatile(probe as *const u8) } != 0 {
             return top - probe;
         }
-        probe += core::mem::size_of::<usize>();
+        probe += 1;
     }
     0
 }

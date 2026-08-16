@@ -9,7 +9,10 @@
 ```bash
 # 密钥二选一(绝不入库、不发给模型):
 IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py     # 环境变量
-python3 scripts/ai_audit.py --key-file /tmp/key.txt     # 一次性密钥文件
+python3 scripts/ai_audit.py --key-file /tmp/key.txt     # 密钥文件
+
+# 密钥文件可长期保留(建议放仓库之外的路径,如 %TEMP%\opencode\audit-key.txt):
+python3 scripts/ai_audit.py --key-file /mnt/c/Users/<user>/AppData/Local/Temp/opencode/audit-key.txt
 
 # 可选配置(环境变量):
 IGNIUM_AUDIT_MODEL=deepseek-v4-pro    # 默认;可换 deepseek-v4-flash

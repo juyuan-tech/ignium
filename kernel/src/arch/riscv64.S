@@ -6,41 +6,46 @@
 # ---------------------------------------------------------------------------
 # trap_vector:异常/中断统一入口(stvec 指向此处)。
 #
-# 设计要点:
-#   - 用 sscratch 换出 t6 获得陷阱帧基址,从而**不破坏被中断的 t6**
-#     (M1 的 sret 恢复路径依赖帧的完整性)。
-#   - 保存全部 31 个通用寄存器 + 4 个关键 CSR(sstatus/sepc/scause/stval)。
+# 设计(基于 pro 审计 #2/#3 的重构):
+#   - **陷阱栈**:sscratch 保存 per-hart 陷阱栈顶;入口用 `csrrw` 换出
+#     t6 取得栈顶,在陷阱栈上压入陷阱帧 —— 处理器绝不在被中断者的
+#     sp 上运行(栈溢出/用户态 sp 均无法危害内核)。
+#   - **可重入**:每层陷阱向下压新帧,并把 sscratch 更新为新帧底;
+#     嵌套陷阱的写入被限制在陷阱栈区域内,不再破坏任意内存。
+#   - **完整帧**:保存全部 31 个通用寄存器 + 4 个关键 CSR。
 #   - M0 阶段 trap_handler 输出诊断后停机;M1 扩展为中断分发 + sret。
 #
-# TRAP_FRAME 布局(与 riscv64.rs 的声明保持一致):
-#   [0..31)  GPR x1..x31(索引 30 为原始 t6)
+# 帧布局(与 riscv64.rs 的 ABI 索引常量保持一致!改一侧必须改另一侧):
+#   [0..31)  GPR x1..x31(索引 n 对应 x(n+1))
 #   [32]     sstatus
 #   [33]     sepc
 #   [34]     scause
 #   [35]     stval
 #   [36..40) 预留(M1 使用)
 #
-# ⚠ 已知限制(嵌套 trap):
-#   若在 trap_handler 执行期间再次发生 trap(如 trap 代码自身的 bug),
-#   入口的 `csrrw` 会把第一次 trap 的原始 t6(一个代码地址)换进 t6,
-#   后续保存会写入该地址 —— 破坏代码段。
-#   当前 M0 阶段不可达(trap_handler 只输出并停机,中断未使能)。
-#   M1 使能中断时必须重构:sscratch 改为 per-hart **陷阱栈**指针,
-#   帧挂在栈上(天然支持嵌套),或入口先检查帧占用标志。
+# 陷阱栈与引导栈在 linker.ld 中定义(均位于 _kernel_end 之后的保留区)。
 # ---------------------------------------------------------------------------
 
 .section .text
 .align 4                    # stvec 要求 4 字节对齐(直接模式下低 2 位必须为 0)
 .globl trap_vector
 trap_vector:
-    # 交换 t6 与 sscratch:t6 ← 陷阱帧基址,被中断的 t6 暂存于 sscratch。
-    # 前置条件:init_traps() 已将 sscratch 初始化为 TRAP_FRAME 地址。
+    # t6 ← 陷阱栈顶(sscratch),被中断的 t6 暂存于 sscratch。
     csrrw t6, sscratch, t6
+    # 在陷阱栈上预留帧(t6 = 帧基址)。
+    addi t6, t6, -320
+    # 先保存原始 t0(t0 即将被用作临时寄存器)。
+    sd t0, 4*8(t6)
+    # 取出被中断的 t6(暂存在 sscratch)并写入帧槽 30。
+    csrr t0, sscratch
+    sd t0, 30*8(t6)
+    # 更新陷阱栈顶 = 本帧底:嵌套陷阱将向下压新帧(写入被限制在
+    # 陷阱栈内,不会破坏任意内存)。
+    csrw sscratch, t6
     sd ra, 0*8(t6)
     sd sp, 1*8(t6)
     sd gp, 2*8(t6)
     sd tp, 3*8(t6)
-    sd t0, 4*8(t6)
     sd t1, 5*8(t6)
     sd t2, 6*8(t6)
     sd s0, 7*8(t6)
@@ -66,9 +71,6 @@ trap_vector:
     sd t3, 27*8(t6)
     sd t4, 28*8(t6)
     sd t5, 29*8(t6)
-    # 恢复被中断的 t6(暂存于 sscratch);t0 已在 4*8(t6) 保存,可安全复用。
-    csrr t0, sscratch
-    sd t0, 30*8(t6)
     # 保存关键 CSR:硬件在异常/中断入口已更新这些值,是定位故障的核心。
     csrr t0, sstatus
     sd t0, 32*8(t6)
@@ -83,6 +85,10 @@ trap_vector:
     csrr a1, sepc
     csrr a2, stval
     mv a3, t6
+    # 处理器自身栈:帧下方预留 1KB(嵌套陷阱会压向更深处,仍在
+    # 陷阱栈内)。若 handler 递归深度超过预留,写入会越过陷阱栈底
+    # 进入引导栈顶 —— 仍是内核保留区,不破坏内核数据。
+    addi sp, t6, -1024
     call trap_handler
     # trap_handler 返回类型为 !,此处不可达;防御性死循环。
 1:

@@ -11,6 +11,52 @@ use crate::error;
 // 具体约定见 riscv64.S 头部注释。
 global_asm!(include_str!("riscv64.S"));
 
+/// 陷阱帧 GPR 索引:索引 n 对应 x(n+1)(与 riscv64.S 保存顺序一致)。
+///
+/// **ABI 常量契约**:汇编保存顺序与这里的索引必须同步修改,
+/// 否则诊断 dump 会把寄存器标签全部错位(pro 审计 #1)。
+#[allow(dead_code)] // 常量由 trap_handler 打印代码使用,部分暂未全部引用
+mod gpr {
+    pub const X_RA: usize = 0; // x1
+    pub const X_SP: usize = 1; // x2
+    pub const X_GP: usize = 2; // x3
+    pub const X_TP: usize = 3; // x4
+    pub const X_T0: usize = 4; // x5
+    pub const X_T1: usize = 5; // x6
+    pub const X_T2: usize = 6; // x7
+    pub const X_S0: usize = 7; // x8
+    pub const X_S1: usize = 8; // x9
+    pub const X_A0: usize = 9; // x10
+    pub const X_A1: usize = 10; // x11
+    pub const X_A2: usize = 11; // x12
+    pub const X_A3: usize = 12; // x13
+    pub const X_A4: usize = 13; // x14
+    pub const X_A5: usize = 14; // x15
+    pub const X_A6: usize = 15; // x16
+    pub const X_A7: usize = 16; // x17
+    pub const X_S2: usize = 17; // x18
+    pub const X_S3: usize = 18; // x19
+    pub const X_S4: usize = 19; // x20
+    pub const X_S5: usize = 20; // x21
+    pub const X_S6: usize = 21; // x22
+    pub const X_S7: usize = 22; // x23
+    pub const X_S8: usize = 23; // x24
+    pub const X_S9: usize = 24; // x25
+    pub const X_S10: usize = 25; // x26
+    pub const X_S11: usize = 26; // x27
+    pub const X_T3: usize = 27; // x28
+    pub const X_T4: usize = 28; // x29
+    pub const X_T5: usize = 29; // x30
+    pub const X_T6: usize = 30; // x31
+}
+
+// 陷阱帧 CSR 槽位(riscv64.S 同样保存这些)。
+const CS_SSTATUS: usize = 32;
+const CS_SEPC: usize = 33;
+const CS_SCAUSE: usize = 34;
+const CS_STVAL: usize = 35;
+const TRAP_FRAME_WORDS: usize = 36;
+
 /// CPU 寄存器快照,panic/诊断输出用。
 ///
 /// `#[repr(C)]`:字段顺序与 `cpu_state_asm` 的写入偏移一一对应
@@ -34,21 +80,12 @@ extern "C" {
     fn cpu_state_asm(out: *mut CpuState);
     // trap_vector 的符号地址(riscv64.S 中定义,16 字节对齐)。
     static trap_vector: u8;
+    // 陷阱栈边界(linker.ld 定义):异常处理器的专用栈,帧压在其上。
+    static _trap_stack_bottom: u8;
+    static _trap_stack_top: u8;
 }
 
-/// 陷阱帧:trap_vector(汇编)的寄存器保存区。
-///
-/// 布局(与 riscv64.S 一致,修改必须同步):
-///   [0..31)  GPR x1..x31(索引 30 = 原始 t6)
-///   [32]     sstatus  [33] sepc  [34] scause  [35] stval
-///   [36..40) 预留(M1:sret 恢复路径可能扩展)
-///
-/// 当前为静态缓冲(单核假设);M1 多 hart 化时改为 per-hart 数组,
-/// 并用 sscratch 保存 hart 私有帧指针。
-#[unsafe(no_mangle)]
-pub static mut TRAP_FRAME: [usize; 40] = [0; 40];
-
-/// 安装陷阱向量并初始化陷阱帧指针。
+/// 安装陷阱向量并初始化陷阱栈指针。
 ///
 /// # Safety 说明(调用顺序要求)
 /// 必须在 `uart::init` **之后**调用:stvec 装好后发生的 trap 会进入
@@ -56,13 +93,13 @@ pub static mut TRAP_FRAME: [usize; 40] = [0; 40];
 /// 也必须在一切可能触发异常的用户代码之前调用(否则异常跳地址 0)。
 pub fn init_traps() {
     unsafe {
-        // sscratch 保存陷阱帧基址,供 trap_vector 入口的 `csrrw` 换出使用。
-        // 注意:当前为单 hart 静态帧;多 hart 时此处改为 per-hart 帧地址。
+        // sscratch = 陷阱栈顶;trap_vector 入口用它换出 t6 并在
+        // 栈上压帧(多 hart 时改为 per-hart 栈,此处为单 hart 静态栈)。
         asm!(
-            "la {tmp}, {frame}",
+            "la {tmp}, {top}",
             "csrw sscratch, {tmp}",
             tmp = out(reg) _,
-            frame = sym TRAP_FRAME,
+            top = sym _trap_stack_top,
             options(nostack)
         );
         // stvec 直接模式:低 2 位必须为 0,指向 4 字节对齐的入口
@@ -78,7 +115,7 @@ pub fn init_traps() {
 /// 读取 CPU 寄存器快照(委托给汇编实现,见 riscv64.S)。
 ///
 /// 注意:读到的 `ra`/`sp` 是**当前调用上下文**(panic 处理器自身),
-/// 不是故障点上下文;故障点的忠实寄存器帧由 `TRAP_FRAME` 提供
+/// 不是故障点上下文;故障点的忠实寄存器帧由陷阱栈上的帧提供
 /// (trap_handler 打印)。字段含义用于横向参考。
 pub fn cpu_state() -> CpuState {
     let mut s = CpuState {
@@ -110,8 +147,10 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("wfi", options(nomem, nostack)) }
 }
 
-/// 停机:关中断后反复 wfi。用于 panic 等不可恢复场景,防止日志被污染。
+/// 停机:先关中断再反复 wfi。用于 panic 等不可恢复场景,防止
+/// 输出过程被中断打断、日志被污染(pro 审计 #12:原实现未强制关中断)。
 pub fn halt() -> ! {
+    irq_disable();
     loop {
         unsafe { asm!("wfi", options(nomem, nostack)) }
     }
@@ -123,46 +162,73 @@ pub fn halt() -> ! {
 /// - `scause`:异常/中断原因编码(最高位为 1 表示中断)。
 /// - `sepc`:触发 trap 的指令地址(同步异常时为故障指令)。
 /// - `stval`:trap 相关附加信息(如非法访存地址)。
-/// - `frame`:TRAP_FRAME 基址(31 GPR + 4 CSR,布局见 TRAP_FRAME 注释)。
+/// - `frame`:陷阱栈上帧的基址(布局见 riscv64.S 头部注释)。
+///
+/// # Safety
+/// `frame` 必须指向陷阱栈范围内的有效帧(由汇编压入);调用前会
+/// 校验边界,非法指针直接停机而不是解引用(pro 审计 #7)。
 ///
 /// M0 阶段:仅做完整诊断输出后停机。M1 将按 scause 分发:
 /// 中断 → 对应设备处理(定时器/串口),异常 → 输出帧并停机。
 #[unsafe(no_mangle)]
-pub extern "C" fn trap_handler(scause: usize, sepc: usize, stval: usize, frame: *mut usize) -> ! {
-    // 帧内前 31 项为 GPR,是故障点的忠实快照。
-    let regs = unsafe { core::slice::from_raw_parts(frame, 31) };
+pub unsafe extern "C" fn trap_handler(
+    scause: usize,
+    sepc: usize,
+    stval: usize,
+    frame: *mut usize,
+) -> ! {
+    use gpr::*;
+
+    // 帧指针完整性校验:必须在陷阱栈内、且容纳整个帧。
+    let f = frame as usize;
+    let bottom = unsafe { &_trap_stack_bottom as *const u8 as usize };
+    let top = unsafe { &_trap_stack_top as *const u8 as usize };
+    if f < bottom || f + TRAP_FRAME_WORDS * 8 > top || !f.is_multiple_of(16) {
+        // 帧指针非法(栈被破坏或入口异常):不再解引用,直接停机。
+        error!(
+            "FATAL: invalid trap frame {:#x} (trap stack [{:#x}, {:#x}))",
+            f, bottom, top
+        );
+        halt()
+    }
+
+    let regs = unsafe { core::slice::from_raw_parts(frame, TRAP_FRAME_WORDS) };
     error!(
         "TRAP: scause={:#x} sepc={:#x} stval={:#x}",
         scause, sepc, stval
     );
     error!(
         "ra={:#x} sp={:#x} gp={:#x} tp={:#x}",
-        regs[0], regs[1], regs[2], regs[3]
+        regs[X_RA], regs[X_SP], regs[X_GP], regs[X_TP]
     );
     error!(
-        "t0={:#x} t1={:#x} t2={:#x} s0={:#x}",
-        regs[4], regs[5], regs[6], regs[7]
+        "t0={:#x} t1={:#x} t2={:#x} s0={:#x} s1={:#x}",
+        regs[X_T0], regs[X_T1], regs[X_T2], regs[X_S0], regs[X_S1]
     );
     error!(
         "a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
-        regs[8], regs[9], regs[10], regs[11]
+        regs[X_A0], regs[X_A1], regs[X_A2], regs[X_A3]
     );
     error!(
         "a4={:#x} a5={:#x} a6={:#x} a7={:#x}",
-        regs[12], regs[13], regs[14], regs[15]
+        regs[X_A4], regs[X_A5], regs[X_A6], regs[X_A7]
     );
     error!(
         "s2={:#x} s3={:#x} s4={:#x} s5={:#x}",
-        regs[16], regs[17], regs[18], regs[19]
+        regs[X_S2], regs[X_S3], regs[X_S4], regs[X_S5]
     );
     error!(
         "s6={:#x} s7={:#x} s8={:#x} s9={:#x}",
-        regs[20], regs[21], regs[22], regs[23]
+        regs[X_S6], regs[X_S7], regs[X_S8], regs[X_S9]
     );
     error!(
         "s10={:#x} s11={:#x} t3={:#x} t4={:#x}",
-        regs[24], regs[25], regs[26], regs[27]
+        regs[X_S10], regs[X_S11], regs[X_T3], regs[X_T4]
     );
-    error!("t5={:#x} t6={:#x}", regs[28], regs[29]);
+    error!("t5={:#x} t6={:#x}", regs[X_T5], regs[X_T6]);
+    error!(
+        "sstatus={:#x} sepc_f={:#x} scause_f={:#x} stval_f={:#x}",
+        regs[CS_SSTATUS], regs[CS_SEPC], regs[CS_SCAUSE], regs[CS_STVAL]
+    );
     halt()
 }

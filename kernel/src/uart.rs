@@ -11,6 +11,15 @@
 //! 因此 **必须先置 DLAB 再写分频,清 DLAB 后再写 IER**;
 //! 顺序写反会把波特率高字节写进 IER 或反之,真机上表现为乱码。
 //!
+//! # MMIO 定序(fence)
+//! `volatile` 只阻止编译器重排,**不产生硬件定序**;乱序 RISC-V 核
+//! 可能重排对不同 MMIO 地址的写入,破坏 DLAB 时序。关键写之间
+//! 插入 `fence iorw, iorw`(pro 审计 #10)。
+//!
+//! # 平台依赖(已知限制)
+//! 基址 0x1000_0000 与分频值均为 QEMU virt 约定:M1 阶段改为解析
+//! FDT 得到基址/时钟,按实际时钟计算分频(pro 审计 #6)。
+//!
 //! # 健壮性
 //! 发送采用**有界等待**:真机上 TX 挂死时宁可丢字符(计数器记录)
 //! 也不让整个内核死锁 —— 调试输出必须永远可用。
@@ -34,38 +43,64 @@ pub struct Writer;
 /// 因 TX 超时被丢弃的字符计数(panic dump 中可查,诊断硬件问题)。
 static TX_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// 读 MMIO 寄存器(volatile,防编译器合并/缓存)。
+/// 设备寄存器定序屏障:排序前后的 MMIO 读写。
+/// RISC-V 中 volatile 不产生硬件定序,此处为硬件可见的 fence。
 #[inline]
-fn read_u8(addr: usize) -> u8 {
+fn mmio_fence() {
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
+}
+
+/// 读 MMIO 寄存器(volatile,防编译器合并/缓存)。
+///
+/// # Safety
+/// `addr` 必须指向本内核已映射的 MMIO 寄存器地址,且可读。
+/// 本驱动内部只传入固定 UART 寄存器常量。
+#[inline]
+unsafe fn read_u8(addr: usize) -> u8 {
     unsafe { core::ptr::read_volatile(addr as *const u8) }
 }
 
 /// 写 MMIO 寄存器(volatile)。
+///
+/// # Safety
+/// 同 `read_u8`:addr 必须为合法 MMIO 地址。
 #[inline]
-fn write_u8(addr: usize, val: u8) {
+unsafe fn write_u8(addr: usize, val: u8) {
     unsafe { core::ptr::write_volatile(addr as *mut u8, val) }
 }
 
 /// LSR 位 5 = THR 空(发送保持寄存器可写)。
 #[inline]
 fn is_transmit_empty() -> bool {
-    read_u8(UART_LSR) & 0x20 != 0
+    unsafe { read_u8(UART_LSR) & 0x20 != 0 }
 }
 
-/// 初始化串口为 8N1、115200、FIFO 开启、关中断。
+/// 初始化串口为 8N1、FIFO 开启、关中断。
 ///
-/// 顺序敏感,见模块头"DLAB 陷阱"说明:
-/// 1. LCR=0x80(DLAB=1)→ 写 DLL=0x0C、DLM=0x00(115200 分频)
-/// 2. LCR=0x03(DLAB=0,8N1)→ 此时才能写 IER=0(关中断)
+/// 顺序敏感,见模块头"DLAB 陷阱"说明;关键写之间插入 MMIO fence:
+/// 1. LCR=0x80(DLAB=1)→ fence → 写 DLL/DLM 分频
+/// 2. LCR=0x03(DLAB=0,8N1)→ fence → 写 IER=0(关中断)
 /// 3. FCR=0x07(开 FIFO 并清空)、MCR=0x03(RTS/DTR 置位)
+///
+/// 分频值说明:分频 = 参考时钟 / (16 × 波特率)。QEMU virt 的虚拟
+/// 串口对波特率不敏感,此处数值仅为形式正确(经典 1.8432MHz 参考
+/// 时钟下为 9600 波特,与注释"115200"不符 —— 真机必须按实际时钟
+/// 计算,见模块头"平台依赖")。
 pub fn init() {
-    write_u8(UART_LCR, 0x80);
-    write_u8(UART_DLL, 0x0C);
-    write_u8(UART_DLM, 0x00);
-    write_u8(UART_LCR, 0x03);
-    write_u8(UART_IER, 0x00);
-    write_u8(UART_FCR, 0x07);
-    write_u8(UART_MCR, 0x03);
+    unsafe {
+        write_u8(UART_LCR, 0x80);
+        mmio_fence();
+        write_u8(UART_DLL, 0x0C);
+        write_u8(UART_DLM, 0x00);
+        mmio_fence();
+        write_u8(UART_LCR, 0x03);
+        mmio_fence();
+        write_u8(UART_IER, 0x00);
+        write_u8(UART_FCR, 0x07);
+        write_u8(UART_MCR, 0x03);
+    }
 }
 
 /// 被丢弃字符计数(panic dump 用)。
@@ -88,7 +123,11 @@ pub fn putc(c: u8) {
             return;
         }
     }
-    write_u8(UART_BASE, c);
+    unsafe {
+        write_u8(UART_BASE, c);
+        // 写后 fence:保证后续 LSR 轮询观察到本次写已到达设备。
+        mmio_fence();
+    }
 }
 
 /// 输出字符串;`\n` 自动补 `\r\n`(终端换行兼容)。
