@@ -47,6 +47,17 @@ make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 - `error!` / `warn!` / `info!`(默认输出)/ `debug!` / `trace!`(默认隐藏,`logger::set_level` 可调)
 - panic 时自动输出:位置、消息、CPU 状态 dump(寄存器 + 关键 CSR),并停机关中断
 
+## 独立 AI 审计
+
+防止"自己审自己"的盲区,可用外部 AI(DeepSeek)对源码做独立安全审查:
+
+```bash
+IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
+```
+
+- 密钥只走环境变量/一次性文件,不入库、不发给模型
+- 报告保存至 `docs/audit-reports/<时间戳>-deepseek-chat.md`
+
 ## 仓库结构
 
 ```

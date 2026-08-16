@@ -1,6 +1,8 @@
 .section .text.entry
 .globl _start
 _start:
+    csrw satp, zero
+    fence
     la t0, _bss_start
     la t1, _stack_top
 1:

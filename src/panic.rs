@@ -28,15 +28,20 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     arch::halt()
 }
 
-fn stack_watermark() -> usize {
+fn stack_bounds() -> (usize, usize) {
     let bottom = unsafe { &_stack_bottom as *const u8 as usize };
     let top = unsafe { &_stack_top as *const u8 as usize };
+    (bottom, top)
+}
+
+fn stack_watermark() -> usize {
+    let (bottom, top) = stack_bounds();
     let mut probe = bottom;
     while probe < top {
-        if unsafe { core::ptr::read_volatile(probe as *const u8) } != 0 {
+        if unsafe { core::ptr::read_volatile(probe as *const usize) } != 0 {
             return top - probe;
         }
-        probe += 1;
+        probe += core::mem::size_of::<usize>();
     }
     0
 }
@@ -44,13 +49,20 @@ fn stack_watermark() -> usize {
 fn dump_cpu(state: CpuState) {
     error!("--- CPU state ---");
     error!("tick: {}", crate::logger::tick());
-    let bottom = unsafe { &_stack_bottom as *const u8 as usize };
-    let top = unsafe { &_stack_top as *const u8 as usize };
-    let total = top - bottom;
+    error!("note: sepc/scause/stval are best-effort until M1 trap context capture");
+    let (bottom, top) = stack_bounds();
+    let sp = state.sp;
+    if sp < bottom || sp >= top {
+        error!(
+            "WARNING: sp={:#x} outside stack range [{:#x}, {:#x})",
+            sp, bottom, top
+        );
+    }
     error!(
-        "stack watermark: {} / {} bytes used",
+        "stack watermark: {} / {} bytes used, uart dropped: {}",
         stack_watermark(),
-        total
+        top - bottom,
+        crate::uart::dropped()
     );
     error!(
         "ra={:#x} sp={:#x} gp={:#x} tp={:#x}",

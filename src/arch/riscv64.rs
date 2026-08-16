@@ -1,5 +1,10 @@
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 
+use crate::error;
+
+global_asm!(include_str!("riscv64.S"));
+
+#[repr(C)]
 pub struct CpuState {
     pub ra: usize,
     pub sp: usize,
@@ -10,6 +15,23 @@ pub struct CpuState {
     pub scause: usize,
     pub stval: usize,
     pub satp: usize,
+}
+
+#[unsafe(no_mangle)]
+pub static mut TRAP_FRAME: [usize; 32] = [0; 32];
+
+extern "C" {
+    static trap_vector: u8;
+}
+
+pub fn init_traps() {
+    unsafe {
+        asm!(
+            "csrw stvec, {}",
+            in(reg) &trap_vector as *const u8 as usize,
+            options(nomem, nostack)
+        );
+    }
 }
 
 pub fn cpu_state() -> CpuState {
@@ -52,7 +74,7 @@ pub fn cpu_state() -> CpuState {
 #[inline]
 pub fn irq_disable() {
     unsafe {
-        asm!("csrc sstatus, {}", in(reg) 1 << 1, options(nomem, nostack));
+        asm!("csrc sstatus, {imm}", imm = const 2, options(nomem, nostack));
     }
 }
 
@@ -65,4 +87,43 @@ pub fn halt() -> ! {
     loop {
         unsafe { asm!("wfi", options(nomem, nostack)) }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn trap_handler(scause: usize, sepc: usize, stval: usize, frame: *mut usize) -> ! {
+    error!(
+        "TRAP: scause={:#x} sepc={:#x} stval={:#x}",
+        scause, sepc, stval
+    );
+    let regs = unsafe { core::slice::from_raw_parts(frame, 31) };
+    error!(
+        "ra={:#x} sp={:#x} gp={:#x} tp={:#x}",
+        regs[0], regs[1], regs[2], regs[3]
+    );
+    error!(
+        "t0={:#x} t1={:#x} t2={:#x} s0={:#x}",
+        regs[4], regs[5], regs[6], regs[7]
+    );
+    error!(
+        "a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+        regs[8], regs[9], regs[10], regs[11]
+    );
+    error!(
+        "a4={:#x} a5={:#x} a6={:#x} a7={:#x}",
+        regs[12], regs[13], regs[14], regs[15]
+    );
+    error!(
+        "s2={:#x} s3={:#x} s4={:#x} s5={:#x}",
+        regs[16], regs[17], regs[18], regs[19]
+    );
+    error!(
+        "s6={:#x} s7={:#x} s8={:#x} s9={:#x}",
+        regs[20], regs[21], regs[22], regs[23]
+    );
+    error!(
+        "s10={:#x} s11={:#x} t3={:#x} t4={:#x}",
+        regs[24], regs[25], regs[26], regs[27]
+    );
+    error!("t5={:#x} t6={:#x}", regs[28], regs[29]);
+    halt()
 }
