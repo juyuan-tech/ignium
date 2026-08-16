@@ -23,4 +23,10 @@ test: build
 clean:
 	cargo clean
 
-.PHONY: build bin qemu gdb test clean
+clippy:
+	cargo clippy --release -- -D warnings
+
+fmt:
+	cargo fmt --check
+
+.PHONY: build bin qemu gdb test clean clippy fmt

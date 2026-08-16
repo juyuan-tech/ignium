@@ -15,6 +15,8 @@ jobs:
           components: llvm-tools
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
       - run: cargo build --release
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo fmt --check
       - name: Boot test in QEMU
         run: |
           timeout 10 qemu-system-riscv64 -M virt -m 128M -nographic -bios default \

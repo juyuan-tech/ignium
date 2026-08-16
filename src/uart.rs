@@ -1,21 +1,41 @@
 use core::fmt;
 
 const UART_BASE: usize = 0x1000_0000;
-const UART_THR: usize = UART_BASE + 0x00;
+const UART_IER: usize = UART_BASE + 0x01;
+const UART_FCR: usize = UART_BASE + 0x02;
+const UART_LCR: usize = UART_BASE + 0x03;
+const UART_MCR: usize = UART_BASE + 0x04;
 const UART_LSR: usize = UART_BASE + 0x05;
 
 pub struct Writer;
 
 #[inline]
-fn is_transmit_empty() -> bool {
-    unsafe { core::ptr::read_volatile(UART_LSR as *const u8) & 0x20 != 0 }
+fn read_u8(addr: usize) -> u8 {
+    unsafe { core::ptr::read_volatile(addr as *const u8) }
 }
 
-pub fn init() {}
+#[inline]
+fn write_u8(addr: usize, val: u8) {
+    unsafe { core::ptr::write_volatile(addr as *mut u8, val) }
+}
+
+#[inline]
+fn is_transmit_empty() -> bool {
+    read_u8(UART_LSR) & 0x20 != 0
+}
+
+pub fn init() {
+    write_u8(UART_LCR, 0x80);
+    write_u8(UART_BASE, 0x0C);
+    write_u8(UART_IER, 0x00);
+    write_u8(UART_LCR, 0x03);
+    write_u8(UART_FCR, 0x07);
+    write_u8(UART_MCR, 0x03);
+}
 
 pub fn putc(c: u8) {
     while !is_transmit_empty() {}
-    unsafe { core::ptr::write_volatile(UART_THR as *mut u8, c) }
+    write_u8(UART_BASE, c);
 }
 
 pub fn write_str(s: &str) {

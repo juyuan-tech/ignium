@@ -2,10 +2,12 @@ OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
 BASE_ADDRESS = 0x80200000;
+STACK_SIZE = 64K;
 
 SECTIONS
 {
     . = BASE_ADDRESS;
+    _kernel_start = .;
     _text_start = .;
     .text : {
         *(.text.entry)
@@ -30,9 +32,11 @@ SECTIONS
         *(.sbss*)
         *(COMMON)
         . = ALIGN(16);
-        . += 64K;
+        . += STACK_SIZE;
         _stack_top = .;
+        _stack_size = STACK_SIZE;
     }
     . = ALIGN(4K);
     _end = .;
+    _kernel_end = .;
 }

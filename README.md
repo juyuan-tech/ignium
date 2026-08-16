@@ -35,20 +35,30 @@ make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 预期输出:
 
 ```
-[Ignium] 炬元微内核 v0.1.0 booting
-[Ignium] M0: boot ok - arch: riscv64, machine: qemu-virt
+[000000] [INFO ] Ignium 炬元微内核 v0.1.0 booting
+[000000] [INFO ] M0: boot ok - arch: riscv64, machine: qemu-virt
+[000000] [WARN ] timer not yet enabled; tick stays at 0 until M1
 ```
+
+## 日志系统
+
+分级日志(`[tick] [级别] 消息`,tick 由定时器递增,M1 后启用):
+
+- `error!` / `warn!` / `info!`(默认输出)/ `debug!` / `trace!`(默认隐藏,`logger::set_level` 可调)
+- panic 时自动输出:位置、消息、CPU 状态 dump(寄存器 + 关键 CSR),并停机关中断
 
 ## 仓库结构
 
 ```
 ├── src/
-│   ├── main.rs          # 入口 + panic 处理
+│   ├── main.rs          # 入口 + 启动日志
 │   ├── entry.S          # _start,清零 bss,跳转 kernel_main
-│   ├── uart.rs          # NS16550 串口驱动 + println! 宏
+│   ├── logger.rs        # 分级日志系统(error/warn/info/debug/trace + tick)
+│   ├── panic.rs         # panic 处理:位置/消息/CPU 状态 dump
+│   ├── uart.rs          # NS16550 串口驱动(初始化 + println! + 日志输出)
 │   └── arch/            # 架构隔离层(riscv64 / 未来 x86_64)
 ├── linker.ld            # 链接脚本(QEMU virt 0x80200000)
-├── Makefile             # build / qemu / gdb / test
+├── Makefile             # build / qemu / gdb / test / clippy / fmt
 ├── docs/DESIGN.md       # 架构设计原则
 └── ROADMAP.md           # 12 个月串行路线
 ```
