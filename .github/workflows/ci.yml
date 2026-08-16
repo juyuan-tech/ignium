@@ -15,7 +15,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: riscv64gc-unknown-none-elf
-          components: llvm-tools
+          components: llvm-tools, clippy, rustfmt
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
       - run: cargo build --release
       - run: cargo clippy --release -- -D warnings
