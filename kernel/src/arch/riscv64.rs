@@ -4,6 +4,7 @@
 //! 新建 arch/x86_64.rs + 汇编,实现同样一组接口即可。
 
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error;
 
@@ -153,6 +154,7 @@ pub fn irq_enable() {
 
 /// 读取 mtimer 计数器(S 模式经 OpenSBI 委托,`csrr time` 直读)。
 /// 单位:OpenSBI 平台时钟周期(QEMU virt = 10 MHz)。
+#[inline]
 pub fn get_time() -> usize {
     let t: usize;
     unsafe {
@@ -163,6 +165,14 @@ pub fn get_time() -> usize {
 
 /// 定时器节拍间隔(10ms):mtimer 10 MHz 下 = 100,000 周期。
 pub const TIMER_INTERVAL: usize = 100_000;
+
+/// 下一次定时器中断的截止时间(mtimer 周期)。
+///
+/// 用 **deadline 递增法**替代 `get_time() + INTERVAL`:后者把中断
+/// 处理延迟(自截止到 handler 执行的时差)每个周期都累加进下次
+/// 截止,产生持续漂移;前者只加固定间隔,节拍无累积误差。
+/// 仅定时器 ISR 写入(fetch_add),启动时初始化一次。
+static TIMER_DEADLINE: AtomicUsize = AtomicUsize::new(0);
 
 /// 使能超级定时器中断(STIE)并编程第一次定时器中断。
 ///
@@ -175,7 +185,9 @@ pub fn enable_timer() {
         // 走寄存器操作数形式。
         asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nomem, nostack));
     }
-    crate::sbi::set_timer(get_time() + TIMER_INTERVAL);
+    let deadline = get_time() + TIMER_INTERVAL;
+    TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
+    crate::sbi::set_timer(deadline);
 }
 
 /// 空闲等待:wfi 令 CPU 进入低功耗等待;若中断被使能,等待可被唤醒。
@@ -243,9 +255,12 @@ pub unsafe extern "C" fn trap_handler(
         // ===== 中断路径 =====
         match scause & !INTERRUPT_BIT {
             CAUSE_SUPERVISOR_TIMER => {
-                // 定时器节拍:tick 递增 + 重排下一次中断。
+                // 定时器节拍:deadline 递增(无累积漂移)+ tick 计数
+                // + 重排下一次中断。
                 crate::logger::tick_up();
-                crate::sbi::set_timer(get_time() + TIMER_INTERVAL);
+                let next =
+                    TIMER_DEADLINE.fetch_add(TIMER_INTERVAL, Ordering::Relaxed) + TIMER_INTERVAL;
+                crate::sbi::set_timer(next);
                 // 恢复被中断的上下文继续执行。
                 frame
             }

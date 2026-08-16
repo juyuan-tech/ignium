@@ -32,7 +32,8 @@
 trap_vector:
     # t6 ← 陷阱栈顶(sscratch),被中断的 t6 暂存于 sscratch。
     csrrw t6, sscratch, t6
-    # 在陷阱栈上预留帧(t6 = 帧基址)。
+    # 在陷阱栈上预留帧(t6 = 帧基址)。320 = TRAP_FRAME_WORDS(36)*8
+    # 加 32 字节余量,与 riscv64.rs 的帧定义及恢复路径的 +320 保持一致。
     addi t6, t6, -320
     # 先保存原始 t0(t0 即将被用作临时寄存器)。
     sd t0, 4*8(t6)

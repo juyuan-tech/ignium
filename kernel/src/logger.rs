@@ -80,6 +80,8 @@ pub fn tick() -> u64 {
 }
 
 /// tick 递增(M1 定时器中断回调;仅此处可修改 TICK)。
+/// ISR 热路径,保持 inline。
+#[inline]
 pub fn tick_up() {
     TICK.fetch_add(1, Ordering::Relaxed);
 }
