@@ -6,6 +6,8 @@ OpenAI-compatible API) for an independent security/bug review.
 
 Usage:
     IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py [--key-file PATH]
+    IGNIUM_AUDIT_MODEL=deepseek-v4-pro   # default; switch models via env
+    IGNIUM_AUDIT_URL=...                 # override API endpoint
 
 The API key is read from the environment or a one-shot local file.
 It is never written into the repository and never sent to the model.
@@ -21,9 +23,9 @@ import urllib.error
 import urllib.request
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-API_URL = "https://api.deepseek.com/chat/completions"
-MODEL = "deepseek-chat"
-TIMEOUT = 300
+API_URL = os.environ.get("IGNIUM_AUDIT_URL", "https://api.deepseek.com/chat/completions")
+MODEL = os.environ.get("IGNIUM_AUDIT_MODEL", "deepseek-v4-pro")
+TIMEOUT = 600
 
 GLOBS = [
     "src/**/*.rs",
@@ -121,7 +123,7 @@ def call_api(key, prompt, retries=3):
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 8192,
+            "max_tokens": 16384,
             "stream": False,
         }
     ).encode("utf-8")

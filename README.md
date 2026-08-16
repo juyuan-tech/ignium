@@ -53,6 +53,7 @@ make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 
 ```bash
 IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
+# 默认模型 deepseek-v4-pro,可切换:IGNIUM_AUDIT_MODEL=deepseek-v4-flash
 ```
 
 - 密钥只走环境变量/一次性文件,不入库、不发给模型
