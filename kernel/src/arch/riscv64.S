@@ -21,7 +21,8 @@
 #   [33]     sepc
 #   [34]     scause
 #   [35]     stval
-#   [36..40) 预留(M1 使用)
+#   (TRAP_FRAME_WORDS = 36,M1 若需扩展 CSR 槽位,须同步增加
+#    TRAP_FRAME_WORDS 与 TRAP_FRAME_SIZE)
 #
 # 陷阱栈与引导栈在 linker.ld 中定义(均位于 _kernel_end 之后的保留区)。
 # ---------------------------------------------------------------------------
@@ -35,8 +36,21 @@
 .align 4                    # stvec 要求 4 字节对齐(直接模式下低 2 位必须为 0)
 .globl trap_vector
 trap_vector:
-    # t6 ← 陷阱栈顶(sscratch),被中断的 t6 暂存于 sscratch。
+    # 1) 重建内核 gp(H1):被中断的上下文(未来用户态)可能持有任意
+    #    gp;后续任何可被链接器松弛成 gp 相对的访存(la 等)与
+    #    trap_handler 的全局访问都必须落在内核 gp 上。
+    #    norelax 防止本指令自身被松弛为 gp 相对寻址(变成 no-op)。
+    .option norelax
+    la gp, __global_pointer$
+    .option relax
+    # 2) t6 ← 陷阱栈顶(sscratch),被中断的 t6 暂存于 sscratch。
     csrrw t6, sscratch, t6
+    # 3) 嵌套检测(H2):正常状态下 sscratch == 陷阱栈顶;若为帧底
+    #    (handler 活跃),直接停机 —— 不做栈上压帧(嵌套帧会覆盖
+    #    外层 handler 活跃栈)。可恢复嵌套陷阱是 M1+ 工作(需
+    #    per-hart 应急栈),当前"嵌套即停机"是明确且安全的语义。
+    la t0, _trap_stack_top
+    bne t6, t0, 4f
     # 在陷阱栈上预留帧(t6 = 帧基址)。
     addi t6, t6, -TRAP_FRAME_SIZE
     # 先保存原始 t0(t0 即将被用作临时寄存器)。
@@ -159,6 +173,12 @@ trap_vector:
     csrci sstatus, 2
     wfi
     j 2b
+    # ===== 嵌套陷阱路径(H2:handler 活跃时再次 trap)=====
+    # 不触碰陷阱栈/帧,直接安全停机。
+4:
+    csrci sstatus, 2
+    wfi
+    j 4b
 
 # ---------------------------------------------------------------------------
 # cpu_state_asm:CpuState 快照读取(纯汇编实现)。

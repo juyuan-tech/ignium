@@ -126,7 +126,10 @@ def call_api(key, prompt, retries=3):
                 {"role": "system", "content": "You are a senior OS kernel security reviewer."},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": 65536,
+            # 输出不设实际限制:max 推理会吃掉大量 token(实测单次
+            # 思考可达 30 万字符),代码量增长后只会更多。
+            # 上限取 API 最大值 384K token(实际不可能触达)。
+            "max_tokens": 393216,
             "reasoning_effort": EFFORT,
             "stream": False,
         }

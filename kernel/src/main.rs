@@ -75,7 +75,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     loop {
         arch::wait_for_interrupt();
         let t = crate::logger::tick();
-        if t - last_tick >= 100 {
+        // wrapping_sub(L3):tick 回绕/损坏时避免减法下溢导致
+        // 心跳永久停摆(正确性优先于理论上的绝对时序)。
+        if t.wrapping_sub(last_tick) >= 100 {
             last_tick = t;
             // saturating_mul:overflow-checks 开启下,极端 tick 值
             // (u64 千年量级)也不会触发 panic(pro 审计 max #10)。

@@ -274,11 +274,19 @@ pub unsafe extern "C" fn trap_handler(
     stval: usize,
     frame: *mut usize,
 ) -> *mut usize {
-    // 帧指针完整性校验:必须在陷阱栈内、且容纳整个帧。
+    // 帧指针完整性校验(L2):用减法避免 `f + 帧长` 在损坏指针上
+    // 溢出回绕(旧写法 f+288 可回绕越过 top,导致 OOB 解引用)。
+    // 必须:帧在陷阱栈内、容纳整个帧、16 字节对齐。
     let f = frame as usize;
     let bottom = unsafe { &_trap_stack_bottom as *const u8 as usize };
     let top = unsafe { &_trap_stack_top as *const u8 as usize };
-    if f < bottom || f + TRAP_FRAME_WORDS * 8 > top || !f.is_multiple_of(16) {
+    let frame_bytes = TRAP_FRAME_WORDS * 8;
+    if top < bottom
+        || top - bottom < frame_bytes
+        || f < bottom
+        || f > top - frame_bytes
+        || !f.is_multiple_of(16)
+    {
         // 帧指针非法(栈被破坏或入口异常):不再解引用,直接停机。
         error!(
             "FATAL: invalid trap frame {:#x} (trap stack [{:#x}, {:#x}))",

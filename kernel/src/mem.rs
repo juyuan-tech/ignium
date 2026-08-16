@@ -50,6 +50,7 @@ static mut PAGE_META: [PageMeta; MAX_PAGES] = [PageMeta {
 /// 伙伴分配器单例。
 static mut ALLOCATOR: BuddyAllocator = BuddyAllocator {
     base: 0,
+    real_count: 0,
     page_count: 0,
     meta: core::ptr::null_mut(),
     free_lists: [FREE_NONE; MAX_ORDER + 1],
@@ -57,9 +58,11 @@ static mut ALLOCATOR: BuddyAllocator = BuddyAllocator {
 
 /// 伙伴分配器。
 pub struct BuddyAllocator {
-    /// 可分配区物理基址(页对齐)。
+    /// 可分配区物理基址(页对齐,且对齐到最大块)。
     base: usize,
-    /// 可分配页数。
+    /// 真实可分配页数(不含补齐页)。
+    real_count: usize,
+    /// 补齐后的总页数(含永久占用的补齐页)。
     page_count: usize,
     /// 页元数据数组指针。
     meta: *mut PageMeta,
@@ -80,11 +83,13 @@ impl BuddyAllocator {
     }
 
     /// 页索引 → 物理地址。
+    #[inline]
     fn block_addr(&self, idx: usize) -> usize {
         self.base + idx * PAGE_SIZE
     }
 
     /// 物理地址 → 页索引。
+    #[inline]
     fn block_index(&self, addr: usize) -> usize {
         (addr - self.base) / PAGE_SIZE
     }
@@ -128,6 +133,7 @@ impl BuddyAllocator {
         debug_assert!(padded <= MAX_PAGES);
 
         self.base = base;
+        self.real_count = count;
         self.page_count = padded;
         self.meta = (&raw const PAGE_META).cast::<PageMeta>().cast_mut();
         for i in 0..padded {
@@ -170,20 +176,22 @@ impl BuddyAllocator {
             cur -= 1;
             self.push(idx + (1usize << cur), cur);
         }
-        // 标记整块已分配(元数据 order 与页一致,供 free 使用)。
-        let size = 1usize << order;
-        for i in idx..idx + size {
-            let m = self.meta(i);
-            m.order = order as u8;
-            m.used = true;
-        }
+        // 只标记块头页(O1):free/合并只读块头元数据;内页保持
+        // {0,false} 使内页地址释放天然被拒(与 free 的对齐检查
+        // 构成双重防护)。省去整块标记(大块分配省数千次写)。
+        let m = self.meta(idx);
+        m.order = order as u8;
+        m.used = true;
         Some(self.block_addr(idx))
     }
 
     /// 释放 `addr` 处的块(合并 buddy 后回链)。
     pub fn free(&mut self, addr: usize) -> Result<(), ()> {
-        // 指针合法性:在区域内、页对齐、元数据标记已分配。
-        let end = self.base + self.page_count * PAGE_SIZE;
+        // 指针合法性:在**真实**区域内、页对齐、元数据标记已分配。
+        // 用 real_count 而非 page_count:补齐页(超出物理 RAM 的
+        // 占位)元数据同为 used=true,若被误释放会把手伸向不存在的
+        // 内存(M3) —— 用真实页数直接拒绝。
+        let end = self.base + self.real_count * PAGE_SIZE;
         if addr < self.base || addr >= end || !addr.is_multiple_of(PAGE_SIZE) {
             return Err(());
         }
@@ -191,6 +199,12 @@ impl BuddyAllocator {
         let mut order = self.meta(idx).order as usize;
         if order > MAX_ORDER || !self.meta(idx).used {
             return Err(()); // double-free 或未分配的指针
+        }
+        // 防御:F1 —— 释放地址必须是块头(页索引为 2^order 的倍数)。
+        // 内页地址若被误传(API 滥用或指针损坏),拒绝而非静默破坏
+        // 空闲链表(否则后续分配可能返回重叠块)。
+        if !idx.is_multiple_of(1usize << order) {
+            return Err(());
         }
         // 向上合并 buddy:仅当 order < MAX_ORDER 时尝试。
         // 两个 order-12 buddy 无法合并(不存在 order 13),保持为
@@ -262,11 +276,23 @@ pub fn page_count() -> usize {
 }
 
 /// 分配 2^order 页,返回物理地址。
+///
+/// # 契约
+/// 返回值**必须**原样传给 `free_pages`;传入块内页地址(内页)会被
+/// 拒绝(返回 Err),不会静默破坏分配器。
+///
+/// # 数据保密(M4)
+/// 返回的页**未清零**(空闲时首字存有链表指针)。M2 向用户态交接
+/// 页面之前必须整页清零,否则泄漏内核链表布局信息。
 pub fn alloc_pages(order: usize) -> Option<usize> {
     allocator().alloc(order)
 }
 
 /// 释放物理地址处的块。
+///
+/// # 契约
+/// `addr` 必须是 `alloc_pages` 原样返回的地址;其他输入(内页、
+/// 未分配页、越界页)返回 Err。
 pub fn free_pages(addr: usize) -> Result<(), ()> {
     allocator().free(addr)
 }
@@ -314,6 +340,13 @@ pub fn self_test() -> Result<(), &'static str> {
     if free_pages(g).is_ok() {
         return Err("double-free accepted");
     }
+
+    // 5) 块内页地址被拒绝(防空闲链表静默损坏,F1)。
+    let h = alloc_pages(2).ok_or("alloc(2) failed")?;
+    if free_pages(h + PAGE_SIZE).is_ok() {
+        return Err("interior page free accepted");
+    }
+    free_pages(h).map_err(|_| "free h failed")?;
 
     Ok(())
 }

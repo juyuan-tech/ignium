@@ -24,6 +24,10 @@ _start:
     # 后续多核代码以 tp 索引 per-hart 陷阱栈/上下文,当前阶段无使用方,
     # 但提前建立约定避免迁移成本。
     mv tp, a0
+    # 清洗引导器遗留的陷阱状态(L1):stvec/sscratch 置零,
+    # 防止早期 trap 跳到陈旧向量/使用陈旧陷阱栈指针。
+    csrw stvec, zero
+    csrw sscratch, zero
     # 若上一级引导(或 SBI)遗留了分页开启状态,不清 satp 会带着
     # 残留页表执行,立即崩溃。写入 0 = Bare 模式(直接物理寻址)。
     csrw satp, zero
@@ -42,10 +46,12 @@ _start:
     # 并发清 BSS、共享引导栈/陷阱栈导致的数据竞争。
     bnez a0, park
 
-    # 清零 [ _bss_start, _stack_top ),8 字节步进。
+    # 清零 [ _bss_start, _trap_stack_top ),8 字节步进。
+    # 覆盖:BSS + 引导栈 + 陷阱栈 —— 三处全部归零(M6:陷阱栈清零
+    # 使 trap 栈上的水位诊断成立;引导栈清零是 panic 水位前提)。
     # 两端都在链接脚本中按 16 字节对齐,循环无越界风险。
     la t0, _bss_start
-    la t1, _stack_top
+    la t1, _trap_stack_top
 1:
     bgeu t0, t1, 2f
     sd zero, 0(t0)
