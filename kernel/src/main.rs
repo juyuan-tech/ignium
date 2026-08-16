@@ -15,6 +15,7 @@
 
 mod arch;
 mod logger;
+mod mem;
 mod panic;
 mod sbi;
 mod uart;
@@ -53,6 +54,15 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         "M0: boot ok - arch: riscv64, machine: qemu-virt, hartid={}, fdt={:#x}",
         hartid, fdt as usize
     );
+    // 物理内存初始化 + 自检(须在 irq_enable 之前:分配器暂非并发安全)。
+    mem::init();
+    match mem::self_test() {
+        Ok(()) => info!(
+            "M1: buddy allocator selftest ok ({} KiB managed)",
+            mem::page_count() * 4
+        ),
+        Err(e) => panic!("buddy allocator selftest failed: {e}"),
+    }
     arch::irq_enable();
     info!(
         "M1: timer enabled ({}us interval), interrupts on",
