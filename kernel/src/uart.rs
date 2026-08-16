@@ -130,8 +130,11 @@ pub fn putc(c: u8) {
         }
     }
     unsafe {
+        // 写前屏障(MED#3):LSR 读 → THR 写 的定序,乱序核上
+        // 防止 LSR 轮询结果与本次写交错。
+        mmio_fence();
         write_u8(UART_BASE, c);
-        // 写后 fence:保证后续 LSR 轮询观察到本次写已到达设备。
+        // 写后屏障:保证后续 LSR 轮询观察到本次写已到达设备。
         mmio_fence();
     }
 }

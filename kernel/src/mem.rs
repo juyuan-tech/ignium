@@ -113,16 +113,24 @@ impl BuddyAllocator {
         if head == FREE_NONE {
             return None;
         }
+        // release 模式也校验(MED#4):链表损坏=内核完整性故障,
+        // 宁可 panic 也不返回越界页索引。
+        assert!(head < self.page_count, "buddy: corrupt free-list head");
         let next = unsafe { (self.block_addr(head) as *const usize).read() };
         self.free_lists[order] = next;
         Some(head)
     }
 
-    /// 初始化:记录区域并整区入链(按最大阶拆分)。
+    /// 初始化:记录区域,并在建链时**刻蚀出保留区**(如 FDT)。
+    ///
+    /// 保留区处理(CRITICAL#1):只改元数据是不够的 —— 含保留区的
+    /// 空闲块必须被**拆分/刻蚀**,否则整块仍可被分配、覆盖保留区。
+    /// 做法:自顶向下 carve,与保留区无交叠的块整块入链,完全在
+    /// 保留区内的块标记永久占用,部分交叠的递归拆分。
     ///
     /// # Safety
     /// 只允许调用一次;`base` 必须页对齐;元数据数组容量足够。
-    unsafe fn init(&mut self, base: usize, count: usize) {
+    unsafe fn init(&mut self, base: usize, count: usize, reserved: (usize, usize)) {
         debug_assert!(count <= MAX_PAGES);
         // 向上补齐到 2^MAX_ORDER 的倍数:补齐页标记为**永久占用**,
         // 使所有块都是完整的 order-12 —— 尾部不再产生小阶块,
@@ -150,32 +158,39 @@ impl BuddyAllocator {
         // 只把**完整落在 real_count 内**的块入链(HIGH#1):尾部
         // 跨入补齐页的"半块"绝不出现在空闲链表 —— 否则分配该块会
         // 把超出物理 RAM 的补齐页交给使用者(自检前的静默损坏源)。
-        let mut idx = 0usize;
-        while idx + order_size <= count {
-            self.push(idx, MAX_ORDER);
-            idx += order_size;
-        }
+        // 保留区刻蚀见 carve(CRITICAL#1)。
+        self.carve(0, MAX_ORDER, reserved);
     }
 
-    /// 预留一段物理区间(如 FDT):标记为永久占用,分配器永不触碰,
-    /// 释放也会被拒绝。
+    /// 递归刻蚀:构建空闲链表,同时把保留区页标记为永久占用。
     ///
-    /// # Safety
-    /// `addr`/`size` 必须在分配区范围内;重复预留安全(幂等)。
-    pub unsafe fn reserve_region(&mut self, addr: usize, size: usize) -> Result<(), ()> {
-        let start = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        let end = (addr + size) / PAGE_SIZE * PAGE_SIZE;
-        let region_end = self.base + self.real_count * PAGE_SIZE;
-        if start < self.base || end > region_end || start >= end {
-            return Err(());
+    /// 块(页区间 `[idx, idx + 2^order)`):
+    /// - 与保留区**无交叠** → 整块入链
+    /// - **完全在**保留区内 → 标记 order=0xFF 永久占用
+    /// - **部分交叠** → 拆成两个子块递归处理
+    ///
+    /// 由于块总是完整落在 real_count 内(上层已约束保留区上界),
+    /// 此处无需再关心补齐页。
+    fn carve(&mut self, idx: usize, order: usize, reserved: (usize, usize)) {
+        let (rs, re) = reserved;
+        let size = 1usize << order;
+        let s = idx;
+        let e = idx + size;
+        if e <= rs || s >= re {
+            // 完全在保留区外 → 入链(补齐页问题已由上层保证)。
+            self.push(idx, order);
+            return;
         }
-        for i in ((start - self.base) / PAGE_SIZE)..((end - self.base) / PAGE_SIZE) {
-            let m = self.meta(i);
-            // order = 0xFF 哨兵:free() 的 order>MAX_ORDER 检查直接拒绝。
+        if s >= rs && e <= re {
+            // 完全在保留区内 → 永久占用(永不出链)。
+            let m = self.meta(idx);
             m.order = u8::MAX;
             m.used = true;
+            return;
         }
-        Ok(())
+        // 部分交叠 → 拆分。order 0 且部分交叠不可能(保留区页对齐)。
+        self.carve(idx, order - 1, reserved);
+        self.carve(idx + (size >> 1), order - 1, reserved);
     }
 
     /// 分配一个 `order` 阶块,返回物理地址;无足够内存返回 None。
@@ -255,6 +270,7 @@ impl BuddyAllocator {
         let mut prev = FREE_NONE;
         let mut cur = self.free_lists[order];
         while cur != FREE_NONE {
+            assert!(cur < self.page_count, "buddy: corrupt free-list node");
             if cur == target {
                 let next = unsafe { (self.block_addr(cur) as *const usize).read() };
                 if prev == FREE_NONE {
@@ -277,8 +293,14 @@ extern "C" {
     static _alloc_start: u8;
 }
 
+/// FDT 预留大小:解析 FDT 前的保守保留(1MB;M1.5 解析后按实际大小)。
+const FDT_RESERVE_SIZE: usize = 1024 * 1024;
+
 /// 初始化物理内存管理。启动早期调用(先于 irq_enable)。
-pub fn init() {
+///
+/// `fdt` 指向引导器传入的设备树,其所在区间在建链时被刻蚀为
+/// 保留区(永久占用),防止未来分配(页表/堆)覆盖引导数据。
+pub fn init(fdt: usize) {
     // _alloc_start 向上对齐到**最大块(16MB)**:buddy 层级只保证
     // 相对 base 的对齐,绝对地址对齐要求 base 本身对齐到最大块
     // (自检实测抓到:base 仅页对齐时,order-3 块绝对地址不 32KB 对齐,
@@ -290,7 +312,13 @@ pub fn init() {
         panic!("no physical memory available for allocator");
     }
     let count = (RAM_END - base) / PAGE_SIZE;
-    unsafe { allocator().init(base, count) };
+    // 保留区 = FDT 页区间(饱和算术防溢出,超出分配区的部分由
+    // init 内部收敛,pro 审计 #2)。
+    let fdt_start = fdt.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let fdt_end = fdt.saturating_add(FDT_RESERVE_SIZE);
+    let rs = fdt_start.saturating_sub(base) / PAGE_SIZE;
+    let re = fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE);
+    unsafe { allocator().init(base, count, (rs, re)) };
 }
 
 /// 可分配页数。
@@ -320,13 +348,6 @@ pub fn free_pages(addr: usize) -> Result<(), ()> {
     allocator().free(addr)
 }
 
-/// 预留物理区间(永久占用,分配器永不触碰)。
-///
-/// 用于保护引导器数据结构(如 FDT)等必须在分配区内的保留区域。
-pub fn reserve_region(addr: usize, size: usize) -> Result<(), ()> {
-    unsafe { allocator().reserve_region(addr, size) }
-}
-
 /// 分配器自检:验证分配/释放/合并/对齐,失败返回错误描述。
 ///
 /// 由 kernel_main 在 irq_enable 之前调用(分配器尚未并发安全)。
@@ -340,29 +361,41 @@ pub fn self_test() -> Result<(), &'static str> {
     }
     free_pages(b).map_err(|_| "free(12) #2 failed")?;
 
-    // 2) 分裂与合并:两个 order-11 块应互为 buddy,释放后合并回 order-12。
-    // 注意:buddy 关系用**页索引 XOR**,地址 XOR 在 base 非 2 的幂
-    // 对齐时因进位失效(0x80210000 位 23 置位)—— 测试用减法判定。
-    let c = alloc_pages(11).ok_or("alloc(11) #1 failed")?;
-    let d = alloc_pages(11).ok_or("alloc(11) #2 failed")?;
-    let half = (1usize << 11) * PAGE_SIZE;
-    if d != c + half {
-        return Err("order-11 blocks are not buddies");
+    // 2) 全生命周期守恒:按阶**递减**排空(原生弹出不拆分)→
+    //    耗尽后分配必须失败 → 全部释放 → order-12 必须可再次分配。
+    //    最后一步只有当低阶块全部合并回 12 阶时才成立 ——
+    //    这是对 buddy 合并语义的直接验证,且不依赖块相邻性
+    //    (FDT 刻蚀会在低阶留下碎片,相邻性假设已不可靠)。
+    let mut held = [0usize; 256];
+    let mut held_n = 0;
+    for order in (0..=MAX_ORDER).rev() {
+        while let Some(addr) = alloc_pages(order) {
+            if held_n == held.len() {
+                return Err("held overflow");
+            }
+            held[held_n] = addr;
+            held_n += 1;
+        }
     }
-    free_pages(c).map_err(|_| "free c failed")?;
-    free_pages(d).map_err(|_| "free d failed")?;
-    let e = alloc_pages(MAX_ORDER).ok_or("merged alloc(12) failed")?;
-    if e != c.min(d) {
-        return Err("buddy merge failed");
+    if alloc_pages(0).is_some() {
+        return Err("allocator not exhausted");
     }
-    free_pages(e).map_err(|_| "free e failed")?;
+    for &addr in held[..held_n].iter() {
+        free_pages(addr).map_err(|_| "free held failed")?;
+    }
+    let big = alloc_pages(MAX_ORDER).ok_or("post-free alloc(12) failed")?;
+    free_pages(big).map_err(|_| "free big failed")?;
 
-    // 3) 对齐:order-3 块须 32KB 绝对对齐(base 已对齐到最大块)。
-    let f = alloc_pages(3).ok_or("alloc(3) failed")?;
-    if !f.is_multiple_of(8 * PAGE_SIZE) {
-        return Err("order-3 block misaligned");
+    // 3) 对齐:每个阶的块都须按自身大小绝对对齐
+    //    (base 已对齐到最大块,所有拆分保持对齐)。
+    for order in 0..=MAX_ORDER {
+        let a = alloc_pages(order).ok_or("align alloc failed")?;
+        let block = PAGE_SIZE * (1usize << order);
+        if !a.is_multiple_of(block) {
+            return Err("block misaligned");
+        }
+        free_pages(a).map_err(|_| "align free failed")?;
     }
-    free_pages(f).map_err(|_| "free f failed")?;
 
     // 4) 双重释放被拒绝。
     let g = alloc_pages(0).ok_or("alloc(0) failed")?;

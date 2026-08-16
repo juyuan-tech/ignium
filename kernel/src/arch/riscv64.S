@@ -50,7 +50,11 @@ trap_vector:
     # 若不等 → handler 已活跃(第二层 trap)→ 停机。此时帧写入
     # 位置在外层 handler 活跃栈上方,无重叠;外层将停机,无害。
     # 只用已入帧的 t0(不能再用其他未保存寄存器)。
+    # norelax(LOW#6):此 la 若被松弛成 gp 相对寻址,会用到尚未
+    # 重载的(可能被中断上下文污染的)gp。
+    .option norelax
     la t0, _trap_stack_top
+    .option relax
     addi t0, t0, -TRAP_FRAME_SIZE
     bne t6, t0, 4f
     # 保存被中断的 gp,然后重载内核 gp(H1):此后任何可被松弛成
