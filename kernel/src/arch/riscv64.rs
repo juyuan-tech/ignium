@@ -180,19 +180,17 @@ pub fn irq_enable() {
 
 /// 保存中断使能状态并关闭中断(IRQ 安全锁的基础)。
 /// 返回:原 SIE 是否开启。
+///
+/// MED-12(审计 15 轮):必须用 `csrrci` **原子读-清** —— 分立的
+/// `csrr + csrci` 之间存在窗口:csrr 读到 SIE=1 后、csrci 执行前,
+/// 中断可能到达(ISR 在"宣称关闭"前运行,可能持锁死锁)。
 #[inline]
 pub fn irq_save() -> bool {
     let s: usize;
     unsafe {
-        asm!("csrr {}, sstatus", out(reg) s, options(nostack));
+        asm!("csrrci {}, sstatus, 2", out(reg) s, options(nostack));
     }
-    let on = s & 2 != 0;
-    if on {
-        unsafe {
-            asm!("csrci sstatus, 2", options(nostack));
-        }
-    }
-    on
+    s & 2 != 0
 }
 
 /// 按 `irq_save` 的返回值恢复中断使能状态。

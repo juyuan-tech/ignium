@@ -39,9 +39,12 @@ struct PageMeta {
 }
 
 /// 页元数据静态数组(64KB,启动时清零)。
-/// 仅经 `&raw const` 裸指针访问(init 期一次性写入),声明为
-/// 普通 static(消除 static mut)。
-static PAGE_META: [PageMeta; MAX_PAGES] = [PageMeta {
+/// C1(审计 15 轮):页元数据用 `static mut`(Rust 提供的可变静态
+/// 机制)而非"不可变 static 经裸指针写"(后者是形式 UB)。
+/// 访问纪律:一律经 `&raw const/&raw mut` 裸指针,不形成引用
+/// (编译器不会在此引入别名假设);init 期单线程写,之后只读。
+#[allow(static_mut_refs)]
+static mut PAGE_META: [PageMeta; MAX_PAGES] = [PageMeta {
     order: 0,
     used: false,
 }; MAX_PAGES];
@@ -69,6 +72,10 @@ pub struct BuddyAllocator {
     /// 各阶空闲链表头(块 = 页索引)。
     free_lists: [usize; MAX_ORDER + 1],
 }
+
+// 含裸指针:单上下文 + 关中断互斥下,指针仅内核自身维护且生命周期
+// 为内核全程 —— 跨上下文传递安全(供 SpinLock<T: Send> 的 Sync 约束)。
+unsafe impl Send for BuddyAllocator {}
 
 /// 分配器单例访问:SpinLock 互斥 + 闭包封装(HIGH-1)。
 /// 每次操作恰好一个 `&mut`;ISR 内禁止调用(死锁,见 sync.rs 约束)。
@@ -144,6 +151,7 @@ impl BuddyAllocator {
         self.base = base;
         self.real_count = count;
         self.page_count = padded;
+        // C1:裸指针取址(static mut,不形成引用)。
         self.meta = (&raw const PAGE_META).cast::<PageMeta>().cast_mut();
         for i in 0..padded {
             *self.meta(i) = PageMeta {
@@ -340,6 +348,11 @@ fn fdt_size(fdt: usize) -> Option<usize> {
     }
     let magic = unsafe { be32(fdt) };
     if magic != 0xD00D_FEED {
+        return None;
+    }
+    // MED-9(审计 15 轮):头部读取不得越过 RAM 末尾(靠 RAM 内的
+    // fdt 指针 + 8 字节头边界);fdt_size 只读 8 字节,校验 fdt+8。
+    if fdt.saturating_add(8) > crate::board::RAM_END {
         return None;
     }
     let total = unsafe { be32(fdt + 4) } as usize;

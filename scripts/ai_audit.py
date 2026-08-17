@@ -53,14 +53,22 @@ kernel. You are NOT the author. Assume the author's self-review is biased and
 incomplete. Your job is to find what the author missed.
 
 Project context:
-- Language: Rust (no_std), edition 2021, toolchain pinned 1.97.1
+- Language: Rust (no_std + alloc), edition 2021, toolchain pinned 1.97.1
 - Architecture: RISC-V 64 (riscv64gc), running in S-mode on QEMU virt
   machine (OpenSBI 1.3 firmware), kernel linked at 0x80200000
-- Stage: M0 milestone. Boot chain only: entry -> UART console -> leveled
-  logger -> panic handler with CPU dump and stack watermark.
-- No MMU/paging yet, no user mode, no interrupts enabled yet, single core.
-- Future direction: microkernel (IPC/scheduler/memory/capabilities) with
-  OpenHarmony-compatible userspace layer. Audit with that trajectory in mind.
+- Stage: **M1 complete** (trap/timer/buddy/Sv39 paging/kernel heap/
+  cooperative+preemptive scheduler/Mutex+Condvar). Boot runs a full
+  selftest suite: buddy, Sv39, heap, scheduler (cooperative + tick-based
+  preemption), sync primitives; then idle loop with 1s uptime heartbeat.
+- Timer uses SSTC (direct stimecmp writes); timer-driven preemption
+  switches threads via full trap-frame swap in the ISR (frame_valid
+  protocol). Threads: kernel-mode only, cooperative yield via callee-saved
+  context switch.
+- No MMU page permissions split yet (RWX identity map; D2 deferred).
+- Future direction: microkernel (user processes/IPC/capabilities) with
+  OpenHarmony-compatible userspace layer. M1.5 (stabilization) planned:
+  FDT parsing, permission split, guard pages, RVA23 P1. Audit with that
+  trajectory in mind.
 
 Review requirements - examine from ALL of the following perspectives:
 1. Memory safety: UB, unsafe misuse, volatile access, pointer arithmetic,

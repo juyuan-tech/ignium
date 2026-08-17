@@ -93,6 +93,10 @@ pub struct KernelHeap {
     classes: [SlabClass; SLAB_SIZES.len()],
 }
 
+// 含裸指针(SlabHeader 链表):单上下文 + SpinLock 互斥下安全
+// (供 SpinLock<T: Send> 的 Sync 约束)。
+unsafe impl Send for KernelHeap {}
+
 impl KernelHeap {
     const fn new() -> Self {
         KernelHeap {

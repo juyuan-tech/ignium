@@ -25,7 +25,9 @@ pub struct SpinLock<T> {
 }
 
 // 内核单地址空间、无线程迁移,锁保证互斥访问 —— 声明 Sync 安全。
-unsafe impl<T> Sync for SpinLock<T> {}
+// HIGH-8(审计 15 轮):约束 T: Send(锁内值须可安全跨上下文传递;
+// 无约束的裸 unsafe impl 在 T 含非 Send 类型时是错误的安全声明)。
+unsafe impl<T: Send> Sync for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
     /// 构造(可在静态上下文中使用)。
@@ -88,7 +90,7 @@ pub struct Mutex<T: ?Sized> {
     value: UnsafeCell<T>,
 }
 
-unsafe impl<T: ?Sized> Sync for Mutex<T> {}
+unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
     /// 构造。

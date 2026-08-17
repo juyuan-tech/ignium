@@ -71,11 +71,14 @@ struct Thread {
     /// false = 线程经 yield/block 让出(进度在 ctx),其帧已失效,
     ///         若被抢占恢复会**从头重跑**线程。
     frame_valid: bool,
+    /// C5(审计 15 轮):唤醒标志 —— wake 无条件置位,block_current
+    /// 消费;覆盖"唤醒早于阻塞"的窗口,防丢失唤醒。
+    woken: bool,
     /// 线程入口(thread_entry 经 id 查表调用)。
     entry: fn(),
     /// 线程栈(Box:栈内存来自内核堆)。
     #[allow(dead_code)]
-    stack: Box<[u8]>,
+    stack: Option<Box<[u8]>>,
 }
 
 /// 调度器。
@@ -91,12 +94,19 @@ struct Scheduler {
     ticks_run: u64,
     /// 下一个线程 id。
     next_id: usize,
+    /// 已退出线程的栈回收队列(idle 在自身上下文释放)。
+    reaper: VecDeque<Box<[u8]>>,
 }
 
-/// 空闲线程入口:永远让出。
+// 含裸指针/上下文状态:单上下文 + SpinLock 互斥下安全
+// (供 SpinLock<T: Send> 的 Sync 约束)。
+unsafe impl Send for Scheduler {}
+
+/// 空闲线程入口:回收已退出线程的栈 + 永远让出。
 fn idle_entry() {
     loop {
-        // 空闲线程不主动跑业务;yield 把 CPU 让给就绪线程。
+        // 回收他人栈(安全:自己不在被释放的栈上);随后让出 CPU。
+        reap();
         yield_();
     }
 }
@@ -203,6 +213,8 @@ impl Scheduler {
         let mut frame = [0usize; FRAME_WORDS];
         frame[FRAME_SEPC] = thread_entry as *const () as usize;
         frame[FRAME_SSTATUS] = 1 << 5; // SPIE
+                                       // MED-10(审计 15 轮):优先级越界钳制,防就绪队列越界 panic。
+        let prio = prio.min(PRIO_LEVELS as u8 - 1);
         let t = Thread {
             prio,
             state: ThreadState::Ready,
@@ -215,8 +227,9 @@ impl Scheduler {
             frame,
             // 新线程初始帧有效(sepc=thread_entry),可被抢占首启。
             frame_valid: true,
+            woken: false,
             entry,
-            stack,
+            stack: Some(stack),
         };
         self.threads.push(t);
         self.enqueue(id);
@@ -232,6 +245,7 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     idle: 0,
     ticks_run: 0,
     next_id: 1,
+    reaper: VecDeque::new(),
 });
 
 /// 线程 id 分配(供外部日志/调试)。
@@ -270,8 +284,9 @@ pub fn init() {
         // idle 以主流程直接运行(非经切换),初始帧从未被使用 →
         // 无效;其帧在真正被抢占时才会捕获。
         frame_valid: false,
+        woken: false,
         entry: idle_entry,
-        stack,
+        stack: Some(stack),
     });
     s.current = idle_id;
     s.idle = idle_id;
@@ -298,6 +313,9 @@ pub fn yield_() {
     let (old, new) = {
         let mut s = SCHED.lock();
         let cur = s.current;
+        // C3(审计 15 轮回归):合并锁时丢失 —— yield 后进度在 ctx,
+        // 帧必须失效,否则抢占会用过期帧恢复线程(从头重跑)。
+        s.threads[cur].frame_valid = false;
         s.enqueue(cur);
         s.ticks_run = 0;
         let next = s.pick_next();
@@ -326,6 +344,19 @@ pub fn block_current() {
             // 已被唤醒(队列中):撤销本次入队,继续运行。
             s.remove_from_ready(cur);
             s.threads[cur].state = ThreadState::Running;
+            // C11(审计 15 轮):**先 drop 锁再恢复中断** ——
+            // 否则中断在锁持有期间重开,定时器 ISR 抢锁死锁。
+            drop(s);
+            arch::irq_restore(irq);
+            return;
+        }
+        // C5(审计 15 轮):woken 标志 —— 唤醒可能发生在"登记之后、
+        // 阻塞之前"(wake 无条件记录),这里消费它并继续运行,
+        // 否则该唤醒丢失(线程永久阻塞)。
+        if s.threads[cur].woken {
+            s.threads[cur].woken = false;
+            s.threads[cur].state = ThreadState::Running;
+            drop(s);
             arch::irq_restore(irq);
             return;
         }
@@ -340,21 +371,26 @@ pub fn block_current() {
         (old, new)
     };
     unsafe { arch::context_switch(old, new) };
-    // 醒来:撤销 wake 的入队(否则"运行中仍在就绪队列",
-    // 会被再次选中 → 同一线程双调度/重入)。
+    // 醒来:撤销 wake 的入队并消费唤醒标志(防双调度/重入)。
     let mut s = SCHED.lock();
     let cur = s.current;
     s.remove_from_ready(cur);
+    s.threads[cur].woken = false;
     drop(s);
     arch::irq_restore(irq);
 }
 
-/// 唤醒指定线程(置 Ready 并入队)。
+/// 唤醒指定线程:无条件记录唤醒标志(C5 —— 唤醒可能发生在目标
+/// 线程"登记之后、阻塞之前",此时其 state 尚非 Blocked,靠标志
+/// 兜底,block_current 会消费它),若已阻塞则入队。
 pub fn wake(id: usize) {
     let irq = arch::irq_save();
     let mut s = SCHED.lock();
-    if s.threads[id].state == ThreadState::Blocked {
-        s.enqueue(id);
+    if id < s.threads.len() {
+        s.threads[id].woken = true;
+        if s.threads[id].state == ThreadState::Blocked {
+            s.enqueue(id);
+        }
     }
     drop(s);
     arch::irq_restore(irq);
@@ -376,15 +412,11 @@ pub fn exit() -> ! {
     let (old, new) = {
         let mut s = SCHED.lock();
         let cur = s.current;
-        // 安全优化:释放退出线程的 16KB 栈(否则 TCB 随 Box 留在
-        // Vec,线程 churn 会耗尽内存 —— 资源耗尽风险)。
-        //
-        // "释放自身栈"窗口分析(安全):drop 后当前 SP 仍指向已释放
-        // 内存,但 —— 中断已关(irq_save)+ 单核,drop 与 context_switch
-        // 之间仅有寄存器操作(无分配、无写入);buddy 归还把 next 指针
-        // 写在块首字(栈底页),与当前 SP 所在栈顶区域不相交;切走后
-        // 该内存才可能被复用(彼时已不在其上)。
-        s.threads[cur].stack = alloc::vec![].into_boxed_slice();
+        // C2(审计 15 轮):**不得释放自身正在使用的栈** —— 把栈 Box
+        // 移交回收队列,由 idle(在它自己的栈上)安全释放。
+        if let Some(stack) = s.threads[cur].stack.take() {
+            s.reaper.push_back(stack);
+        }
         s.threads[cur].state = ThreadState::Exited;
         s.threads[cur].frame_valid = false;
         s.ticks_run = 0;
@@ -398,6 +430,18 @@ pub fn exit() -> ! {
     // exit_self 切走,不会到达这里;防御性停机。
     arch::irq_restore(irq);
     arch::halt()
+}
+
+/// 回收已退出线程的栈(仅由 idle 线程调用 —— 它在自己的栈上,
+/// 释放的是别人的栈,安全)。
+fn reap() {
+    let irq = arch::irq_save();
+    let mut s = SCHED.lock();
+    while let Some(stack) = s.reaper.pop_front() {
+        drop(stack);
+    }
+    drop(s);
+    arch::irq_restore(irq);
 }
 
 /// 定时器 ISR 回调(中断关闭上下文):抢占决策,返回恢复帧。
