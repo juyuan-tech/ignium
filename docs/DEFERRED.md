@@ -23,6 +23,7 @@
 | D13 | 内核堆(slab)—— 使 `Vec`/`Box` 可用 | ROADMAP M1 | 下一步 | 待办 |
 | D14 | 上下文切换 + 调度器 + 同步原语 | ROADMAP M1 | D13 之后 | 待办 |
 | D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办 |
+| D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | 待办 |
 
 ## 已关闭(移动到这里)
 

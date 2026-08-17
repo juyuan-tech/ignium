@@ -81,6 +81,12 @@
 | 复用调度/IPC(架构无关) | 同一套 shell 双架构运行 |
 | CI 双架构矩阵 | 双绿 |
 
+## 兼容性与发布基线
+
+- **RVA23**:当前不符(工具链 RV64GC 子集);分阶段支持计划见
+  `docs/RVA23.md`(P1 编译目标扩展 + CI `-cpu max` 基线 → M1.5;
+  P2 Zicboz/Svpbmt/Zacas/Sstc → M2;P3 完整性 → M2+)。
+
 ## 发布策略
 
 - GitHub + Gitee 双平台(Gitee 面向鸿蒙社区)
