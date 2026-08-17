@@ -190,9 +190,11 @@ impl Scheduler {
     fn spawn(&mut self, entry: fn(), prio: u8) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        let stack = alloc::vec![0u8; THREAD_STACK_SIZE].into_boxed_slice();
+        // 零化-free 栈分配(性能优化):`vec![0u8; N]` 会白付 16KB
+        // memset —— 栈内容无需初始化(初始帧/上下文显式构造)。
+        let stack = alloc_zeroed_free_stack();
         // HIGH-4:sp 须 16 字节对齐(RISC-V ABI);堆指针仅保证 8 对齐。
-        let sp = ((stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF) as usize;
+        let sp = (stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF;
         // 初始帧:sepc = 线程包装器,sstatus:SPIE=1(进线程后开中断)。
         let mut frame = [0usize; FRAME_WORDS];
         frame[FRAME_SEPC] = thread_entry as *const () as usize;
@@ -231,14 +233,24 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
 /// 线程 id 分配(供外部日志/调试)。
 static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// 零化-free 线程栈分配(性能优化):免 16KB memset。
+/// 栈内存来自内核堆,无需初始化(初始帧/上下文显式构造);
+/// 16 字节对齐满足 ABI。
+fn alloc_zeroed_free_stack() -> Box<[u8]> {
+    let layout = core::alloc::Layout::from_size_align(THREAD_STACK_SIZE, 16).expect("stack layout");
+    let ptr = unsafe { alloc::alloc::alloc(layout) };
+    assert!(!ptr.is_null(), "kernel heap: thread stack OOM");
+    unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, THREAD_STACK_SIZE)) }
+}
+
 /// 初始化调度器(创建 idle 线程;须在堆就绪后、irq_enable 前调用)。
 pub fn init() {
     let irq = arch::irq_save();
     let mut s = SCHED.lock();
     // idle 线程:id=0,最低优先级,永不阻塞。
     let idle_id = 0;
-    let stack = alloc::vec![0u8; THREAD_STACK_SIZE].into_boxed_slice();
-    let sp = ((stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF) as usize;
+    let stack = alloc_zeroed_free_stack();
+    let sp = (stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF;
     let mut frame = [0usize; FRAME_WORDS];
     frame[FRAME_SEPC] = idle_entry as *const () as usize;
     frame[FRAME_SSTATUS] = 1 << 5;
