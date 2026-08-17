@@ -223,7 +223,7 @@ pub fn enable_timer() {
         // 内存屏障,防止与后续 ecall 重排。
         asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nostack));
     }
-    let deadline = get_time() + TIMER_INTERVAL;
+    let deadline = get_time().wrapping_add(TIMER_INTERVAL);
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
     // 首次编程失败 = 内核失去节拍源(M1):warn+挂死不如明确失败,
     // panic 输出完整诊断后停机(CI 负向断言也能捕获)。
@@ -307,10 +307,12 @@ pub unsafe extern "C" fn trap_handler(
         match scause & !INTERRUPT_BIT {
             CAUSE_SUPERVISOR_TIMER => {
                 // 定时器节拍:deadline 递增(无累积漂移)+ tick 计数
-                // + 重排下一次中断。
+                // + 重排下一次中断。wrapping_add(MED-4):overflow-checks
+                // 开启下,极端时间(理论 18 万年后)不触发 panic。
                 crate::logger::tick_up();
-                let next =
-                    TIMER_DEADLINE.fetch_add(TIMER_INTERVAL, Ordering::Relaxed) + TIMER_INTERVAL;
+                let next = TIMER_DEADLINE
+                    .fetch_add(TIMER_INTERVAL, Ordering::Relaxed)
+                    .wrapping_add(TIMER_INTERVAL);
                 // M1(审计 11 轮):SBI 失败 = 节拍源丢失(调度/看门狗
                 // 都会挂死),ISR 内不可日志 —— 直接 panic 给出明确
                 // 诊断,而不是静默停摆。

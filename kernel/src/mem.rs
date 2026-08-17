@@ -11,9 +11,11 @@
 //! - **合并**:释放时若 buddy 同阶且空闲,摘除 buddy 并向上合并。
 //!
 //! # 并发约束(当前)
-//! 非 SMP/ISR 安全:调用方须保证互斥(单核 + 关中断)。启动自检在
-//! `irq_enable` 之前运行。M1.5 引入自旋锁后开放多核/中断上下文,
-//! 并配套"页状态 bitmap + 守卫页"。
+//! 所有访问经 `with_allocator`(SpinLock 互斥,见 sync.rs 约束):
+//! 主上下文可用;**ISR 内禁止**(自旋死锁)。ISR 安全分配与
+//! 中断安全锁一起在调度器里程碑引入(DEFERRED D3/D11)。
+
+use crate::sync::SpinLock;
 
 /// 物理页大小(4KB)。
 pub const PAGE_SIZE: usize = 4096;
@@ -36,21 +38,23 @@ struct PageMeta {
     used: bool,
 }
 
-/// 页元数据静态数组(64KB,.bss,启动时清零)。
-/// 与 `_alloc_start` 实际页数无关,只保证容量足够。
-static mut PAGE_META: [PageMeta; MAX_PAGES] = [PageMeta {
+/// 页元数据静态数组(64KB,启动时清零)。
+/// 仅经 `&raw const` 裸指针访问(init 期一次性写入),声明为
+/// 普通 static(消除 static mut)。
+static PAGE_META: [PageMeta; MAX_PAGES] = [PageMeta {
     order: 0,
     used: false,
 }; MAX_PAGES];
 
-/// 伙伴分配器单例。
-static mut ALLOCATOR: BuddyAllocator = BuddyAllocator {
+/// 伙伴分配器单例,SpinLock 包装(HIGH-1):所有访问经 `with_allocator`
+/// 互斥;static_mut + 裸指针模式移除。
+static ALLOCATOR: SpinLock<BuddyAllocator> = SpinLock::new(BuddyAllocator {
     base: 0,
     real_count: 0,
     page_count: 0,
     meta: core::ptr::null_mut(),
     free_lists: [FREE_NONE; MAX_ORDER + 1],
-};
+});
 
 /// 伙伴分配器。
 pub struct BuddyAllocator {
@@ -66,11 +70,10 @@ pub struct BuddyAllocator {
     free_lists: [usize; MAX_ORDER + 1],
 }
 
-/// 分配器单例访问:把操作封装进闭包,保证**每次操作恰好一个 `&mut`**
-/// (消除上一轮审计 L3 的多别名隐患),并为未来引入锁(调度器里程碑)
-/// 预留了唯一的加锁点。
+/// 分配器单例访问:SpinLock 互斥 + 闭包封装(HIGH-1)。
+/// 每次操作恰好一个 `&mut`;ISR 内禁止调用(死锁,见 sync.rs 约束)。
 fn with_allocator<T>(f: impl FnOnce(&mut BuddyAllocator) -> T) -> T {
-    f(unsafe { (&raw mut ALLOCATOR).as_mut().unwrap() })
+    f(&mut ALLOCATOR.lock())
 }
 
 impl BuddyAllocator {
@@ -320,6 +323,26 @@ extern "C" {
     static _alloc_start: u8;
 }
 
+/// 读取 FDT 实际大小(HIGH-2:固定 1MB 预留可能不足/过量)。
+/// 校验头部:magic=0xD00DFEED、totalsize(偏移 4)在合理范围。
+/// 无效指针/非法头 → None(调用方回退保守预留)。
+fn fdt_size(fdt: usize) -> Option<usize> {
+    if fdt == 0 || !fdt.is_multiple_of(4) {
+        return None;
+    }
+    unsafe {
+        let magic = core::ptr::read_volatile(fdt as *const u32);
+        if magic != 0xD00D_FEED {
+            return None;
+        }
+        let total = core::ptr::read_volatile((fdt + 4) as *const u32) as usize;
+        if !(8..=16 * 1024 * 1024).contains(&total) {
+            return None;
+        }
+        Some(total)
+    }
+}
+
 /// 初始化物理内存管理。启动早期调用(先于 irq_enable)。
 ///
 /// `fdt` 指向引导器传入的设备树,其所在区间在建链时被刻蚀为
@@ -336,10 +359,12 @@ pub fn init(fdt: usize) {
         panic!("no physical memory available for allocator");
     }
     let count = (crate::board::RAM_END - base) / PAGE_SIZE;
-    // 保留区 = FDT 页区间(H1:起点**向下**取整 —— 指针未页对齐时
-    // 也必须保护其所在页;终点向上取整;饱和算术防溢出)。
+    // 保留区 = FDT 实际大小(HIGH-2:解析头部 totalsize,回退保守值)。
+    // 起点**向下**取整(H1:指针未页对齐时也必须保护其所在页);
+    // 终点向上取整;饱和算术防溢出。
+    let reserve = fdt_size(fdt).unwrap_or(crate::board::FDT_RESERVE_SIZE);
     let fdt_start = fdt / PAGE_SIZE * PAGE_SIZE;
-    let fdt_end = fdt.saturating_add(crate::board::FDT_RESERVE_SIZE);
+    let fdt_end = fdt.saturating_add(reserve);
     let rs = fdt_start.saturating_sub(base) / PAGE_SIZE;
     let re = fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE);
     with_allocator(|a| unsafe { a.init(base, count, (rs, re)) });

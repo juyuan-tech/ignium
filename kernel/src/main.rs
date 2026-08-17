@@ -20,6 +20,7 @@ mod mem;
 mod mmu;
 mod panic;
 mod sbi;
+mod sync;
 mod uart;
 
 use core::arch::global_asm;

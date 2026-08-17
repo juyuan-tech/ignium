@@ -112,13 +112,15 @@ trap_vector:
     csrr a1, sepc
     csrr a2, stval
     mv a3, t6
-    # 处理器自身栈:帧下方预留 2KB(trap_handler 的 error! 输出链
-    # 实测 < 1KB,2KB 留足余量)。**强制校验余量在陷阱栈内**:
-    # 若 sp 计算值越过陷阱栈底,说明栈已近耗尽(嵌套过深),此时
-    # 调用 handler 会把数据写进引导栈顶 —— 改为安全停机
-    # (pro 审计 max #2)。
+    # 处理器自身栈:帧下方预留 8KB(HIGH-3:实测 error! 输出链 < 1KB,
+    # 但 Rust 格式化栈用随参数/优化浮动,2KB 不足以保证)。**强制校验
+    # 余量在陷阱栈内**:若 sp 计算值越过陷阱栈底,说明栈已近耗尽
+    # (嵌套过深),此时调用 handler 会把数据写进引导栈顶 —— 改为
+    # 安全停机(pro 审计 max #2)。
     la t0, _trap_stack_bottom
-    addi t1, t6, -2048
+    # -8192 超出 addi 立即数范围,用 li+add 组合。
+    li t1, -8192
+    add t1, t1, t6
     bltu t1, t0, 2f
     mv sp, t1
     call trap_handler
