@@ -73,7 +73,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         hartid, fdt as usize
     );
     // 物理内存初始化(含 FDT 保留区刻蚀)+ 自检。
-    // 须在 irq_enable 之前:分配器暂非并发安全。
+    // 分配器(M1):IRQ 安全 SpinLock(MED-3),持锁不被抢占;
+    // 此项自检须在 irq_enable 之前(避免定时器与自检交错)。
     mem::init(fdt as usize);
     match mem::self_test() {
         Ok(()) => info!(
@@ -93,7 +94,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         Err(e) => panic!("Sv39 paging selftest failed: {e}"),
     }
     // 内核堆初始化(缓存分配区基址)后自检。
-    // 须在 irq_enable 之前:堆锁为 SpinLock(主上下文,ISR 禁止)。
+    // 堆锁为 IRQ 安全 SpinLock(MED-3,审计 17 轮);ISR 零分配(容量预留)。
+    // 自检须在 irq_enable 之前(irq_enable 后当前上下文即 idle 线程)。
     heap::init();
     match heap::self_test() {
         Ok(()) => info!("M1: kernel heap selftest ok (slab 16B..2KB + page path)"),

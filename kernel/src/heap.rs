@@ -8,7 +8,9 @@
 //!   块基址记录在返回指针前 8 字节;释放时回读基址归还 buddy。
 //!   高对齐(`align > 页`)按"需 + align"过量分配,向上对齐。
 //! - **判别**:`SLAB_PAGE_CLASS` 表(页 → 档,0xFF = 非 slab)。
-//! - **同步**:SpinLock(仅主上下文;ISR 禁止,见 sync.rs 约束)。
+//! - **同步**:IRQ 安全 SpinLock(MED-3,加锁关中断);持锁临界区
+//!   不被定时器抢占(消除 convoy)。ISR 仍零分配(容量预留,
+//!   见 sync.rs 约束与 DEFERRED D11)。
 //! - **OOM**:分配内部 panic(`handle_alloc_error` 走稳定路径,
 //!   无需 unstable 属性)。
 //! - slab 页释放策略:当前**永不归还** buddy(每档最多 1~2 页,

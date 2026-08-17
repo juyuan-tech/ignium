@@ -11,9 +11,11 @@
 //! - **合并**:释放时若 buddy 同阶且空闲,摘除 buddy 并向上合并。
 //!
 //! # 并发约束(当前)
-//! 所有访问经 `with_allocator`(SpinLock 互斥,见 sync.rs 约束):
-//! 主上下文可用;**ISR 内禁止**(自旋死锁)。ISR 安全分配与
-//! 中断安全锁一起在调度器里程碑引入(DEFERRED D3/D11)。
+//! 所有访问经 `with_allocator`:
+//! - **IRQ 安全 SpinLock**(MED-3,审计 17 轮):加锁保存/恢复 SIE,
+//!   持锁临界区不被抢占,主上下文与 ISR 均不死锁(D3 已实现)。
+//! - ISR 仍**零分配**(ISR 零分配约定,D11 容量预留兜底);分配
+//!   器锁为 IRQ 安全变体,唤醒不会在中断恢复后再做(无锁唤醒)。
 
 use crate::sync::SpinLock;
 
@@ -456,7 +458,7 @@ pub unsafe fn zero_page(addr: usize) {
 
 /// 分配器自检:验证分配/释放/合并/对齐,失败返回错误描述。
 ///
-/// 由 kernel_main 在 irq_enable 之前调用(分配器尚未并发安全)。
+/// 由 kernel_main 在 irq_enable 之前调用(尚无并发竞争者)。
 pub fn self_test() -> Result<(), &'static str> {
     // 1) 整区(16MB)分配→释放→再分配:应复用同一区域。
     let a = alloc_pages(MAX_ORDER).ok_or("alloc(12) failed")?;

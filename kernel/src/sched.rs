@@ -5,16 +5,22 @@
 //!   + 协作上下文(Context)。
 //! - **协作切换**(`yield_`/阻塞):调用边界保存调用者保存寄存器,
 //!   经 `context_switch` 切换(见 riscv64.S)。
-//! - **抢占切换**:定时器 ISR 中,若当前线程时间片到期且存在就绪
-//!   线程,把被中断线程的**全量陷阱帧**复制进其 TCB,返回下一线程
-//!   的帧指针 —— 汇编恢复路径据此 sret 进入下一线程(全寄存器恢复,
-//!   t/a 也不丢)。
+//! - **抢占切换**:定时器 ISR 中,若当前线程时间片到期或更高优先级
+//!   线程就绪(MED-2),且存在**帧有效**的线程,把被中断线程的
+//!   **全量陷阱帧**复制进其 TCB,返回下一线程的帧指针 —— 汇编
+//!   恢复路径据此 sret 进入下一线程(全寄存器恢复,t/a 也不丢)。
+//! - **恢复机制协议**(审计 17 轮收严):线程的恢复数据恰有一个有效
+//!   (新线程除外,二者皆有效)——
+//!   `ctx_valid`(协作切换保存点新鲜)/ `frame_valid`(抢占捕获帧新鲜)
+//!   互斥,抢占使 ctx 失效,yield 使帧失效。协作路径接受任一有效,
+//!   do_switch 按机制分发(ctx → context_switch;仅帧 → frame_restore),
+//!   防止被抢占线程在"唯一可运行线程退出/阻塞"时永久滞留。
 //! - **优先级**:2 级(HIGH/LOW),级内轮转;idle 为最低。
 //! - **时间片**:每线程 `SLICE_TICKS`(10 tick = 100ms)内不主动
-//!   yield 则被抢占。
-//! - **同步**:调度器自身在 SpinLock 保护下运行;ISR 路径(on_tick)
-//!   只在 tick 与帧复制上操作,不做复杂队列修改(抢占决定在
-//!   `on_tick` 中提前完成)。
+//!   yield 则被抢占(同优先级)。
+//! - **同步**:调度器自身在 IRQ 安全 SpinLock(MED-3)保护下运行;
+//!   ISR 路径(on_tick)零分配(容量预留)、零日志,只做帧复制与
+//!   就绪队列出/入队(抢占决定在 `on_tick` 中完成)。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -75,11 +81,13 @@ struct Thread {
     ///         若被抢占恢复会**从头重跑**线程。
     frame_valid: bool,
     /// CRITICAL-1(审计 16 轮):ctx 是否"可作协作切换恢复用"。
-    /// 与 frame_valid 互补 —— 两套切换机制各选各的:
-    /// - 协作路径(yield/block/exit)只允许选中 ctx_valid 的线程;
+    /// 与 frame_valid 互补(审计 17 轮收严为双机制,见模块头):
+    /// - 协作路径选中者经 do_switch 按机制恢复 —— ctx_valid 用
+    ///   context_switch,仅 frame_valid 用 frame_restore;
     /// - 抢占路径(on_tick)只允许选中 frame_valid 的线程。
     ///
-    /// 被抢占的线程 ctx 陈旧(状态在帧里),协作路径若选中它会错乱。
+    /// 被抢占的线程 ctx 陈旧(状态在帧里),协作路径用陈旧 ctx
+    /// 切换它会错乱(复现旧程序点),故抢占后必须置 false。
     ctx_valid: bool,
     /// C5(审计 15 轮):唤醒标志 —— wake 无条件置位,block_current
     /// 消费;覆盖"唤醒早于阻塞"的窗口,防丢失唤醒。
@@ -466,6 +474,9 @@ pub fn block_current() {
             // 已被唤醒(队列中):撤销本次入队,继续运行。
             s.remove_from_ready(cur);
             s.threads[cur].state = ThreadState::Running;
+            // 自审(审计 17 轮续):同 woken 分支一样消费唤醒标志 ——
+            // 避免下次 block_current 把本次唤醒再消费一次(虚假继续)。
+            s.threads[cur].woken = false;
             // C11(审计 15 轮):**先 drop 锁再恢复中断** ——
             // 否则中断在锁持有期间重开,定时器 ISR 抢锁死锁。
             drop(s);
