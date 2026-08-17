@@ -56,7 +56,10 @@ const CS_SEPC: usize = 33;
 const CS_SCAUSE: usize = 34;
 const CS_STVAL: usize = 35;
 // 36 个槽 = 31 GPR + 4 CSR + 1 个未用槽(索引 31,对齐填充;LOW#8)。
-const TRAP_FRAME_WORDS: usize = 36;
+/// 陷阱帧槽位数:31 GPR + 4 CSR + 1 填充槽(索引 31;LOW#8)。
+/// **对外 pub**:sched.rs 的 Thread.frame 尺寸引用本常量
+/// (CRITICAL-1:此前各自维护,40 vs 36 导致越界读)。
+pub const TRAP_FRAME_WORDS: usize = 36;
 
 // 编译期锁定帧尺寸:riscv64.S 用 .equ TRAP_FRAME_SIZE, 288 与之对应
 // (汇编无法引用 Rust 常量,用断言防止两侧漂移,pro 审计 max #4)。
@@ -268,9 +271,24 @@ pub fn enable_timer() {
     // 往返,几百周期)。QEMU virt 与 RVA23 强制平台均支持;无 SSTC
     // 的平台此指令触发非法指令陷阱 → 停机诊断(可接受,见 sbi.rs)。
     set_stimecmp(deadline);
+    // HIGH-2 探测:写读回一致性断言 —— 若平台无 SSTC 或实现异常,
+    // 在此给出明确 panic 而非静默/后续乱跳。
+    let probe: usize;
+    unsafe {
+        asm!("csrr {}, stimecmp", out(reg) probe, options(nostack));
+    }
+    assert!(
+        probe == deadline,
+        "SSTC stimecmp write/read mismatch (platform lacks SSTC?)"
+    );
 }
 
 /// 直写 stimecmp(需平台支持 SSTC 扩展)。
+///
+/// HIGH-2(审计 14 轮):无 SSTC 平台执行 `csrw stimecmp` 会触发
+/// 非法指令陷阱 → 停机诊断。探测见 `enable_timer` 的写读回断言;
+/// **能力检测与 SBI 回退**登记 D17,随 M1.5 的 FDT(riscv,isa)
+/// 解析落地(届时据此选 SSTC 或 SBI 定时器)。
 #[inline]
 fn set_stimecmp(next: usize) {
     unsafe {

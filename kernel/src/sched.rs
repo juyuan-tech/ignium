@@ -39,7 +39,11 @@ pub const PRIO_HIGH: u8 = 0;
 pub const PRIO_LOW: u8 = 1;
 
 /// 陷阱帧槽位(与 riscv64.S/riscv64.rs 一致)。
-const FRAME_WORDS: usize = 40;
+/// CRITICAL-1:必须等于 arch::TRAP_FRAME_WORDS(36)= 31 GPR + 4 CSR
+/// + 1 填充;此前误写 40,on_tick 复制帧时越界读 32 字节。
+const FRAME_WORDS: usize = arch::TRAP_FRAME_WORDS;
+/// 编译期锁定:两处帧尺寸不得漂移。
+const _: () = assert!(FRAME_WORDS == 36);
 /// 帧内 sstatus 槽。
 const FRAME_SSTATUS: usize = 32;
 /// 帧内 sepc 槽。

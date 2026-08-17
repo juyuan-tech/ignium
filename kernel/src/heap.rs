@@ -190,9 +190,14 @@ impl KernelHeap {
         let size = layout.size();
         let align = layout.align();
         // CRITICAL-4:对 **所有** align > 8 的情况统一过量分配
-        // (align-1 对齐余量),返回指针对齐到 align;此前仅
-        // align > 页 才过量,8 < align <= 页 时 block+8 未对齐。
-        let needed = size + 8 + align - 1;
+        // (align-1 对齐余量),返回指针对齐到 align。
+        // MEDIUM-2(审计 14 轮):恶意/极端 Layout 可能使加法溢出
+        // 回绕成小值 → 计算出的 order 过小 → 欠分配 → 堆破坏。
+        // 用 checked 算术,溢出即 panic(与 order 超限一致)。
+        let needed = match size.checked_add(8).and_then(|v| v.checked_add(align - 1)) {
+            Some(v) => v,
+            None => panic!("kernel heap: allocation size overflow"),
+        };
         let pages = needed.div_ceil(mem::PAGE_SIZE);
         let order = pages.next_power_of_two().trailing_zeros() as usize;
         // MEDIUM-3:所需超过最大块(16MB)时明确失败,而非静默截断。

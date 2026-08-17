@@ -51,21 +51,23 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     arch::halt()
 }
 
-/// 返回栈区物理边界 `(bottom, top)`。
-/// 定位 sp 所在的栈区(boot 栈或 trap 栈),返回其 `(bottom, top)`。
+/// 返回栈区物理边界 `(bottom, top)`;sp 不在任何已知栈时返回 None
+/// (LOW-2:不默认回退 boot 栈,水位标记 unknown,防误导诊断)。
 ///
 /// panic 可能发生在两个栈上:主上下文(引导栈)或 trap_handler
 /// (陷阱栈)。水位扫描必须针对**当前栈**,否则会得到误导性结果
 /// (pro 审计 max #6:旧实现只扫引导栈,陷阱栈 panic 时报 0 已用)。
-fn current_stack_bounds(sp: usize) -> (usize, usize) {
+fn current_stack_bounds(sp: usize) -> Option<(usize, usize)> {
     let boot_bottom = (&raw const _stack_bottom).addr();
     let boot_top = (&raw const _stack_top).addr();
     let trap_bottom = (&raw const _trap_stack_bottom).addr();
     let trap_top = (&raw const _trap_stack_top).addr();
     if sp >= trap_bottom && sp < trap_top {
-        (trap_bottom, trap_top)
+        Some((trap_bottom, trap_top))
+    } else if sp >= boot_bottom && sp < boot_top {
+        Some((boot_bottom, boot_top))
     } else {
-        (boot_bottom, boot_top)
+        None
     }
 }
 
@@ -75,16 +77,16 @@ fn current_stack_bounds(sp: usize) -> (usize, usize) {
 /// 该地址曾被写过。从栈底向上第一个非零字节 ≈ 历史最深栈帧底。
 /// 按**字节**扫描(pro 审计 #13:usize 类型读取带严格 provenance
 /// 的活跃栈内存存在可疑性;panic 路径的性能开销可忽略)。
-fn stack_watermark(sp: usize) -> usize {
-    let (bottom, top) = current_stack_bounds(sp);
+fn stack_watermark(sp: usize) -> Option<usize> {
+    let (bottom, top) = current_stack_bounds(sp)?;
     let mut probe = bottom;
     while probe < top {
         if unsafe { core::ptr::read_volatile(probe as *const u8) } != 0 {
-            return top - probe;
+            return Some(top - probe);
         }
         probe += 1;
     }
-    0
+    Some(0)
 }
 
 /// 输出 CPU 状态 dump。
@@ -97,20 +99,27 @@ fn dump_cpu(state: CpuState) {
     error!("tick: {}", crate::logger::tick());
     error!("note: ra/sp 与 CSR 为 panic 上下文 best-effort 值;故障点帧见 trap dump");
     let sp = state.sp;
-    let (bottom, top) = current_stack_bounds(sp);
-    if sp < bottom || sp >= top {
-        // sp 出界是栈溢出/内存破坏的强信号,必须醒目提示。
-        error!(
-            "WARNING: sp={:#x} outside stack range [{:#x}, {:#x})",
-            sp, bottom, top
-        );
+    match current_stack_bounds(sp) {
+        Some((bottom, top)) => {
+            let wm = stack_watermark(sp).unwrap_or(0);
+            error!(
+                "stack watermark: {wm} / {} bytes used, uart dropped: {}",
+                top - bottom,
+                crate::uart::dropped()
+            );
+        }
+        None => {
+            // sp 不在任何已知栈:LOW-2 —— 标记 unknown,不误导。
+            error!(
+                "WARNING: sp={:#x} outside all known stacks (corrupted?)",
+                sp
+            );
+            error!(
+                "stack watermark: UNKNOWN, uart dropped: {}",
+                crate::uart::dropped()
+            );
+        }
     }
-    error!(
-        "stack watermark: {} / {} bytes used, uart dropped: {}",
-        stack_watermark(sp),
-        top - bottom,
-        crate::uart::dropped()
-    );
     error!(
         "ra={:#x} sp={:#x} gp={:#x} tp={:#x}",
         state.ra, state.sp, state.gp, state.tp

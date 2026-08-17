@@ -366,13 +366,27 @@ pub fn init(fdt: usize) {
     }
     let count = (crate::board::RAM_END - base) / PAGE_SIZE;
     // 保留区 = FDT 实际大小(HIGH-2:解析头部 totalsize,回退保守值)。
-    // 起点**向下**取整(H1:指针未页对齐时也必须保护其所在页);
-    // 终点向上取整;饱和算术防溢出。
-    let reserve = fdt_size(fdt).unwrap_or(crate::board::FDT_RESERVE_SIZE);
-    let fdt_start = fdt / PAGE_SIZE * PAGE_SIZE;
-    let fdt_end = fdt.saturating_add(reserve);
-    let rs = fdt_start.saturating_sub(base) / PAGE_SIZE;
-    let re = fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE);
+    // HIGH-1(审计 14 轮):fdt 指针必须先做合法性校验 —— 无效指针
+    // (0/非对齐/不在 RAM 内)若仍参与区间计算,会把任意块误标为
+    // 保留(浪费内存)或破坏刻蚀不变量。无效 → 跳过保留。
+    let (rs, re) = {
+        let ok = fdt != 0
+            && fdt.is_multiple_of(4)
+            && (crate::board::RAM_START..crate::board::RAM_END).contains(&fdt);
+        if !ok {
+            (0usize, 0usize)
+        } else {
+            // 起点**向下**取整(H1:指针未页对齐时也必须保护其所在页);
+            // 终点向上取整;饱和算术防溢出。
+            let reserve = fdt_size(fdt).unwrap_or(crate::board::FDT_RESERVE_SIZE);
+            let fdt_start = fdt / PAGE_SIZE * PAGE_SIZE;
+            let fdt_end = fdt.saturating_add(reserve);
+            (
+                fdt_start.saturating_sub(base) / PAGE_SIZE,
+                fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE),
+            )
+        }
+    };
     with_allocator(|a| unsafe { a.init(base, count, (rs, re)) });
 }
 
