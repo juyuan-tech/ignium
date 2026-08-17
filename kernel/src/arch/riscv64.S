@@ -191,6 +191,52 @@ trap_vector:
     j 4b
 
 # ---------------------------------------------------------------------------
+# context_switch:协作线程切换(调用边界语义)。
+#
+# 为什么只保存调用者保存寄存器(ra/sp/s0-s11)?
+#   - 协作切换发生在函数调用点(yield 等):按 RISC-V ABI,
+#     跨调用存活的是 ra/sp/s0-s11;t/a 寄存器跨调用可被丢弃,
+#     被切换出去的线程恢复时不会依赖它们。
+#   - 抢占切换不走本路径(走陷阱帧全量切换,见 sched.rs)。
+#
+# C ABI:void context_switch(Context *old, const Context *new)
+# Context(repr(C))布局:
+#   +0  ra  +8  sp  +16..+104  s0..s11
+# ---------------------------------------------------------------------------
+.align 2
+.globl context_switch
+context_switch:
+    sd ra, 0(a0)
+    sd sp, 8(a0)
+    sd s0, 16(a0)
+    sd s1, 24(a0)
+    sd s2, 32(a0)
+    sd s3, 40(a0)
+    sd s4, 48(a0)
+    sd s5, 56(a0)
+    sd s6, 64(a0)
+    sd s7, 72(a0)
+    sd s8, 80(a0)
+    sd s9, 88(a0)
+    sd s10, 96(a0)
+    sd s11, 104(a0)
+    ld ra, 0(a1)
+    ld sp, 8(a1)
+    ld s0, 16(a1)
+    ld s1, 24(a1)
+    ld s2, 32(a1)
+    ld s3, 40(a1)
+    ld s4, 48(a1)
+    ld s5, 56(a1)
+    ld s6, 64(a1)
+    ld s7, 72(a1)
+    ld s8, 80(a1)
+    ld s9, 88(a1)
+    ld s10, 96(a1)
+    ld s11, 104(a1)
+    ret
+
+# ---------------------------------------------------------------------------
 # cpu_state_asm:CpuState 快照读取(纯汇编实现)。
 #
 # 为什么不用 Rust 内联汇编?

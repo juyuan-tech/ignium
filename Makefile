@@ -55,6 +55,8 @@ test: build
 		&& grep -q "buddy allocator selftest ok" /tmp/ignium-test.log \
 		&& grep -q "Sv39 paging ok" /tmp/ignium-test.log \
 		&& grep -q "kernel heap selftest ok" /tmp/ignium-test.log \
+		&& grep -q "scheduler selftest ok" /tmp/ignium-test.log \
+		&& grep -q "sync primitives selftest ok" /tmp/ignium-test.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-test.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
 		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)

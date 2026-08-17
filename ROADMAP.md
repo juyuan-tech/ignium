@@ -27,9 +27,9 @@
 | Sv39 页表 + 内核自身映射 | ✅ 完成:身份映射(2MB 超页 RAM + UART 4KB),satp 切换 + sfence,自检通过 |
 | Sv39 页表 + 内核自身映射 | arch_mmu_map 接口 |
 | 内核堆(slab)+ alloc 稳定 | ✅ 完成:8 档 slab(16B..2KB)+ buddy 页路径,`#[global_allocator]`,Vec/Box 可用,自检通过 |
-| 上下文切换 arch_thread_switch | 多线程交替打印无错 |
-| 调度器:优先级抢占 + 时间片 + idle | 并发调度稳定 |
-| 同步原语:mutex/condvar | 并发计数最终值正确 |
+| 上下文切换 arch_thread_switch | ✅ 完成:协作切换(调用者保存寄存器)+ 抢占切换(全量帧) |
+| 调度器:优先级抢占 + 时间片 + idle | ✅ 完成:2 级优先级 + 轮转 + 100ms 时间片抢占 + idle,自检通过 |
+| 同步原语:mutex/condvar | ✅ 完成:阻塞式互斥(2000 计数校验)+ 条件变量握手,自检通过 |
 
 **M1 完成**,tag + Release。
 

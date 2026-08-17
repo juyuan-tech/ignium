@@ -100,14 +100,14 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 
 ## 路线
 
-见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1(陷阱/定时器/物理内存/Sv39 分页)**,下一步为内核堆。
+见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 全部完成**(陷阱/定时器/物理内存/分页/内核堆/调度器/同步原语),下一步 M2(用户进程 + IPC)。
 
 ## 里程碑
 
 | 里程碑 | 内容 |
 |---|---|
 | M0 ✓ | QEMU 启动 + UART 打印 |
-| M1 | trap/定时器/内存管理/调度 |
+| M1 ✓ | trap/定时器/内存管理/分页/内核堆/调度/同步原语 |
 | M2 | 用户进程 + IPC + 能力 |
 | M3 | 用户态服务 + shell |
 | M4 | 健壮性/测试 + OpenHarmony 组件移植 |

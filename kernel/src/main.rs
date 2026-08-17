@@ -23,6 +23,7 @@ mod mem;
 mod mmu;
 mod panic;
 mod sbi;
+mod sched;
 mod sync;
 mod uart;
 
@@ -95,14 +96,24 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         Ok(()) => info!("M1: kernel heap selftest ok (slab 16B..2KB + page path)"),
         Err(e) => panic!("kernel heap selftest failed: {e}"),
     }
+    // 调度器初始化(idle 线程)+ 自检。
+    // 须在 irq_enable 之前;此后当前上下文 = idle 线程。
+    sched::init();
+    match sched::self_test() {
+        Ok(()) => info!("M1: scheduler selftest ok (cooperative + preemptive)"),
+        Err(e) => panic!("scheduler selftest failed: {e}"),
+    }
+    match sync::self_test() {
+        Ok(()) => info!("M1: sync primitives selftest ok (mutex + condvar)"),
+        Err(e) => panic!("sync primitives selftest failed: {e}"),
+    }
     arch::irq_enable();
     info!(
         "M1: timer enabled ({}us interval), interrupts on",
         arch::TIMER_INTERVAL / 10
     );
-    // 空闲循环:wfi 被定时器中断唤醒,tick 由中断处理递增。
-    // 每 100 tick(1s)输出一次 uptime 心跳,验证中断/恢复链路与
-    // 节拍精度。注意:M1 验证用;调度器就绪后应移除或降级为 debug。
+    // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
+    // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。
     let mut last_tick = 0u64;
     loop {
         arch::wait_for_interrupt();

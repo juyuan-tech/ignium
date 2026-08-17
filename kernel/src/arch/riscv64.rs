@@ -83,11 +83,23 @@ extern "C" {
     // 纯汇编实现(riscv64.S)。为什么不用内联汇编:读取 ra/sp/gp/tp
     // 而不声明操作数在 Rust 内联汇编中是形式 UB,见 riscv64.S 注释。
     fn cpu_state_asm(out: *mut CpuState);
+    // 协作线程切换(riscv64.S):保存调用者保存寄存器,加载新上下文。
+    pub fn context_switch(old: *mut Context, new: *const Context);
     // trap_vector 的符号地址(riscv64.S 中定义,16 字节对齐)。
     static trap_vector: u8;
     // 陷阱栈边界(linker.ld 定义):异常处理器的专用栈,帧压在其上。
     static _trap_stack_bottom: u8;
     static _trap_stack_top: u8;
+}
+
+/// 协作线程上下文:仅调用者保存寄存器(ra/sp/s0-s11)。
+/// `#[repr(C)]` 与 context_switch 汇编的偏移一致。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Context {
+    pub ra: usize,
+    pub sp: usize,
+    pub s: [usize; 12],
 }
 
 /// 安装陷阱向量并初始化陷阱栈指针。
@@ -160,6 +172,33 @@ pub fn irq_disable() {
 pub fn irq_enable() {
     unsafe {
         asm!("csrsi sstatus, 2", options(nostack));
+    }
+}
+
+/// 保存中断使能状态并关闭中断(IRQ 安全锁的基础)。
+/// 返回:原 SIE 是否开启。
+#[inline]
+pub fn irq_save() -> bool {
+    let s: usize;
+    unsafe {
+        asm!("csrr {}, sstatus", out(reg) s, options(nostack));
+    }
+    let on = s & 2 != 0;
+    if on {
+        unsafe {
+            asm!("csrci sstatus, 2", options(nostack));
+        }
+    }
+    on
+}
+
+/// 按 `irq_save` 的返回值恢复中断使能状态。
+#[inline]
+pub fn irq_restore(on: bool) {
+    if on {
+        unsafe {
+            asm!("csrsi sstatus, 2", options(nostack));
+        }
     }
 }
 
@@ -320,8 +359,10 @@ pub unsafe extern "C" fn trap_handler(
                     crate::sbi::set_timer(next) == 0,
                     "sbi_set_timer failed in timer ISR"
                 );
-                // 恢复被中断的上下文继续执行。
-                frame
+                // 抢占决策:时间片到期且存在就绪线程时,返回下一线程
+                // 的帧指针,汇编恢复路径据此 sret 进入新线程
+                // (全寄存器恢复,含 t/a)。
+                unsafe { crate::sched::on_tick(frame) }
             }
             other => {
                 // 未处理的中断:输出诊断并停机。
