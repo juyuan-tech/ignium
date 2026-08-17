@@ -224,6 +224,18 @@ impl Scheduler {
         self.enqueue(cur);
         // CRITICAL-1:抢占路径选帧有效线程。
         let next = self.pick_next(false);
+        if next == cur {
+            // 前瞻(审计 16 轮自审):轮转可能把刚入队的 cur 选回
+            // (其帧有效)—— 白做一次捕获/恢复循环。撤销入队并
+            // 恢复原线程(has_other 已证明曾存在候选,但候选可能
+            // 在轮转间隙失去资格;重试路径在下一 tick 自然发生)。
+            self.remove_from_ready(cur);
+            self.threads[cur].state = ThreadState::Running;
+            // 帧恢复运行;ctx 仍陈旧(帧恢复不更新 ctx),保持 false。
+            self.threads[cur].frame_valid = true;
+            self.threads[cur].ctx_valid = false;
+            return frame;
+        }
         self.current = next;
         // 选中者将被帧恢复运行 —— 恢复后可被协作切换(ctx 将
         // 在它下次 yield 时重存),此处置 ctx_valid 使协作路径可选它。

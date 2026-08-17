@@ -227,6 +227,7 @@ impl Condvar {
 static TEST_MUTEX: Mutex<u32> = Mutex::new(0);
 static TEST_MUTEX_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_MUTEX_DONE2: AtomicBool = AtomicBool::new(false);
+static TEST_MUTEX_MIXED_DONE: AtomicBool = AtomicBool::new(false);
 
 /// 互斥自检线程:在锁内递增 1000 次,完成置位。
 fn mutex_inc() {
@@ -269,6 +270,20 @@ fn cond_consumer() {
     }
 }
 
+/// 互斥自检线程:在锁内递增 500 次(8 线程混合切换版本,覆盖
+/// 抢占-协作交错的 ctx_valid/frame_valid 协议)。
+fn mutex_mixed() {
+    for _ in 0..500 {
+        let mut g = TEST_MUTEX.lock();
+        *g += 1;
+        // 偶次迭代让出:制造协作切换与抢占交错的混合路径。
+        if (*g).is_multiple_of(2) {
+            sched::yield_();
+        }
+    }
+    TEST_MUTEX_MIXED_DONE.store(true, Ordering::Release);
+}
+
 /// 同步原语自检(须在调度器初始化后、作为线程运行)。
 pub fn self_test() -> Result<(), &'static str> {
     sched::spawn(mutex_inc, sched::PRIO_HIGH);
@@ -297,6 +312,25 @@ pub fn self_test() -> Result<(), &'static str> {
     }
     if !TEST_COND_DONE.load(Ordering::Acquire) {
         return Err("condvar handshake failed");
+    }
+
+    // 混合路径压力:8 线程 × 500 次互斥递增 + 偶次 yield
+    // (抢占-协作交错,覆盖 ctx_valid/frame_valid 协议回归)。
+    *TEST_MUTEX.lock() = 0;
+    TEST_MUTEX_MIXED_DONE.store(false, Ordering::Relaxed);
+    for _ in 0..8 {
+        sched::spawn(mutex_mixed, sched::PRIO_HIGH);
+    }
+    guard = 0;
+    while !TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) && guard < 500_000 {
+        sched::yield_();
+        guard += 1;
+    }
+    if !TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) {
+        return Err("mixed-path mutex timeout");
+    }
+    if *TEST_MUTEX.lock() != 8 * 500 {
+        return Err("mixed-path mutex counter mismatch");
     }
     Ok(())
 }
