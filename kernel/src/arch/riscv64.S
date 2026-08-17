@@ -130,10 +130,16 @@ trap_vector:
     beqz a0, 1f
     # ===== 恢复路径 =====
     mv t6, a0
-    # 先把 sscratch 恢复为陷阱栈顶(帧底 + 帧大小),供下次 trap 使用。
-    # 不这样做会导致陷阱栈顶每次 trap 都向下漂移,最终耗尽。
-    addi t0, t6, TRAP_FRAME_SIZE
+    # CRITICAL-3(审计 16 轮):sscratch 只在帧位于**陷阱栈**时复位
+    # 为栈顶 —— 抢占切换的帧在堆里(线程 TCB),把 sscratch 设成
+    # 堆地址会让下次 trap 的嵌套检测误判"嵌套"而停机。
+    # 判断:帧 + 帧长 == 陷阱栈顶。
+    la t0, _trap_stack_top
+    addi t1, t6, TRAP_FRAME_SIZE
+    bne t1, t0, 3f
+    # 陷阱栈帧:复位 sscratch 为栈顶,防栈顶漂移。
     csrw sscratch, t0
+3:
     # 恢复 sstatus:清掉 SIE 位再写回 —— sret 时硬件用 SPIE(硬件在
     # trap 入口置 1)恢复 SIE,从而"原子地"重新使能中断,避免在
     # sret 前被打断(被打断时帧已部分恢复,会产生双重恢复错误)。

@@ -230,9 +230,11 @@ impl KernelHeap {
             return;
         }
         let page = (ptr as usize) & !(mem::PAGE_SIZE - 1);
-        // MEDIUM-2:指针越界防御 —— 判别表下标不得越界/下溢。
+        // MEDIUM-2 + MED-9(审计 16 轮):界检查收窄到**真实可分配
+        // 页数** —— 过宽的 MAX_PAGES 检查会让 padding/未分配区的
+        // 指针进入大对象路径读 ptr-8(越界)。
         let base = heap_base();
-        if page < base || page - base >= mem::MAX_PAGES * mem::PAGE_SIZE {
+        if page < base || page - base >= mem::page_count() * mem::PAGE_SIZE {
             panic!(
                 "kernel heap: invalid pointer {:#x} (outside allocatable region)",
                 ptr as usize

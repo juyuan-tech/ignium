@@ -18,7 +18,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -31,6 +30,10 @@ use crate::warn;
 const THREAD_STACK_SIZE: usize = 16 * 1024;
 /// 时间片(tick 数,10 tick = 100ms)。
 const SLICE_TICKS: u64 = 10;
+/// 最大并发线程数(就绪队列按此预留容量 —— HIGH-5/审计 16 轮:
+/// 定时器 ISR 内 enqueue 的 push_back 不得触发分配,否则与堆锁
+/// 死锁;容量在 init 一次性预留)。
+const MAX_THREADS: usize = 64;
 /// 优先级级数。
 const PRIO_LEVELS: usize = 2;
 /// 高优先级。
@@ -71,6 +74,13 @@ struct Thread {
     /// false = 线程经 yield/block 让出(进度在 ctx),其帧已失效,
     ///         若被抢占恢复会**从头重跑**线程。
     frame_valid: bool,
+    /// CRITICAL-1(审计 16 轮):ctx 是否"可作协作切换恢复用"。
+    /// 与 frame_valid 互补 —— 两套切换机制各选各的:
+    /// - 协作路径(yield/block/exit)只允许选中 ctx_valid 的线程;
+    /// - 抢占路径(on_tick)只允许选中 frame_valid 的线程。
+    ///
+    /// 被抢占的线程 ctx 陈旧(状态在帧里),协作路径若选中它会错乱。
+    ctx_valid: bool,
     /// C5(审计 15 轮):唤醒标志 —— wake 无条件置位,block_current
     /// 消费;覆盖"唤醒早于阻塞"的窗口,防丢失唤醒。
     woken: bool,
@@ -78,7 +88,7 @@ struct Thread {
     entry: fn(),
     /// 线程栈(Box:栈内存来自内核堆)。
     #[allow(dead_code)]
-    stack: Option<Box<[u8]>>,
+    stack: Option<KernelStack>,
 }
 
 /// 调度器。
@@ -95,18 +105,17 @@ struct Scheduler {
     /// 下一个线程 id。
     next_id: usize,
     /// 已退出线程的栈回收队列(idle 在自身上下文释放)。
-    reaper: VecDeque<Box<[u8]>>,
+    reaper: VecDeque<KernelStack>,
 }
 
 // 含裸指针/上下文状态:单上下文 + SpinLock 互斥下安全
 // (供 SpinLock<T: Send> 的 Sync 约束)。
 unsafe impl Send for Scheduler {}
 
-/// 空闲线程入口:回收已退出线程的栈 + 永远让出。
+/// 空闲线程入口(实际不可达 —— idle 线程以主流程上下文运行;
+/// ctx.ra 初始引用保持此符号,防链接器移除)。
 fn idle_entry() {
     loop {
-        // 回收他人栈(安全:自己不在被释放的栈上);随后让出 CPU。
-        reap();
         yield_();
     }
 }
@@ -132,14 +141,30 @@ impl Scheduler {
     /// 查找下一个可运行线程(轮转),返回 id。
     /// 选中者状态置为 Running(派发即运行;此前缺失导致唤醒线程
     /// 以 Ready 状态进入 block_current 误判"已唤醒"而自旋)。
-    fn pick_next(&mut self) -> usize {
+    ///
+    /// CRITICAL-1:参数 `need_ctx` = true 表示协作路径调用 —— 只选
+    /// ctx_valid 的线程(被抢占线程的 ctx 陈旧,协作切换会错乱);
+    /// = false 表示抢占路径(on_tick),只选 frame_valid 的线程。
+    /// 无分配:仅 VecDeque 出/入队(轮转),不满足条件的候选回队尾。
+    fn pick_next(&mut self, need_ctx: bool) -> usize {
         for level in 0..PRIO_LEVELS {
-            while let Some(id) = self.ready[level].pop_front() {
-                if self.threads[id].state == ThreadState::Ready {
+            let q = &mut self.ready[level];
+            let round = q.len();
+            for _ in 0..round {
+                let Some(id) = q.pop_front() else { break };
+                if self.threads[id].state != ThreadState::Ready {
+                    continue; // 非 Ready(如 Exited):丢弃。
+                }
+                let ok = if need_ctx {
+                    self.threads[id].ctx_valid
+                } else {
+                    self.threads[id].frame_valid
+                };
+                if ok {
                     self.threads[id].state = ThreadState::Running;
                     return id;
                 }
-                // 状态非 Ready(如已 Exit):丢弃。
+                q.push_back(id); // 暂不满足:轮转到队尾,不丢失。
             }
         }
         self.idle
@@ -191,11 +216,18 @@ impl Scheduler {
             .frame
             .copy_from_slice(unsafe { core::slice::from_raw_parts(frame, FRAME_WORDS) });
         self.threads[cur].frame_valid = true;
+        // CRITICAL-1:抢占捕获后,ctx 失效(状态在帧里)——
+        // 协作路径不得再用陈旧 ctx 切换它。
+        self.threads[cur].ctx_valid = false;
         self.threads[cur].state = ThreadState::Ready;
         // 加入就绪(排到队尾,轮转)。
         self.enqueue(cur);
-        let next = self.pick_next();
+        // CRITICAL-1:抢占路径选帧有效线程。
+        let next = self.pick_next(false);
         self.current = next;
+        // 选中者将被帧恢复运行 —— 恢复后可被协作切换(ctx 将
+        // 在它下次 yield 时重存),此处置 ctx_valid 使协作路径可选它。
+        self.threads[next].ctx_valid = true;
         // 返回下一线程的帧指针,汇编据此 sret 全量恢复。
         self.threads[next].frame.as_mut_ptr()
     }
@@ -208,12 +240,17 @@ impl Scheduler {
         // memset —— 栈内容无需初始化(初始帧/上下文显式构造)。
         let stack = alloc_zeroed_free_stack();
         // HIGH-4:sp 须 16 字节对齐(RISC-V ABI);堆指针仅保证 8 对齐。
-        let sp = (stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF;
+        let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
         // 初始帧:sepc = 线程包装器,sstatus:SPIE=1(进线程后开中断)。
+        // CRITICAL-2(审计 16 轮):帧内 sp/gp 必须有效 —— 恢复路径
+        // 会从帧加载 sp;gp 与 trap_vector 入口一致(内核代码可能
+        // 生成 gp 相对访问)。
         let mut frame = [0usize; FRAME_WORDS];
         frame[FRAME_SEPC] = thread_entry as *const () as usize;
         frame[FRAME_SSTATUS] = 1 << 5; // SPIE
-                                       // MED-10(审计 15 轮):优先级越界钳制,防就绪队列越界 panic。
+        frame[1] = sp;
+        frame[2] = __global_pointer();
+        // MED-10(审计 15 轮):优先级越界钳制,防就绪队列越界 panic。
         let prio = prio.min(PRIO_LEVELS as u8 - 1);
         let t = Thread {
             prio,
@@ -227,6 +264,8 @@ impl Scheduler {
             frame,
             // 新线程初始帧有效(sepc=thread_entry),可被抢占首启。
             frame_valid: true,
+            // 初始 ctx 有效(thread_entry 首启),可被协作切换选中。
+            ctx_valid: true,
             woken: false,
             entry,
             stack: Some(stack),
@@ -251,24 +290,57 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
 /// 线程 id 分配(供外部日志/调试)。
 static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
 
-/// 零化-free 线程栈分配(性能优化):免 16KB memset。
-/// 栈内存来自内核堆,无需初始化(初始帧/上下文显式构造);
-/// 16 字节对齐满足 ABI。
-fn alloc_zeroed_free_stack() -> Box<[u8]> {
+/// __global_pointer$ 地址(与 entry.S/trap_vector 一致;新线程帧
+/// 的 gp 槽用它,保证内核代码的 gp 相对访问有效)。
+fn __global_pointer() -> usize {
+    unsafe extern "C" {
+        #[link_name = "__global_pointer$"]
+        static GLOBAL_POINTER: u8;
+    }
+    (&raw const GLOBAL_POINTER).addr()
+}
+
+/// 零化-free 线程栈(性能优化:免 16KB memset)。
+///
+/// MED-8(审计 16 轮):Box<[u8]> 的 Drop 用 align=1 布局释放 ——
+/// 与分配时的 align=16 **不匹配(UB)**。自定义包装按同一布局
+/// (size=THREAD_STACK_SIZE, align=16)释放。
+struct KernelStack {
+    ptr: *mut u8,
+}
+
+// 含裸指针:单上下文调度下,指针生命周期由 Scheduler 管理 —— 安全。
+unsafe impl Send for KernelStack {}
+
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        let layout =
+            core::alloc::Layout::from_size_align(THREAD_STACK_SIZE, 16).expect("stack layout");
+        unsafe { alloc::alloc::dealloc(self.ptr, layout) };
+    }
+}
+
+fn alloc_zeroed_free_stack() -> KernelStack {
     let layout = core::alloc::Layout::from_size_align(THREAD_STACK_SIZE, 16).expect("stack layout");
     let ptr = unsafe { alloc::alloc::alloc(layout) };
     assert!(!ptr.is_null(), "kernel heap: thread stack OOM");
-    unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, THREAD_STACK_SIZE)) }
+    KernelStack { ptr }
 }
 
 /// 初始化调度器(创建 idle 线程;须在堆就绪后、irq_enable 前调用)。
 pub fn init() {
     let irq = arch::irq_save();
     let mut s = SCHED.lock();
+    // HIGH-5:预留容量 —— 此后 ISR 内的 enqueue/栈移交均零分配。
+    for q in s.ready.iter_mut() {
+        q.reserve(MAX_THREADS);
+    }
+    s.reaper.reserve(MAX_THREADS);
+    s.threads.reserve(MAX_THREADS);
     // idle 线程:id=0,最低优先级,永不阻塞。
     let idle_id = 0;
     let stack = alloc_zeroed_free_stack();
-    let sp = (stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF;
+    let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
     let mut frame = [0usize; FRAME_WORDS];
     frame[FRAME_SEPC] = idle_entry as *const () as usize;
     frame[FRAME_SSTATUS] = 1 << 5;
@@ -284,6 +356,7 @@ pub fn init() {
         // idle 以主流程直接运行(非经切换),初始帧从未被使用 →
         // 无效;其帧在真正被抢占时才会捕获。
         frame_valid: false,
+        ctx_valid: true,
         woken: false,
         entry: idle_entry,
         stack: Some(stack),
@@ -315,10 +388,17 @@ pub fn yield_() {
         let cur = s.current;
         // C3(审计 15 轮回归):合并锁时丢失 —— yield 后进度在 ctx,
         // 帧必须失效,否则抢占会用过期帧恢复线程(从头重跑)。
+        // CRITICAL-1:ctx 刚保存(有效),协作路径可选本线程。
         s.threads[cur].frame_valid = false;
+        s.threads[cur].ctx_valid = true;
+        // MED-7(审计 16 轮):顺带回收已退出线程的栈(在"即将被
+        // 切走"的当前线程栈上释放**他人**的栈 —— 安全)。
+        while let Some(stack) = s.reaper.pop_front() {
+            drop(stack);
+        }
         s.enqueue(cur);
         s.ticks_run = 0;
-        let next = s.pick_next();
+        let next = s.pick_next(true);
         s.current = next;
         let old = (&mut s.threads[cur].ctx) as *mut Context;
         let new = (&s.threads[next].ctx) as *const Context;
@@ -363,8 +443,9 @@ pub fn block_current() {
         let c = s.current;
         s.threads[c].state = ThreadState::Blocked;
         s.threads[c].frame_valid = false;
+        s.threads[c].ctx_valid = true;
         s.ticks_run = 0;
-        let n = s.pick_next();
+        let n = s.pick_next(true);
         s.current = n;
         let old = (&mut s.threads[c].ctx) as *mut Context;
         let new = (&s.threads[n].ctx) as *const Context;
@@ -419,8 +500,9 @@ pub fn exit() -> ! {
         }
         s.threads[cur].state = ThreadState::Exited;
         s.threads[cur].frame_valid = false;
+        s.threads[cur].ctx_valid = true;
         s.ticks_run = 0;
-        let next = s.pick_next();
+        let next = s.pick_next(true);
         s.current = next;
         let old = (&mut s.threads[cur].ctx) as *mut Context;
         let new = (&s.threads[next].ctx) as *const Context;
@@ -430,18 +512,6 @@ pub fn exit() -> ! {
     // exit_self 切走,不会到达这里;防御性停机。
     arch::irq_restore(irq);
     arch::halt()
-}
-
-/// 回收已退出线程的栈(仅由 idle 线程调用 —— 它在自己的栈上,
-/// 释放的是别人的栈,安全)。
-fn reap() {
-    let irq = arch::irq_save();
-    let mut s = SCHED.lock();
-    while let Some(stack) = s.reaper.pop_front() {
-        drop(stack);
-    }
-    drop(s);
-    arch::irq_restore(irq);
 }
 
 /// 定时器 ISR 回调(中断关闭上下文):抢占决策,返回恢复帧。
