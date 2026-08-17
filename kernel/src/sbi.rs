@@ -6,8 +6,8 @@
 //! # 约定
 //! - 调用约定:`a7` = 扩展号,`a6` = 功能号,`a0-a5` = 参数;
 //!   返回 `a0` = 错误码(SBI_SUCCESS=0),`a1` = 附加返回值。
-//! - 内核当前不校验返回值:定时器编程失败时 tick 不推进,uptime
-//!   日志会暴露问题;M2+ 引入错误传播。
+//! - 错误处理:**所有调用方必须检查返回值**。定时器编程失败 =
+//!   节拍源丢失,boot 与 ISR 两处均已 assert!(panic 明确诊断)。
 //! - OpenSBI 1.0 规范:扩展号 0x54494D45("TIME")功能 0 = set_timer,
 //!   参数 = 绝对 stime 值(mtimer 时钟周期)。
 
@@ -17,8 +17,8 @@ const SBI_EXT_TIME: usize = 0x5449_4D45;
 /// 编程定时器:在 `stime_value`(绝对时间,mtimer 周期)触发
 /// 超级定时器中断(STIE)。替代已废弃的 legacy sbi_set_timer。
 ///
-/// 返回 SBI 错误码(0 = SBI_SUCCESS)。调用方应检查返回值;
-/// ISR 内可忽略(失败表现为 tick 冻结,由 uptime 暴露)。
+/// 返回 SBI 错误码(0 = SBI_SUCCESS)。**调用方必须检查**:boot 与
+/// 定时器 ISR 均已 assert!,失败即 panic(节拍源丢失不可静默)。
 ///
 /// # Safety
 /// 仅用于编程 S 模式定时器;调用后 a0/a1 被 SBI 覆写,已声明为

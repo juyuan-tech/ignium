@@ -27,6 +27,12 @@ use core::arch::global_asm;
 // 引导汇编:_start 入口、BSS 清零、栈指针设置。逻辑见 src/entry.S 注释。
 global_asm!(include_str!("entry.S"));
 
+/// 多核引导仲裁标志:entry.S 用 amoswap 竞争"引导权"
+/// (boot hart 不一定是 hart 0)。必须放在 .data(镜像加载即就绪,
+/// 不依赖 BSS 清零)。
+#[unsafe(no_mangle)]
+pub static mut BOOT_LOCK: u32 = 0;
+
 /// 内核主入口,由 `_start`(src/entry.S)以 C ABI 调用,永不返回。
 ///
 /// # 参数
@@ -36,12 +42,15 @@ global_asm!(include_str!("entry.S"));
 ///
 /// # 初始化顺序(依赖关系,勿随意调整)
 /// 1. `arch::irq_disable` —— 在一切操作前建立确定的中断状态
-/// 2. `uart::init` —— 日志基础设施,必须先于任何输出
-/// 3. `arch::init_traps` —— stvec 装好之前发生异常会跳到地址 0
+/// 2. `arch::sanitize_csr` —— 清洗引导器遗留的 sie/sip/sstatus 位
+/// 3. `uart::init` —— 日志基础设施,必须先于任何输出
+/// 4. `arch::init_traps` —— stvec 装好之前发生异常会跳到地址 0
 ///    (不可恢复),因此必须尽早;但必须在 uart 之后(陷阱日志依赖串口)
-/// 4. `arch::enable_timer` —— 定时器中断源(STIE),必须晚于陷阱向量
-/// 5. `logger::set_level` —— 日志级别,先于任何日志调用
-/// 6. `arch::irq_enable` —— 最后才开全局中断(中断源全部就绪之后)
+/// 5. `arch::enable_timer` —— 定时器中断源(STIE),必须晚于陷阱向量
+/// 6. `logger::set_level` —— 日志级别,先于任何日志调用
+/// 7. `mem::init(fdt)` + 自检 —— 物理内存(含 FDT 刻蚀),须在页表前
+/// 8. `mmu::init` + 自检 —— Sv39 身份映射,须在中断使能前
+/// 9. `arch::irq_enable` —— 最后才开全局中断(中断源全部就绪之后)
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     arch::irq_disable();

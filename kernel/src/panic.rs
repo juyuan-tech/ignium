@@ -15,9 +15,9 @@ use crate::arch::{self, CpuState};
 use crate::error;
 
 // 链接脚本符号(kernel/linker.ld):栈区边界。
-// 说明:extern 声明**仅用于取符号地址**(`&_stack_bottom as usize`),
-// 从不解引用该 extern 本身;后续的扫描用裸指针 volatile 逐字节读,
-// 无类型化读的 provenance 问题(pro 审计 max #5)。
+// 说明:extern 声明**仅用于取符号地址**((&raw const X).addr(),
+// 不形成引用),从不解引用该 extern 本身;后续的扫描用裸指针
+// volatile 逐字节读,无类型化读的 provenance 问题(pro 审计 max #5)。
 extern "C" {
     static _stack_bottom: u8;
     static _stack_top: u8;

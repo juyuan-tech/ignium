@@ -13,5 +13,5 @@ target = "riscv64gc-unknown-none-elf"
 [target.riscv64gc-unknown-none-elf]
 # 链接脚本由 kernel/build.rs 以 CARGO_MANIFEST_DIR 绝对路径传入
 # (L1:相对路径依赖工作目录,子目录/IDE 构建会失败)。
-# 链接脚本显式收纳全部段 + /DISCARD/ 工具链噪音段;新段靠代码
-# review 显式入脚本(见 AGENTS.md 红线 4)。
+# 注:Zaamo/Zalrsc 原子扩展在 entry.S 内以 .option arch 就地启用,
+# 无需在此配置。

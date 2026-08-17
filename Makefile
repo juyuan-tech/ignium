@@ -58,6 +58,14 @@ test: build
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
 		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)
 
+# 多核冒烟:boot hart 不一定是 hart 0(实测 -smp 4 时为 hart 3),
+# 断言恰好 1 条 M0(引导权仲裁正确,无重复引导/无全员停车)。
+test-smp:
+	@timeout 10 $(QEMU) $(QEMUARGS) -smp 4 -kernel $(KERNEL_ELF) > /tmp/ignium-smp.log 2>&1 || true
+	@test "$$(grep -c 'M0: boot ok' /tmp/ignium-smp.log)" -eq 1 \
+		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log \
+		&& echo "SMP TEST PASS" || (echo "SMP TEST FAIL"; cat /tmp/ignium-smp.log; exit 1)
+
 clean:
 	cargo clean
 
@@ -67,4 +75,4 @@ clippy:
 fmt:
 	cargo fmt --check
 
-.PHONY: build bin qemu gdb test clean clippy fmt
+.PHONY: build bin qemu gdb test test-smp clean clippy fmt

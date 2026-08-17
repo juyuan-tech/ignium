@@ -219,7 +219,9 @@ pub fn enable_timer() {
         // sie.STIE = bit 5(超级定时器中断使能)。
         // 注意:csrs/csrc 的立即数仅 5 位(0..31),位 5(0x20)必须
         // 走寄存器操作数形式。
-        asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nomem, nostack));
+        // 屏障语义同 irq_*(无 nomem):中断源切换必须作为编译器
+        // 内存屏障,防止与后续 ecall 重排。
+        asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nostack));
     }
     let deadline = get_time() + TIMER_INTERVAL;
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);

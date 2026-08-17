@@ -1,17 +1,19 @@
 # Ignium 引导入口(RISC-V 64,S 模式,OpenSBI 跳转到 0x80200000 进入此处)。
 #
 # 寄存器约定:
-#   a0 = hartid(OpenSBI 传入)
-#   a1 = FDT 指针(OpenSBI 传入)
-#   a0/a1 必须保留到 `call kernel_main`(BSS 循环只使用 t0/t1;
-#   副 hart 停车分支在触碰内存之前完成)。
+#   a0 = hartid(OpenSBI 传入,保留到 `call kernel_main`)
+#   a1 = FDT 指针(OpenSBI 传入,保留到 `call kernel_main`)
 #
 # 启动顺序:
 #   1) 清 sstatus.SIE(遗留引导器可能开着中断)
-#   2) satp 清零(Bare 模式)+ sfence.vma 冲刷 TLB
-#   3) 初始化 gp(__global_pointer$ 锚点;norelax 防止自身被松弛成 no-op)
-#   4) 副 hart(非 0)立即停车,不触碰共享内存
-#   5) hart 0:清零 BSS(含栈区)→ 设栈 → kernel_main
+#   2) tp = hartid(per-hart 状态约定)
+#   3) stvec = early_trap stub + sscratch 清零(早期陷阱安全停机)
+#   4) satp 清零(Bare 模式)+ sfence.vma 冲刷 TLB
+#   5) 初始化 gp(norelax 防自松弛)
+#   6) **引导权仲裁**:BOOT_LOCK 原子标志竞争 —— boot hart 不一定是
+#      hart 0(QEMU -smp 4 实测 boot hart = 3);赢得仲裁者执行
+#      BSS 清零与引导,其余停车(防全员停车/重复清零)。
+#   7) 引导者:清零 BSS(含栈区)→ 设栈 → kernel_main
 
 .section .text.entry
 .globl _start
@@ -24,10 +26,8 @@ _start:
     # 后续多核代码以 tp 索引 per-hart 陷阱栈/上下文,当前阶段无使用方,
     # 但提前建立约定避免迁移成本。
     mv tp, a0
-    # 清洗引导器遗留的陷阱状态(L1):stvec/sscratch 置零,
-    # 防止早期 trap 跳到陈旧向量/使用陈旧陷阱栈指针。
-    # 然后立即安装"早期停机 stub":在 init_traps() 之前发生任何
-    # 异常 → 关中断停机(而不是跳到地址 0 乱跑,M3 陷阱窗口)。
+    # 清洗引导器遗留的陷阱状态(L1):安装"早期停机 stub"并清 sscratch
+    # (在 init_traps() 之前任何异常 → 关中断停机,M3 陷阱窗口)。
     .option norelax
     la t0, early_trap
     .option relax
@@ -46,10 +46,22 @@ _start:
     la gp, __global_pointer$
     .option relax
 
-    # 副 hart 停车:多 hart 启动时,非 0 hart 在触碰任何内存前原地
-    # 等待(hart 0 完成引导后再唤醒 —— M1 实现)。这防止多个 hart
-    # 并发清 BSS、共享引导栈/陷阱栈导致的数据竞争。
-    bnez a0, park
+    # ===== 引导权仲裁 =====
+    # amoswap.w.aq rd, rs2, (rs1):rd = 旧值,内存 = rs2。
+    # BOOT_LOCK 初始为 0(在 .data,镜像加载即就绪);返回 0 者
+    # 赢得引导权(原子性保证只有一个赢家),其余立即停车。
+    # .option arch:LLVM 把 'a' 细分为 zaamo/zalrsc,需就地启用。
+    .option arch, +zaamo
+    .option norelax
+    la t0, BOOT_LOCK
+    .option relax
+    li t1, 1
+    amoswap.w.aq t1, t1, 0(t0)
+    # 赢家继续;输家停车(不触碰任何共享内存)。
+    bnez t1, park
+    # 仲裁的 acquire 语义之后,用全 fence 保证后续 BSS 清零对
+    # 所有 hart 可见(真实多核平台的存储顺序)。
+    fence rw, rw
 
     # 清零 [ _bss_start, _trap_stack_top ),8 字节步进。
     # 覆盖:BSS + 引导栈 + 陷阱栈 —— 三处全部归零(M6:陷阱栈清零
