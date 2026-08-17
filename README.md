@@ -4,7 +4,7 @@
 
 - 项目:商丘炬元科技有限公司
 - 许可证:Apache-2.0
-- 开发环境:WSL2 (Ubuntu 22.04) + QEMU,无需物理机
+- 开发环境:WSL2 (Ubuntu 24.04) + QEMU,无需物理机
 - 启动链:QEMU OpenSBI 固件 → Ignium 内核 @0x80200000(S 模式)
 
 ## 定位与差异化
@@ -24,11 +24,9 @@
 ```bash
 sudo apt install -y qemu-system-misc
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup target add riscv64gc-unknown-none-elf
-rustup component add llvm-tools
 
-make qemu    # 编译并启动到 QEMU
-make test    # CI 同样的启动冒烟测试
+make test    # 编译(工具链/目标/组件由 rust-toolchain.toml 自动安装)+ QEMU 冒烟
+make qemu    # 启动到 QEMU(交互查看)
 make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 ```
 
@@ -37,6 +35,8 @@ make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 ```
 [000000] [INFO ] Ignium 炬元微内核 v0.1.0 booting
 [000000] [INFO ] M0: boot ok - arch: riscv64, machine: qemu-virt, hartid=0, fdt=0x87e00000
+[000000] [INFO ] M1: buddy allocator selftest ok (114688 KiB managed)
+[000000] [INFO ] M1: Sv39 paging ok (identity map, satp root=0x8000000000081000)
 [000000] [INFO ] M1: timer enabled (10000us interval), interrupts on
 [000100] [INFO ] uptime: 100 ticks (1000 ms)
 [000200] [INFO ] uptime: 200 ticks (2000 ms)
@@ -68,17 +68,26 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 ├── kernel/                 # 内核 crate(唯一特权层,workspace 成员)
 │   ├── src/
 │   │   ├── main.rs         # 入口 + 启动顺序(依赖关系见注释)
-│   │   ├── entry.S         # _start:satp 清零/TLB 冲刷/清 BSS/设栈
+│   │   ├── board.rs        # 板级平台常量(单文件改板,FDT 化前的集中点)
+│   │   ├── entry.S         # _start:SIE 清零/gp 初始化/副核停车/清 BSS/设栈/早期 trap stub
 │   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)
 │   │   ├── panic.rs        # panic:位置/消息/CPU dump/栈水位/双 panic 保护
-│   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + 有界发送)
-│   │   └── arch/           # 架构隔离层(riscv64 / 未来 x86_64)
+│   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
+│   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
+│   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
+│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(2MB 超页 RAM + MMIO)
+│   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret 恢复)
+│   ├── build.rs            # 链接脚本绝对路径传递(CARGO_MANIFEST_DIR)
 │   ├── Cargo.toml
-│   └── linker.ld           # 链接脚本(栈独立于镜像,孤儿段报错)
-├── scripts/                # 工具(ai_audit.py 外部 AI 审计)
-├── docs/                   # DESIGN.md / audit-reports/
+│   └── linker.ld           # 链接脚本(栈独立于镜像,_alloc_start 红线)
+├── scripts/                # 工具(ai_audit.py 外部 AI 审计,密钥不入库)
+├── docs/
+│   ├── DESIGN.md           # 架构设计原则
+│   ├── DEFERRED.md         # 延迟项注册表(15 项,含触发条件)
+│   ├── reports/            # 详尽报告(每次修复/更新必写)
+│   └── audit-reports/      # 外部 AI 审计留档
 ├── .github/                # CI + Issue/PR 模板
-├── AGENTS.md               # AI 协作者与团队执行规范
+├── AGENTS.md               # AI 协作者与团队执行规范(红线 + 报告规范)
 ├── CONTRIBUTING.md         # 贡献指南
 └── SECURITY.md             # 漏洞报告政策
 ```
