@@ -60,6 +60,11 @@ struct Thread {
     ctx: Context,
     /// 抢占切换用全量陷阱帧(被抢占时复制至此)。
     frame: [usize; FRAME_WORDS],
+    /// CRITICAL-3:帧是否"可作抢占恢复用"。
+    /// true = 帧刚被抢占捕获(或新线程初始帧),可被 on_tick 选中;
+    /// false = 线程经 yield/block 让出(进度在 ctx),其帧已失效,
+    ///         若被抢占恢复会**从头重跑**线程。
+    frame_valid: bool,
     /// 线程入口(thread_entry 经 id 查表调用)。
     entry: fn(),
     /// 线程栈(Box:栈内存来自内核堆)。
@@ -96,8 +101,10 @@ fn thread_entry() {
     arch::irq_enable();
     let irq = arch::irq_save();
     let entry = {
-        let s = SCHED.lock();
+        let mut s = SCHED.lock();
         let id = s.current;
+        // 初始帧已被消费(本次进入),此后进度在 ctx(CRITICAL-3)。
+        s.threads[id].frame_valid = false;
         s.threads[id].entry
     };
     arch::irq_restore(irq);
@@ -107,11 +114,13 @@ fn thread_entry() {
 
 impl Scheduler {
     /// 查找下一个可运行线程(轮转),返回 id。
-    /// 调用方须持锁。
+    /// 选中者状态置为 Running(派发即运行;此前缺失导致唤醒线程
+    /// 以 Ready 状态进入 block_current 误判"已唤醒"而自旋)。
     fn pick_next(&mut self) -> usize {
         for level in 0..PRIO_LEVELS {
             while let Some(id) = self.ready[level].pop_front() {
                 if self.threads[id].state == ThreadState::Ready {
+                    self.threads[id].state = ThreadState::Running;
                     return id;
                 }
                 // 状态非 Ready(如已 Exit):丢弃。
@@ -127,10 +136,22 @@ impl Scheduler {
         self.threads[id].state = ThreadState::Ready;
     }
 
+    /// 从就绪队列撤销一个线程(block_current 的"已唤醒则继续"路径)。
+    fn remove_from_ready(&mut self, id: usize) {
+        for q in self.ready.iter_mut() {
+            if let Some(pos) = q.iter().position(|&x| x == id) {
+                q.remove(pos);
+                return;
+            }
+        }
+    }
+
     /// 协作让出:锁内更新状态与 pick,锁外切换(中断仍关闭,
     /// 单核无抢占介入,切换原子性由 irq_save 保证)。
     fn yield_self(&mut self) -> (usize, usize) {
         let cur = self.current;
+        // 进度移入 ctx,帧失效(CRITICAL-3)。
+        self.threads[cur].frame_valid = false;
         self.enqueue(cur);
         self.ticks_run = 0;
         let next = self.pick_next();
@@ -142,6 +163,7 @@ impl Scheduler {
     fn block_self(&mut self) -> (usize, usize) {
         let cur = self.current;
         self.threads[cur].state = ThreadState::Blocked;
+        self.threads[cur].frame_valid = false;
         self.ticks_run = 0;
         let next = self.pick_next();
         self.current = next;
@@ -149,28 +171,34 @@ impl Scheduler {
     }
 
     /// 抢占决策(定时器 ISR 内,中断关闭,不可阻塞):
-    /// 时间片到期且存在其他就绪线程 → 复制当前帧、返回下一线程帧。
-    /// 否则返回原帧(继续当前线程)。
+    /// 时间片到期且存在**帧有效**的其他就绪线程 → 复制当前帧、
+    /// 返回下一线程帧。否则返回原帧(继续当前线程)。
+    ///
+    /// CRITICAL-3:只允许选中 frame_valid 的线程 —— 否则会用过期帧
+    /// (sepc=thread_entry)恢复一个已 yield 的线程,使其从头重跑。
     fn on_tick(&mut self, frame: *mut usize) -> *mut usize {
         self.ticks_run += 1;
         if self.ticks_run < SLICE_TICKS {
             return frame;
         }
         self.ticks_run = 0;
-        // 是否存在可抢占的就绪线程(非自身)。
+        // 是否存在可抢占的就绪线程(非自身、帧有效)。
         let has_other = (0..PRIO_LEVELS).any(|l| {
-            self.ready[l]
-                .iter()
-                .any(|&id| id != self.current && self.threads[id].state == ThreadState::Ready)
+            self.ready[l].iter().any(|&id| {
+                id != self.current
+                    && self.threads[id].state == ThreadState::Ready
+                    && self.threads[id].frame_valid
+            })
         });
         if !has_other {
             return frame;
         }
         let cur = self.current;
-        // 把被中断线程的全量帧复制进其 TCB。
+        // 把被中断线程的全量帧复制进其 TCB(帧此刻有效)。
         self.threads[cur]
             .frame
             .copy_from_slice(unsafe { core::slice::from_raw_parts(frame, FRAME_WORDS) });
+        self.threads[cur].frame_valid = true;
         self.threads[cur].state = ThreadState::Ready;
         // 加入就绪(排到队尾,轮转)。
         self.enqueue(cur);
@@ -184,6 +212,7 @@ impl Scheduler {
     fn exit_self(&mut self) -> (usize, usize) {
         let cur = self.current;
         self.threads[cur].state = ThreadState::Exited;
+        self.threads[cur].frame_valid = false;
         self.ticks_run = 0;
         let next = self.pick_next();
         self.current = next;
@@ -195,7 +224,8 @@ impl Scheduler {
         let id = self.next_id;
         self.next_id += 1;
         let stack = alloc::vec![0u8; THREAD_STACK_SIZE].into_boxed_slice();
-        let sp = stack.as_ptr() as usize + THREAD_STACK_SIZE;
+        // HIGH-4:sp 须 16 字节对齐(RISC-V ABI);堆指针仅保证 8 对齐。
+        let sp = ((stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF) as usize;
         // 初始帧:sepc = 线程包装器,sstatus:SPIE=1(进线程后开中断)。
         let mut frame = [0usize; FRAME_WORDS];
         frame[FRAME_SEPC] = thread_entry as *const () as usize;
@@ -210,6 +240,8 @@ impl Scheduler {
                 s: [0; 12],
             },
             frame,
+            // 新线程初始帧有效(sepc=thread_entry),可被抢占首启。
+            frame_valid: true,
             entry,
             stack,
         };
@@ -239,7 +271,7 @@ pub fn init() {
     // idle 线程:id=0,最低优先级,永不阻塞。
     let idle_id = 0;
     let stack = alloc::vec![0u8; THREAD_STACK_SIZE].into_boxed_slice();
-    let sp = stack.as_ptr() as usize + THREAD_STACK_SIZE;
+    let sp = ((stack.as_ptr() as usize + THREAD_STACK_SIZE) & !0xF) as usize;
     let mut frame = [0usize; FRAME_WORDS];
     frame[FRAME_SEPC] = idle_entry as *const () as usize;
     frame[FRAME_SSTATUS] = 1 << 5;
@@ -252,6 +284,9 @@ pub fn init() {
             s: [0; 12],
         },
         frame,
+        // idle 以主流程直接运行(非经切换),初始帧从未被使用 →
+        // 无效;其帧在真正被抢占时才会捕获。
+        frame_valid: false,
         entry: idle_entry,
         stack,
     });
@@ -292,11 +327,24 @@ pub fn yield_() {
 }
 
 /// 阻塞当前线程(须由调度器外的同步原语唤醒)。
+///
+/// 丢失唤醒防护(HIGH-2):若唤醒已在阻塞前发生(线程已被置 Ready
+/// 并入队),则撤销入队并**继续运行**,不再阻塞 —— 否则唤醒被
+/// 吞掉,线程永久挂起。
 pub fn block_current() {
     let irq = arch::irq_save();
     let (cur, next) = {
         let mut s = SCHED.lock();
-        s.block_self()
+        let cur = s.current;
+        if s.threads[cur].state == ThreadState::Ready {
+            // 已被唤醒(队列中):撤销本次入队,继续运行。
+            s.remove_from_ready(cur);
+            s.threads[cur].state = ThreadState::Running;
+            arch::irq_restore(irq);
+            return;
+        }
+        let (c, n) = s.block_self();
+        (c, n)
     };
     let (old, new) = {
         let mut s = SCHED.lock();
@@ -305,6 +353,12 @@ pub fn block_current() {
         (old, new)
     };
     unsafe { arch::context_switch(old, new) };
+    // 醒来:撤销 wake 的入队(否则"运行中仍在就绪队列",
+    // 会被再次选中 → 同一线程双调度/重入)。
+    let mut s = SCHED.lock();
+    let cur = s.current;
+    s.remove_from_ready(cur);
+    drop(s);
     arch::irq_restore(irq);
 }
 
@@ -380,16 +434,17 @@ pub fn self_test() -> Result<(), &'static str> {
     if !TEST_DONE.load(Ordering::Relaxed) {
         return Err("thread exit not observed");
     }
-    // 3) 抢占:忙循环线程不 yield,若定时器抢占失效则主线程永远
-    //    得不到 CPU(超时即证明失效)。
-    TEST_BUSY.store(0, Ordering::Relaxed);
+    // 3) 抢占:忙循环线程不 yield,持续到 tick 前进 >= 15
+    //    (150ms > 100ms 时间片 → 必被抢占至少一次,主线程才可能
+    //    继续;HIGH-3:旧测试目标在首片内完成,未真正验证抢占)。
+    TEST_BUSY_DONE.store(false, Ordering::Relaxed);
     spawn(test_busy, PRIO_LOW);
     guard = 0;
-    while TEST_BUSY.load(Ordering::Relaxed) < BUSY_TARGET && guard < 200_000 {
+    while !TEST_BUSY_DONE.load(Ordering::Relaxed) && guard < 200_000 {
         yield_();
         guard += 1;
     }
-    if TEST_BUSY.load(Ordering::Relaxed) < BUSY_TARGET {
+    if !TEST_BUSY_DONE.load(Ordering::Relaxed) {
         return Err("preemption failed: busy thread starved main");
     }
     Ok(())
@@ -410,15 +465,17 @@ fn test_done() {
     TEST_DONE.store(true, Ordering::Relaxed);
 }
 
-/// 忙循环线程:不 yield,靠定时器抢占让出 CPU。
-/// 目标值跨多个时间片(10 tick/片),保证主线程至少被抢占回一次。
-const BUSY_TARGET: usize = 1_000_000;
+/// 忙循环线程:不 yield,跑满 150ms(tick 前进 15)后置完成位。
+/// 时间片 100ms → 必然经历至少一次抢占。
 fn test_busy() {
-    while TEST_BUSY.load(Ordering::Relaxed) < BUSY_TARGET {
+    let start = crate::logger::tick();
+    while crate::logger::tick().wrapping_sub(start) < 15 {
         TEST_BUSY.fetch_add(1, Ordering::Relaxed);
     }
+    TEST_BUSY_DONE.store(true, Ordering::Relaxed);
 }
 
 static TEST_CTR: AtomicUsize = AtomicUsize::new(0);
 static TEST_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_BUSY: AtomicUsize = AtomicUsize::new(0);
+static TEST_BUSY_DONE: AtomicBool = AtomicBool::new(false);

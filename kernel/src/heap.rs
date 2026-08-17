@@ -128,7 +128,11 @@ impl KernelHeap {
             let nhdr = unsafe { &mut *nh };
             nhdr.next = head;
             self.classes[idx].head = nh;
-            return nhdr.free_list as *mut u8;
+            // CRITICAL-1:必须**弹出**新页的首个槽 —— 直接返回会让
+            // 新页 free_list 仍指向它,同一槽被分配两次。
+            let slot = nhdr.free_list;
+            nhdr.free_list = unsafe { *(slot as *const usize) };
+            return slot as *mut u8;
         }
         header.free_list = unsafe { *(slot as *const usize) };
         slot as *mut u8
@@ -168,23 +172,27 @@ impl KernelHeap {
     unsafe fn page_alloc(&mut self, layout: Layout) -> *mut u8 {
         let size = layout.size();
         let align = layout.align();
-        // 高对齐需在块内留出对齐余量(否则对齐后越界)。
-        let needed = if align <= mem::PAGE_SIZE {
-            size + 8
-        } else {
-            size + 8 + align
-        };
+        // CRITICAL-4:对 **所有** align > 8 的情况统一过量分配
+        // (align-1 对齐余量),返回指针对齐到 align;此前仅
+        // align > 页 才过量,8 < align <= 页 时 block+8 未对齐。
+        let needed = size + 8 + align - 1;
         let pages = needed.div_ceil(mem::PAGE_SIZE);
         let order = pages.next_power_of_two().trailing_zeros() as usize;
-        let block = mem::alloc_pages(order.min(mem::MAX_ORDER)).expect("kernel heap: page OOM");
-        if align <= mem::PAGE_SIZE {
-            unsafe { *(block as *mut usize) = block };
-            (block + 8) as *mut u8
-        } else {
-            let aligned = (block + 8).div_ceil(align) * align;
-            unsafe { *((aligned - 8) as *mut usize) = block };
-            aligned as *mut u8
+        // MEDIUM-3:所需超过最大块(16MB)时明确失败,而非静默截断。
+        if order > mem::MAX_ORDER {
+            panic!("kernel heap: allocation too large ({size} bytes)");
         }
+        let block = match mem::alloc_pages(order) {
+            Some(b) => b,
+            None => panic!(
+                "kernel heap: page OOM (order={order}, size={size}, free_pages={})",
+                mem::page_count()
+            ),
+        };
+        // 统一:块内对齐,基址记录在对齐指针前 8 字节。
+        let aligned = (block + 8).div_ceil(align) * align;
+        unsafe { *((aligned - 8) as *mut usize) = block };
+        aligned as *mut u8
     }
 
     /// 释放入口。
@@ -196,6 +204,14 @@ impl KernelHeap {
             return;
         }
         let page = (ptr as usize) & !(mem::PAGE_SIZE - 1);
+        // MEDIUM-2:指针越界防御 —— 判别表下标不得越界/下溢。
+        let base = mem::base();
+        if page < base || page - base >= mem::MAX_PAGES * mem::PAGE_SIZE {
+            panic!(
+                "kernel heap: invalid pointer {:#x} (outside allocatable region)",
+                ptr as usize
+            );
+        }
         let class = slab_class_of(page);
         if class != NOT_SLAB {
             // slab 槽:压回页头空闲链表。

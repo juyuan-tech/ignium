@@ -33,9 +33,11 @@ use core::arch::global_asm;
 global_asm!(include_str!("entry.S"));
 
 /// 多核引导仲裁标志:entry.S 用 amoswap 竞争"引导权"
-/// (boot hart 不一定是 hart 0)。必须放在 .data(镜像加载即就绪,
-/// 不依赖 BSS 清零)。
+/// (boot hart 不一定是 hart 0)。**必须放在 .data**:
+/// 初始值 0 会被编译器放进 .bss,而它必须在 BSS 清零**之前**
+/// 可用(CRITICAL-2);link_section 强制入 .data(镜像加载即就绪)。
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".data")]
 pub static mut BOOT_LOCK: u32 = 0;
 
 /// 内核主入口,由 `_start`(src/entry.S)以 C ABI 调用,永不返回。

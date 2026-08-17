@@ -326,21 +326,27 @@ extern "C" {
 /// 读取 FDT 实际大小(HIGH-2:固定 1MB 预留可能不足/过量)。
 /// 校验头部:magic=0xD00DFEED、totalsize(偏移 4)在合理范围。
 /// 无效指针/非法头 → None(调用方回退保守预留)。
+///
+/// MEDIUM-1:FDT 是**大端**布局 —— 逐字节读取后手工组装,不依赖
+/// 原生字节序(此前 read_volatile::<u32> 在小端机器上 magic 校验
+/// 恒失败,实际大小解析从未生效)。
 fn fdt_size(fdt: usize) -> Option<usize> {
     if fdt == 0 || !fdt.is_multiple_of(4) {
         return None;
     }
-    unsafe {
-        let magic = core::ptr::read_volatile(fdt as *const u32);
-        if magic != 0xD00D_FEED {
-            return None;
-        }
-        let total = core::ptr::read_volatile((fdt + 4) as *const u32) as usize;
-        if !(8..=16 * 1024 * 1024).contains(&total) {
-            return None;
-        }
-        Some(total)
+    unsafe fn be32(addr: usize) -> u32 {
+        let b = |o: usize| unsafe { core::ptr::read_volatile((addr + o) as *const u8) };
+        (b(0) as u32) << 24 | (b(1) as u32) << 16 | (b(2) as u32) << 8 | b(3) as u32
     }
+    let magic = unsafe { be32(fdt) };
+    if magic != 0xD00D_FEED {
+        return None;
+    }
+    let total = unsafe { be32(fdt + 4) } as usize;
+    if !(8..=16 * 1024 * 1024).contains(&total) {
+        return None;
+    }
+    Some(total)
 }
 
 /// 初始化物理内存管理。启动早期调用(先于 irq_enable)。

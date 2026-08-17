@@ -190,7 +190,9 @@ impl Condvar {
         // 原子地:登记 → 释放互斥(不唤醒其等待者)→ 准备阻塞。
         self.waiters.lock().push_back(sched::current_id());
         m.locked.store(false, Ordering::Release);
-        drop(guard);
+        // HIGH-1:必须**消费**守卫 —— 直接 drop 会再次 unlock,
+        // 唤醒互斥等待者并破坏其队列(双重解锁)。
+        core::mem::forget(guard);
         arch::irq_restore(irq);
         sched::block_current();
         // 醒来:重新获取互斥锁。
