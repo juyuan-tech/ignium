@@ -24,8 +24,9 @@ make test      # QEMU 启动冒烟
 
 1. **兼容代码永不进内核**:OpenHarmony/POSIX 兼容全部在用户态
    (docs/DESIGN.md);内核只认 IPC 原语。
-2. **初始化顺序** kernel_main:irq_disable → uart::init → init_traps
-   → set_level。trap 窗口(无 stvec 时异常跳地址 0)不可恢复。
+2. **初始化顺序** kernel_main:irq_disable → sanitize_csr → uart::init
+   → init_traps → enable_timer → set_level → mem::init(fdt)/mmu::init
+   →(自检)→ irq_enable。trap 窗口(无 stvec 时异常跳地址 0)不可恢复。
 3. **汇编与 Rust 的 ABI 约定**:TRAP_FRAME 布局(riscv64.S 与 riscv64.rs
    必须同步)、CpuState 字段顺序(repr(C))。改一侧必须改另一侧。
 4. **链接脚本符号契约**:_kernel_start/_end、_stack_bottom/_top 等

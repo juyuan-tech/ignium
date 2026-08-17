@@ -174,8 +174,8 @@ pub fn get_time() -> usize {
     t
 }
 
-/// 定时器节拍间隔(10ms):mtimer 10 MHz 下 = 100,000 周期。
-pub const TIMER_INTERVAL: usize = 100_000;
+/// 定时器节拍间隔(10ms):由板级常量给出(QEMU virt = 10 MHz)。
+pub const TIMER_INTERVAL: usize = crate::board::TIMER_INTERVAL;
 
 /// 下一次定时器中断的截止时间(mtimer 周期)。
 ///
@@ -309,7 +309,13 @@ pub unsafe extern "C" fn trap_handler(
                 crate::logger::tick_up();
                 let next =
                     TIMER_DEADLINE.fetch_add(TIMER_INTERVAL, Ordering::Relaxed) + TIMER_INTERVAL;
-                crate::sbi::set_timer(next);
+                // M1(审计 11 轮):SBI 失败 = 节拍源丢失(调度/看门狗
+                // 都会挂死),ISR 内不可日志 —— 直接 panic 给出明确
+                // 诊断,而不是静默停摆。
+                assert!(
+                    crate::sbi::set_timer(next) == 0,
+                    "sbi_set_timer failed in timer ISR"
+                );
                 // 恢复被中断的上下文继续执行。
                 frame
             }

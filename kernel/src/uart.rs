@@ -33,7 +33,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-const UART_BASE: usize = 0x1000_0000;
+const UART_BASE: usize = crate::board::UART_BASE;
 #[allow(clippy::identity_op)] // 显式写出偏移 0x00,与寄存器手册对应
 const UART_DLL: usize = UART_BASE + 0x00;
 const UART_DLM: usize = UART_BASE + 0x01;

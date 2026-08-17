@@ -22,15 +22,17 @@ const PTE_V: u64 = 1 << 0; // 有效
 const PTE_R: u64 = 1 << 1; // 可读
 const PTE_W: u64 = 1 << 2; // 可写
 const PTE_X: u64 = 1 << 3; // 可执行
+const PTE_A: u64 = 1 << 6; // 已访问
+const PTE_D: u64 = 1 << 7; // 已脏
 const PTE_PPN_SHIFT: u64 = 10;
 /// PPN 44 位掩码。
 const PTE_PPN_MASK: u64 = (1u64 << 44) - 1;
 
-/// RAM 区域(与 mem.rs 保持一致,身份映射)。
-const RAM_START: usize = mem::RAM_START;
-const RAM_END: usize = mem::RAM_END;
-/// UART MMIO 区域(身份映射;地址与 uart.rs 一致,4KB 页映射)。
-const UART_MMIO: usize = 0x1000_0000;
+/// RAM 区域(与 board.rs 保持一致,身份映射)。
+const RAM_START: usize = crate::board::RAM_START;
+const RAM_END: usize = crate::board::RAM_END;
+/// UART MMIO 区域(身份映射;基址与 board.rs/uart.rs 一致,4KB 页)。
+const UART_MMIO: usize = crate::board::UART_BASE;
 /// 2MB 超页。
 const SUPER_PAGE: usize = 2 * 1024 * 1024;
 
@@ -135,6 +137,15 @@ fn enable(root_paddr: usize) {
     }
 }
 
+/// 叶子 PTE 标志:RWX + A/D(H2)。
+///
+/// A/D 位必须在建页时置位:硬件管理 A/D 的实现(QEMU)会自动更新,
+/// 置位无害;软件管理 A/D 的核(部分真机)在 A/D 为 0 时首次访问
+/// 会触发页故障,而我们的异常路径是停机 —— 建页即置位兼容两种
+/// 模型,消除真机 boot 期故障。
+const PTE_LEAF_RWX: u64 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D;
+const PTE_LEAF_RW: u64 = PTE_V | PTE_R | PTE_W | PTE_A | PTE_D;
+
 /// 初始化内核自身映射并启用分页。
 ///
 /// 调用顺序:必须在 `mem::init` 之后(页表页来自 buddy)、
@@ -144,17 +155,16 @@ pub fn init() {
     let root = mem::alloc_pages(0).expect("root page table allocation failed");
     mem::zero_page(root);
 
-    // RAM 身份映射:2MB 超页,RWX(supervisor-only,U=0)。
+    // RAM 身份映射:2MB 超页,RWX + A/D(supervisor-only,U=0)。
     // M1.5 细化:内核镜像按 代码 RX / 数据 RW 拆分权限。
     let mut vaddr = RAM_START;
     while vaddr < RAM_END {
-        map_super(root, vaddr, vaddr, PTE_V | PTE_R | PTE_W | PTE_X)
-            .expect("RAM superpage mapping failed");
+        map_super(root, vaddr, vaddr, PTE_LEAF_RWX).expect("RAM superpage mapping failed");
         vaddr += SUPER_PAGE;
     }
 
-    // UART MMIO 身份映射:4KB,RW(无 X;MMIO 不应执行代码)。
-    map_4k(root, UART_MMIO, UART_MMIO, PTE_V | PTE_R | PTE_W).expect("UART MMIO mapping failed");
+    // UART MMIO 身份映射:4KB,RW + A/D(无 X;MMIO 不应执行代码)。
+    map_4k(root, UART_MMIO, UART_MMIO, PTE_LEAF_RW).expect("UART MMIO mapping failed");
 
     enable(root);
     debug!("satp switched to Sv39, root={:#x}", root);

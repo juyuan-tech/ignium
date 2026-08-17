@@ -11,10 +11,7 @@
 target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
-# 链接脚本 kernel/linker.ld 显式收纳全部段 + /DISCARD/ 工具链噪音段。
-# 注:不启用 --orphan-handling=warn/error —— lld 自建合成段
-# (.symtab 等)会产生不可消除的告警并破坏 clippy 门禁;
-# 新段靠代码 review 显式入脚本(见 AGENTS.md 红线 4)。
-rustflags = [
-  "-C", "link-arg=-Tkernel/linker.ld",
-]
+# 链接脚本由 kernel/build.rs 以 CARGO_MANIFEST_DIR 绝对路径传入
+# (L1:相对路径依赖工作目录,子目录/IDE 构建会失败)。
+# 链接脚本显式收纳全部段 + /DISCARD/ 工具链噪音段;新段靠代码
+# review 显式入脚本(见 AGENTS.md 红线 4)。

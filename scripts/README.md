@@ -24,5 +24,6 @@ IGNIUM_AUDIT_URL=https://api.deepseek.com/chat/completions  # 换供应商
 - 依赖:仅 Python 3 标准库(无第三方依赖);在 WSL2 中运行
 - 审计报告按时间戳 + 模型名存档,建议对每条发现给出处置记录
   (修复/驳回+理由),再提交到仓库
-- pro 模型默认开启 thinking 模式,输出 token 较大(约 50-60K),
-  成本约为 flash 模型的 3 倍,单次审计成本约 $0.05 量级
+- pro 模型默认开启 thinking 模式且输出不设上限(API 最大值 384K
+  token),单次审计输出 token 3-12 万,成本约 $0.1-0.5 量级
+  (off-peak 半价)

@@ -65,6 +65,12 @@ SECTIONS
 
     /* ============ 镜像之外的独立区 ============ */
 
+    /* 调试段(.debug 与 .riscv.attributes):SHF_NONALLOC,不显式放置
+     * —— 显式放置会推进位置计数器,把 .stack 推离 PC 相对范围
+     * (dev 构建调试段巨大,实测 -524796 越界);lld 对非分配孤儿段
+     * 自动置于末尾,不参与地址布局、不进加载段,对 _alloc_start
+     * 无影响。 */
+
     /* 引导栈:NOLOAD(不占镜像文件),位于 _kernel_end 之后。
      * entry.S 的清零循环以 _stack_top 为界,栈区因此也被清零,
      * 这是 panic 栈水位检测成立的前提。
@@ -89,18 +95,14 @@ SECTIONS
     }
 
     /* M1 物理分配器的起点:栈区/陷阱栈区属于保留区,
-     * 分配器必须从 _alloc_start 之后取页(pro 审计 #4)。 */
+     * 分配器必须从 _alloc_start 之后取页(pro 审计 #4)。
+     * 红线:从此处到文件末尾**不得**再出现任何 SHF_ALLOC 段
+     * (任何未来新段都必须在 _alloc_start 之前定义,或 /DISCARD/)。
+     * 非分配孤儿段(调试/属性)由 lld 置于末尾,天然不触碰本区。 */
     . = ALIGN(4K);
     _alloc_start = .;
 
-    /* 孤儿段策略:显式丢弃工具链噪音段;调试/属性段显式收纳
-     * (否则 --orphan-handling=error 会打断 debug 构建) */
-    .debug : {
-        *(.debug*)
-    }
-    .riscv.attributes : {
-        *(.riscv.attributes)
-    }
+    /* 孤儿段策略:显式丢弃工具链噪音段 */
     /DISCARD/ : {
         *(.eh_frame)
         *(.comment)

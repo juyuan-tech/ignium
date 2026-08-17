@@ -29,7 +29,9 @@
 
 ## arch 层接口(通用代码的唯一依赖)
 
-- `arch_mmu_map / arch_mmu_unmap / arch_tlb_flush`
+- `arch_mmu_map / arch_mmu_unmap / arch_tlb_flush`(M1 现状:Sv39
+  实现位于顶层 `mmu.rs` 模块,接口形态见其模块头注释;x86_64 移植
+  时下沉为 `arch::mmu` 并按本契约收敛,通用代码零改动)
 - `arch_thread_switch`
 - `arch_timer_init / arch_timer_set_next`
 - `arch_irq_enable / arch_irq_disable`

@@ -8,14 +8,14 @@
 - **L2 libc 级**:移植 musl,OpenHarmony 组件 C 代码可直接编译运行 —— 阶段 3 完成
 - **L3 组件级**:跑通 lwIP 与 OpenHarmony 轻量系统样例应用 —— v0.2 里程碑
 
-## 阶段 0:环境与仓库(第 1~2 周)✓ 进行中
+## 阶段 0:环境与仓库(第 1~2 周)✓ 完成
 
 | 任务 | 产出/验收 |
 |---|---|
-| WSL2:rustup + riscv64gc-unknown-none-elf + qemu-system-riscv64 + gdb-multiarch + llvm-tools | 工具链可用 |
-| 仓库 + Apache-2.0 LICENSE + README + CI(编译 + QEMU 启动冒烟) | CI 绿 |
-| 调研 LiteOS-A 的 POSIX 子集/系统调用清单,确定 L1 兼容基线 | 文档 docs/compat-baseline.md |
-| 最小内核:启动 + 串口输出 | M0 ✓ |
+| WSL2:rustup + riscv64gc-unknown-none-elf + qemu-system-riscv64 + gdb-multiarch + llvm-tools | ✅ 工具链可用 |
+| 仓库 + Apache-2.0 LICENSE + README + CI(编译 + QEMU 启动冒烟) | ✅ CI 绿 |
+| 调研 LiteOS-A 的 POSIX 子集/系统调用清单,确定 L1 兼容基线 | ✅ docs/compat-baseline 见 DESIGN |
+| 最小内核:启动 + 串口输出 | ✅ M0 ✓ |
 
 ## 阶段 1:内核核心原语(第 3~8 周)
 

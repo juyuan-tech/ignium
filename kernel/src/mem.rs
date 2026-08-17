@@ -24,13 +24,9 @@ pub const MAX_ORDER: usize = 12;
 /// 空闲链表空指针标记。
 const FREE_NONE: usize = usize::MAX;
 
-/// QEMU virt 默认 128MB RAM(与 `-m 128M` 一致;真机/FDT 定尺寸为
-/// M1.5 工作,届时替换 RAM_END 来源)。mmu.rs 的身份映射复用此区间。
-pub const RAM_START: usize = 0x8000_0000;
-pub const RAM_END: usize = RAM_START + 128 * 1024 * 1024;
-
+/// 平台常量(RAM 范围等)集中在 board.rs,单文件改板。
 /// 元数据数组覆盖最大可能的页数(RAM_START 起算)。
-const MAX_PAGES: usize = (RAM_END - RAM_START) / PAGE_SIZE;
+const MAX_PAGES: usize = (crate::board::RAM_END - crate::board::RAM_START) / PAGE_SIZE;
 
 /// 每页元数据:`order` = 所属块阶,`used` = 已分配。
 #[derive(Clone, Copy)]
@@ -324,9 +320,6 @@ extern "C" {
     static _alloc_start: u8;
 }
 
-/// FDT 预留大小:解析 FDT 前的保守保留(1MB;M1.5 解析后按实际大小)。
-const FDT_RESERVE_SIZE: usize = 1024 * 1024;
-
 /// 初始化物理内存管理。启动早期调用(先于 irq_enable)。
 ///
 /// `fdt` 指向引导器传入的设备树,其所在区间在建链时被刻蚀为
@@ -339,14 +332,14 @@ pub fn init(fdt: usize) {
     let raw = (&raw const _alloc_start).addr();
     let max_block = (1usize << MAX_ORDER) * PAGE_SIZE;
     let base = raw.div_ceil(max_block) * max_block;
-    if base >= RAM_END {
+    if base >= crate::board::RAM_END {
         panic!("no physical memory available for allocator");
     }
-    let count = (RAM_END - base) / PAGE_SIZE;
+    let count = (crate::board::RAM_END - base) / PAGE_SIZE;
     // 保留区 = FDT 页区间(H1:起点**向下**取整 —— 指针未页对齐时
     // 也必须保护其所在页;终点向上取整;饱和算术防溢出)。
     let fdt_start = fdt / PAGE_SIZE * PAGE_SIZE;
-    let fdt_end = fdt.saturating_add(FDT_RESERVE_SIZE);
+    let fdt_end = fdt.saturating_add(crate::board::FDT_RESERVE_SIZE);
     let rs = fdt_start.saturating_sub(base) / PAGE_SIZE;
     let re = fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE);
     with_allocator(|a| unsafe { a.init(base, count, (rs, re)) });
@@ -408,24 +401,23 @@ pub fn self_test() -> Result<(), &'static str> {
     // 2) 全生命周期守恒:按阶**递减**排空(原生弹出不拆分)→
     //    耗尽后分配必须失败 → 全部释放 → order-12 必须可再次分配。
     //    最后一步只有当低阶块全部合并回 12 阶时才成立 ——
-    //    这是对 buddy 合并语义的直接验证,且不依赖块相邻性
-    //    (FDT 刻蚀会在低阶留下碎片,相邻性假设已不可靠)。
-    let mut held = [0usize; 256];
-    let mut held_n = 0;
+    //    这是对 buddy 合并语义的直接验证,且不依赖块相邻性。
+    //    地址用**链表挂在块首字上**(与空闲链表同构):无堆环境
+    //    下的无界存储(M2:固定数组在不同内存几何下会溢出误报)。
+    let mut head: usize = FREE_NONE;
     for order in (0..=MAX_ORDER).rev() {
         while let Some(addr) = alloc_pages(order) {
-            if held_n == held.len() {
-                return Err("held overflow");
-            }
-            held[held_n] = addr;
-            held_n += 1;
+            unsafe { core::ptr::write(addr as *mut usize, head) };
+            head = addr;
         }
     }
     if alloc_pages(0).is_some() {
         return Err("allocator not exhausted");
     }
-    for &addr in held[..held_n].iter() {
-        free_pages(addr).map_err(|_| "free held failed")?;
+    while head != FREE_NONE {
+        let next = unsafe { core::ptr::read(head as *const usize) };
+        free_pages(head).map_err(|_| "free held failed")?;
+        head = next;
     }
     let big = alloc_pages(MAX_ORDER).ok_or("post-free alloc(12) failed")?;
     free_pages(big).map_err(|_| "free big failed")?;
