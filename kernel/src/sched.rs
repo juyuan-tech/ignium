@@ -376,6 +376,15 @@ pub fn exit() -> ! {
     let (old, new) = {
         let mut s = SCHED.lock();
         let cur = s.current;
+        // 安全优化:释放退出线程的 16KB 栈(否则 TCB 随 Box 留在
+        // Vec,线程 churn 会耗尽内存 —— 资源耗尽风险)。
+        //
+        // "释放自身栈"窗口分析(安全):drop 后当前 SP 仍指向已释放
+        // 内存,但 —— 中断已关(irq_save)+ 单核,drop 与 context_switch
+        // 之间仅有寄存器操作(无分配、无写入);buddy 归还把 next 指针
+        // 写在块首字(栈底页),与当前 SP 所在栈顶区域不相交;切走后
+        // 该内存才可能被复用(彼时已不在其上)。
+        s.threads[cur].stack = alloc::vec![].into_boxed_slice();
         s.threads[cur].state = ThreadState::Exited;
         s.threads[cur].frame_valid = false;
         s.ticks_run = 0;
