@@ -41,6 +41,7 @@ make test      # QEMU 启动冒烟
 
 - `kernel/` — 内核 crate(唯一特权层);arch 隔离层在 kernel/src/arch/;
   关键模块:board.rs(板级常量)、mem.rs(buddy)、mmu.rs(Sv39 页表)、
+  heap.rs(内核堆)、sched.rs(线程调度)、sync.rs(同步原语)、
   sbi.rs(SBI 调用)、logger/panic/uart
 - `scripts/ai_audit.py` — 外部 AI 审计(密钥走环境变量,见 scripts/README.md)
 - `docs/` — DESIGN.md(架构铁律)、DEFERRED.md(延迟项注册表)、

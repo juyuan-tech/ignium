@@ -37,7 +37,9 @@ make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 [000000] [INFO ] M0: boot ok - arch: riscv64, machine: qemu-virt, hartid=0, fdt=0x87e00000
 [000000] [INFO ] M1: buddy allocator selftest ok (114688 KiB managed)
 [000000] [INFO ] M1: Sv39 paging ok (identity map, satp root=0x8000000000081000)
-[000000] [INFO ] M1: timer enabled (10000us interval), interrupts on
+[000000] [INFO ] M1: kernel heap selftest ok (slab 16B..2KB + page path)
+[000001] [INFO ] M1: scheduler selftest ok (cooperative + preemptive)
+[000001] [INFO ] M1: sync primitives selftest ok (mutex + condvar)
 [000100] [INFO ] uptime: 100 ticks (1000 ms)
 [000200] [INFO ] uptime: 200 ticks (2000 ms)
 ...
@@ -76,14 +78,18 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
 │   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(2MB 超页 RAM + MMIO)
-│   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret 恢复)
+│   │   ├── heap.rs         # 内核堆(slab 16B..2KB + buddy 页路径,#[global_allocator])
+│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出)
+│   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
+│   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret/context_switch)
 │   ├── build.rs            # 链接脚本绝对路径传递(CARGO_MANIFEST_DIR)
 │   ├── Cargo.toml
 │   └── linker.ld           # 链接脚本(栈独立于镜像,_alloc_start 红线)
 ├── scripts/                # 工具(ai_audit.py 外部 AI 审计,密钥不入库)
 ├── docs/
 │   ├── DESIGN.md           # 架构设计原则
-│   ├── DEFERRED.md         # 延迟项注册表(15 项,含触发条件)
+│   ├── DEFERRED.md         # 延迟项注册表(含触发条件与状态)
+│   ├── RVA23.md            # RVA23 兼容性差距与分阶段支持计划
 │   ├── reports/            # 详尽报告(每次修复/更新必写)
 │   └── audit-reports/      # 外部 AI 审计留档
 ├── .github/                # CI + Issue/PR 模板
