@@ -106,7 +106,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 
 ## 路线
 
-见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 全部完成**(陷阱/定时器/物理内存/分页/内核堆/调度器/同步原语),下一步 M2(用户进程 + IPC)。
+见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 全部完成**(陷阱/定时器/物理内存/分页/内核堆/调度器/同步原语),下一步 **M1.5(稳定化与真机准备)**。
 
 ## 里程碑
 
