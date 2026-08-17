@@ -70,9 +70,11 @@ pub struct BuddyAllocator {
     free_lists: [usize; MAX_ORDER + 1],
 }
 
-/// 访问分配器单例(static mut 经裸指针解引用,规避 static_mut_refs lint)。
-fn allocator() -> &'static mut BuddyAllocator {
-    unsafe { (&raw mut ALLOCATOR).as_mut().unwrap() }
+/// 分配器单例访问:把操作封装进闭包,保证**每次操作恰好一个 `&mut`**
+/// (消除上一轮审计 L3 的多别名隐患),并为未来引入锁(调度器里程碑)
+/// 预留了唯一的加锁点。
+fn with_allocator<T>(f: impl FnOnce(&mut BuddyAllocator) -> T) -> T {
+    f(unsafe { (&raw mut ALLOCATOR).as_mut().unwrap() })
 }
 
 impl BuddyAllocator {
@@ -347,12 +349,12 @@ pub fn init(fdt: usize) {
     let fdt_end = fdt.saturating_add(FDT_RESERVE_SIZE);
     let rs = fdt_start.saturating_sub(base) / PAGE_SIZE;
     let re = fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE);
-    unsafe { allocator().init(base, count, (rs, re)) };
+    with_allocator(|a| unsafe { a.init(base, count, (rs, re)) });
 }
 
 /// 可分配页数。
 pub fn page_count() -> usize {
-    allocator().page_count
+    with_allocator(|a| a.page_count)
 }
 
 /// 分配 2^order 页,返回物理地址。
@@ -365,7 +367,7 @@ pub fn page_count() -> usize {
 /// 返回的页**未清零**(空闲时首字存有链表指针)。M2 向用户态交接
 /// 页面之前必须整页清零,否则泄漏内核链表布局信息。
 pub fn alloc_pages(order: usize) -> Option<usize> {
-    allocator().alloc(order)
+    with_allocator(|a| a.alloc(order))
 }
 
 /// 释放物理地址处的块。
@@ -374,15 +376,18 @@ pub fn alloc_pages(order: usize) -> Option<usize> {
 /// `addr` 必须是 `alloc_pages` 原样返回的地址;其他输入(内页、
 /// 未分配页、预留区、越界页)返回 Err。
 pub fn free_pages(addr: usize) -> Result<(), ()> {
-    allocator().free(addr)
+    with_allocator(|a| a.free(addr))
 }
 
 /// 整页清零(页表页等需要确定初始内容的内存)。
+///
+/// 用非 volatile 裸指针写:页表初始化期间无并发读者,且编译器
+/// 无法消除对裸指针的写入(不可见副作用),无需 volatile 屏障。
 pub fn zero_page(addr: usize) {
     debug_assert!(addr.is_multiple_of(PAGE_SIZE));
     let p = addr as *mut u64;
     for i in 0..PAGE_SIZE / core::mem::size_of::<u64>() {
-        unsafe { core::ptr::write_volatile(p.add(i), 0) };
+        unsafe { core::ptr::write(p.add(i), 0) };
     }
 }
 
