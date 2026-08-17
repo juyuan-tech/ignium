@@ -33,6 +33,7 @@ TIMEOUT = 900
 GLOBS = [
     "kernel/src/**/*.rs",
     "kernel/src/**/*.S",
+    "kernel/build.rs",
     "kernel/Cargo.toml",
     "kernel/linker.ld",
     "Cargo.toml",
@@ -42,6 +43,7 @@ GLOBS = [
     ".github/workflows/*.yml",
     "README.md",
     "docs/DESIGN.md",
+    "docs/DEFERRED.md",
     "ROADMAP.md",
 ]
 

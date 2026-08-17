@@ -7,8 +7,9 @@
 #   make clippy    # 静态检查门禁(-D warnings)
 #   make fmt       # 格式门禁
 #
-# 路径说明:target/ 位于 workspace 根(所有 crate 共享);链接脚本在
-# kernel/linker.ld(由 .cargo/config.toml 的 rustflags 传入)。
+# 路径说明:target/ 位于 workspace 根(所有 crate 共享);链接脚本
+# kernel/linker.ld 由 kernel/build.rs 以绝对路径传给链接器
+# (CARGO_MANIFEST_DIR,不再依赖工作目录)。
 
 TARGET   = riscv64gc-unknown-none-elf
 KERNEL_ELF = target/$(TARGET)/release/ignium-kernel

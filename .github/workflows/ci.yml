@@ -34,9 +34,10 @@ jobs:
       # 启动冒烟:跑满 10s 收集完整输出,断言:
       # 1) "M0: boot ok"(成功启动)
       # 2) "buddy allocator selftest ok"(物理内存分配器自检通过)
-      # 3) >= 2 条 "uptime:"(定时器中断持续存活;单条可能是
+      # 3) "Sv39 paging ok"(页表 + 身份映射 + satp 切换成功)
+      # 4) >= 2 条 "uptime:"(定时器中断持续存活;单条可能是
       #    "第一跳后定时器死亡"的假阳性,pro 审计 #6)
-      # 4) 无 "KERNEL PANIC"/"TRAP:"(启动后无故障)
+      # 5) 无 "KERNEL PANIC"/"TRAP:"(启动后无故障)
       - name: Boot test in QEMU
         run: |
           timeout 10 qemu-system-riscv64 -M virt -m 128M -nographic -bios default \

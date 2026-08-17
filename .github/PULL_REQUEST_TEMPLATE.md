@@ -14,6 +14,7 @@
 - [ ] `make test` PASS
 - [ ] dev + release 双 profile 编译通过
 - [ ] 涉及汇编/链接脚本:已核对 ABI 契约(AGENTS.md 红线 3/4)
+- [ ] 按规范撰写详尽报告 `docs/reports/<日期>-<主题>.md`(每次修复/更新必写,见 AGENTS.md)
 
 ## 外部审计处置(若有新发现)
 

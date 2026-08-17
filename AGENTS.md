@@ -39,9 +39,12 @@ make test      # QEMU 启动冒烟
 
 ## 结构速览
 
-- `kernel/` — 内核 crate(唯一特权层);arch 隔离层在 kernel/src/arch/
-- `scripts/ai_audit.py` — 外部 AI 独立审计(密钥走环境变量,见 scripts/README.md)
-- `docs/` — DESIGN.md(架构铁律)、audit-reports/(外部审计留档)
+- `kernel/` — 内核 crate(唯一特权层);arch 隔离层在 kernel/src/arch/;
+  关键模块:board.rs(板级常量)、mem.rs(buddy)、mmu.rs(Sv39 页表)、
+  sbi.rs(SBI 调用)、logger/panic/uart
+- `scripts/ai_audit.py` — 外部 AI 审计(密钥走环境变量,见 scripts/README.md)
+- `docs/` — DESIGN.md(架构铁律)、DEFERRED.md(延迟项注册表)、
+  reports/(详尽报告)、audit-reports/(外部审计留档)
 - 里程碑节奏见 ROADMAP.md;每个里程碑 tag + Release。
 
 ## 提交规范

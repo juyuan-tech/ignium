@@ -1,7 +1,8 @@
 # Ignium 内核 crate(微内核唯一特权层)。
 #
 # 构建目标 riscv64gc-unknown-none-elf 由 workspace 级 .cargo/config.toml
-# 与 rust-toolchain.toml 决定;链接脚本 kernel/linker.ld 由 rustflags 传入。
+# 与 rust-toolchain.toml 决定;链接脚本 kernel/linker.ld 由 build.rs
+# 以绝对路径(CARGO_MANIFEST_DIR)传给链接器。
 
 [package]
 name = "ignium-kernel"
