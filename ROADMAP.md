@@ -26,7 +26,7 @@
 | 物理内存 buddy allocator | ✅ 完成:4KB 页 / order 0-12,自检(分配/释放/合并/对齐/双释放)通过 |
 | Sv39 页表 + 内核自身映射 | ✅ 完成:身份映射(2MB 超页 RAM + UART 4KB),satp 切换 + sfence,自检通过 |
 | Sv39 页表 + 内核自身映射 | arch_mmu_map 接口 |
-| 内核堆(slab)+ alloc 稳定 | 内核内 Vec 可用 |
+| 内核堆(slab)+ alloc 稳定 | ✅ 完成:8 档 slab(16B..2KB)+ buddy 页路径,`#[global_allocator]`,Vec/Box 可用,自检通过 |
 | 上下文切换 arch_thread_switch | 多线程交替打印无错 |
 | 调度器:优先级抢占 + 时间片 + idle | 并发调度稳定 |
 | 同步原语:mutex/condvar | 并发计数最终值正确 |

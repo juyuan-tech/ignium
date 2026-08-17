@@ -13,8 +13,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 mod arch;
 mod board;
+mod heap;
 mod logger;
 mod mem;
 mod mmu;
@@ -85,6 +88,12 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
             mmu::satp()
         ),
         Err(e) => panic!("Sv39 paging selftest failed: {e}"),
+    }
+    // 内核堆(全局分配器,Vec/Box 可用)自检。
+    // 须在 irq_enable 之前:堆锁为 SpinLock(主上下文,ISR 禁止)。
+    match heap::self_test() {
+        Ok(()) => info!("M1: kernel heap selftest ok (slab 16B..2KB + page path)"),
+        Err(e) => panic!("kernel heap selftest failed: {e}"),
     }
     arch::irq_enable();
     info!(

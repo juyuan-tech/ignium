@@ -28,7 +28,7 @@ const FREE_NONE: usize = usize::MAX;
 
 /// 平台常量(RAM 范围等)集中在 board.rs,单文件改板。
 /// 元数据数组覆盖最大可能的页数(RAM_START 起算)。
-const MAX_PAGES: usize = (crate::board::RAM_END - crate::board::RAM_START) / PAGE_SIZE;
+pub const MAX_PAGES: usize = (crate::board::RAM_END - crate::board::RAM_START) / PAGE_SIZE;
 
 /// 每页元数据:`order` = 所属块阶,`used` = 已分配。
 #[derive(Clone, Copy)]
@@ -374,6 +374,11 @@ pub fn init(fdt: usize) {
 /// 而非含永久占用补齐页的 padded 值)。
 pub fn page_count() -> usize {
     with_allocator(|a| a.real_count)
+}
+
+/// 分配区物理基址(内核堆的页索引换算用)。
+pub fn base() -> usize {
+    with_allocator(|a| a.base)
 }
 
 /// 分配 2^order 页,返回物理地址。

@@ -45,5 +45,6 @@ jobs:
           grep -q "M0: boot ok" /tmp/ignium-ci.log
           grep -q "buddy allocator selftest ok" /tmp/ignium-ci.log
           grep -q "Sv39 paging ok" /tmp/ignium-ci.log
+          grep -q "kernel heap selftest ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
