@@ -92,8 +92,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         ),
         Err(e) => panic!("Sv39 paging selftest failed: {e}"),
     }
-    // 内核堆(全局分配器,Vec/Box 可用)自检。
+    // 内核堆初始化(缓存分配区基址)后自检。
     // 须在 irq_enable 之前:堆锁为 SpinLock(主上下文,ISR 禁止)。
+    heap::init();
     match heap::self_test() {
         Ok(()) => info!("M1: kernel heap selftest ok (slab 16B..2KB + page path)"),
         Err(e) => panic!("kernel heap selftest failed: {e}"),
@@ -109,6 +110,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         Ok(()) => info!("M1: sync primitives selftest ok (mutex + condvar)"),
         Err(e) => panic!("sync primitives selftest failed: {e}"),
     }
+    // 性能基线(启动时打印,供后续优化对比)。
+    heap::bench();
+    sched::bench();
     arch::irq_enable();
     info!(
         "M1: timer enabled ({}us interval), interrupts on",

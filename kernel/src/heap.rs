@@ -15,6 +15,9 @@
 //!   M1 规模可接受;归还与页回收在 M2 引入)。
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::info;
 
 use crate::mem;
 use crate::sync::SpinLock;
@@ -50,8 +53,22 @@ impl SlabClass {
 /// 之后只读;访问一律经裸指针。
 static mut SLAB_PAGE_CLASS: [u8; mem::MAX_PAGES] = [NOT_SLAB; mem::MAX_PAGES];
 
+/// 分配区基址缓存(性能优化):`mem::base()` 每次经分配器锁,
+/// 堆快路径(每次 alloc/dealloc)不承受该开销;init 时缓存一次。
+static ALLOC_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// 初始化堆(缓存基址;须在 mem::init 之后、任何堆操作之前)。
+pub fn init() {
+    ALLOC_BASE.store(mem::base(), Ordering::Relaxed);
+}
+
+#[inline]
+fn heap_base() -> usize {
+    ALLOC_BASE.load(Ordering::Relaxed)
+}
+
 fn slab_class_of(page: usize) -> u8 {
-    let page_idx = (page - mem::base()) / mem::PAGE_SIZE;
+    let page_idx = (page - heap_base()) / mem::PAGE_SIZE;
     unsafe {
         (&raw const SLAB_PAGE_CLASS)
             .cast::<u8>()
@@ -61,7 +78,7 @@ fn slab_class_of(page: usize) -> u8 {
 }
 
 fn slab_class_set(page: usize, class: u8) {
-    let page_idx = (page - mem::base()) / mem::PAGE_SIZE;
+    let page_idx = (page - heap_base()) / mem::PAGE_SIZE;
     unsafe {
         (&raw const SLAB_PAGE_CLASS)
             .cast::<u8>()
@@ -205,7 +222,7 @@ impl KernelHeap {
         }
         let page = (ptr as usize) & !(mem::PAGE_SIZE - 1);
         // MEDIUM-2:指针越界防御 —— 判别表下标不得越界/下溢。
-        let base = mem::base();
+        let base = heap_base();
         if page < base || page - base >= mem::MAX_PAGES * mem::PAGE_SIZE {
             panic!(
                 "kernel heap: invalid pointer {:#x} (outside allocatable region)",
@@ -248,6 +265,22 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 #[global_allocator]
 pub static ALLOCATOR: KernelAllocator = KernelAllocator;
+
+/// 堆吞吐基线:64B 档分配+释放各 100k 次(含堆锁开销)。
+pub fn bench() {
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let t0 = crate::arch::get_time();
+    for _ in 0..100_000 {
+        let p = unsafe { alloc::alloc::alloc(layout) };
+        if p.is_null() {
+            panic!("bench: alloc oom");
+        }
+        unsafe { alloc::alloc::dealloc(p, layout) };
+    }
+    let dt = crate::arch::get_time().wrapping_sub(t0);
+    let ns_per_op = dt.saturating_mul(100) / 100_000;
+    info!("bench: slab 64B alloc+dealloc ≈ {ns_per_op} ns/op");
+}
 
 /// 堆自检:Vec/Box/大对象/高对齐 四路径。
 pub fn self_test() -> Result<(), &'static str> {

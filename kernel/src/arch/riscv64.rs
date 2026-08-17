@@ -264,12 +264,18 @@ pub fn enable_timer() {
     }
     let deadline = get_time().wrapping_add(TIMER_INTERVAL);
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
-    // 首次编程失败 = 内核失去节拍源(M1):warn+挂死不如明确失败,
-    // panic 输出完整诊断后停机(CI 负向断言也能捕获)。
-    assert!(
-        crate::sbi::set_timer(deadline) == 0,
-        "sbi_set_timer failed at boot"
-    );
+    // SSTC 直写 stimecmp(性能优化):替代每 tick 的 SBI ecall(M 模式
+    // 往返,几百周期)。QEMU virt 与 RVA23 强制平台均支持;无 SSTC
+    // 的平台此指令触发非法指令陷阱 → 停机诊断(可接受,见 sbi.rs)。
+    set_stimecmp(deadline);
+}
+
+/// 直写 stimecmp(需平台支持 SSTC 扩展)。
+#[inline]
+fn set_stimecmp(next: usize) {
+    unsafe {
+        asm!("csrw stimecmp, {}", in(reg) next, options(nostack));
+    }
 }
 
 /// 空闲等待:wfi 令 CPU 进入低功耗等待;若中断被使能,等待可被唤醒。
@@ -348,17 +354,12 @@ pub unsafe extern "C" fn trap_handler(
                 // 定时器节拍:deadline 递增(无累积漂移)+ tick 计数
                 // + 重排下一次中断。wrapping_add(MED-4):overflow-checks
                 // 开启下,极端时间(理论 18 万年后)不触发 panic。
+                // SSTC 直写 stimecmp(替代 ecall,见 enable_timer)。
                 crate::logger::tick_up();
                 let next = TIMER_DEADLINE
                     .fetch_add(TIMER_INTERVAL, Ordering::Relaxed)
                     .wrapping_add(TIMER_INTERVAL);
-                // M1(审计 11 轮):SBI 失败 = 节拍源丢失(调度/看门狗
-                // 都会挂死),ISR 内不可日志 —— 直接 panic 给出明确
-                // 诊断,而不是静默停摆。
-                assert!(
-                    crate::sbi::set_timer(next) == 0,
-                    "sbi_set_timer failed in timer ISR"
-                );
+                set_stimecmp(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程
                 // 的帧指针,汇编恢复路径据此 sret 进入新线程
                 // (全寄存器恢复,含 t/a)。

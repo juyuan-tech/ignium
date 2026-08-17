@@ -23,7 +23,9 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::arch::{self, Context};
+use crate::info;
 use crate::sync::SpinLock;
+use crate::warn;
 
 /// 线程栈大小(16KB)。
 const THREAD_STACK_SIZE: usize = 16 * 1024;
@@ -146,30 +148,6 @@ impl Scheduler {
         }
     }
 
-    /// 协作让出:锁内更新状态与 pick,锁外切换(中断仍关闭,
-    /// 单核无抢占介入,切换原子性由 irq_save 保证)。
-    fn yield_self(&mut self) -> (usize, usize) {
-        let cur = self.current;
-        // 进度移入 ctx,帧失效(CRITICAL-3)。
-        self.threads[cur].frame_valid = false;
-        self.enqueue(cur);
-        self.ticks_run = 0;
-        let next = self.pick_next();
-        self.current = next;
-        (cur, next)
-    }
-
-    /// 阻塞当前线程(从就绪中移除,不加入)。
-    fn block_self(&mut self) -> (usize, usize) {
-        let cur = self.current;
-        self.threads[cur].state = ThreadState::Blocked;
-        self.threads[cur].frame_valid = false;
-        self.ticks_run = 0;
-        let next = self.pick_next();
-        self.current = next;
-        (cur, next)
-    }
-
     /// 抢占决策(定时器 ISR 内,中断关闭,不可阻塞):
     /// 时间片到期且存在**帧有效**的其他就绪线程 → 复制当前帧、
     /// 返回下一线程帧。否则返回原帧(继续当前线程)。
@@ -206,17 +184,6 @@ impl Scheduler {
         self.current = next;
         // 返回下一线程的帧指针,汇编据此 sret 全量恢复。
         self.threads[next].frame.as_mut_ptr()
-    }
-
-    /// 线程退出:标记 Exited。
-    fn exit_self(&mut self) -> (usize, usize) {
-        let cur = self.current;
-        self.threads[cur].state = ThreadState::Exited;
-        self.threads[cur].frame_valid = false;
-        self.ticks_run = 0;
-        let next = self.pick_next();
-        self.current = next;
-        (cur, next)
     }
 
     /// 新建线程:分配栈 + 构造初始帧(sepc=thread_entry,sp=栈顶)。
@@ -310,18 +277,21 @@ pub fn spawn(entry: fn(), prio: u8) -> usize {
 /// 协作让出 CPU。
 pub fn yield_() {
     let irq = arch::irq_save();
-    let (cur, next) = {
-        let mut s = SCHED.lock();
-        s.yield_self()
-    };
-    // 锁外切换(中断关闭保证原子性;新线程首启经 thread_entry,
-    // 复切经其自身 yield 的恢复点 —— 都不会再抢本锁)。
+    // 单锁作用域:状态变更 + pick + 裸指针提取一次完成
+    // (性能优化:原实现两次取锁)。
     let (old, new) = {
         let mut s = SCHED.lock();
+        let cur = s.current;
+        s.enqueue(cur);
+        s.ticks_run = 0;
+        let next = s.pick_next();
+        s.current = next;
         let old = (&mut s.threads[cur].ctx) as *mut Context;
         let new = (&s.threads[next].ctx) as *const Context;
         (old, new)
     };
+    // 锁外切换(中断关闭保证原子性;新线程首启经 thread_entry,
+    // 复切经其自身 yield 的恢复点 —— 都不会再抢本锁)。
     unsafe { arch::context_switch(old, new) };
     arch::irq_restore(irq);
 }
@@ -333,7 +303,7 @@ pub fn yield_() {
 /// 吞掉,线程永久挂起。
 pub fn block_current() {
     let irq = arch::irq_save();
-    let (cur, next) = {
+    let (old, new) = {
         let mut s = SCHED.lock();
         let cur = s.current;
         if s.threads[cur].state == ThreadState::Ready {
@@ -343,13 +313,14 @@ pub fn block_current() {
             arch::irq_restore(irq);
             return;
         }
-        let (c, n) = s.block_self();
-        (c, n)
-    };
-    let (old, new) = {
-        let mut s = SCHED.lock();
-        let old = (&mut s.threads[cur].ctx) as *mut Context;
-        let new = (&s.threads[next].ctx) as *const Context;
+        let c = s.current;
+        s.threads[c].state = ThreadState::Blocked;
+        s.threads[c].frame_valid = false;
+        s.ticks_run = 0;
+        let n = s.pick_next();
+        s.current = n;
+        let old = (&mut s.threads[c].ctx) as *mut Context;
+        let new = (&s.threads[n].ctx) as *const Context;
         (old, new)
     };
     unsafe { arch::context_switch(old, new) };
@@ -386,12 +357,14 @@ pub fn current_id() -> usize {
 /// 线程退出(入口函数返回后调用,不返回)。
 pub fn exit() -> ! {
     let irq = arch::irq_save();
-    let (cur, next) = {
-        let mut s = SCHED.lock();
-        s.exit_self()
-    };
     let (old, new) = {
         let mut s = SCHED.lock();
+        let cur = s.current;
+        s.threads[cur].state = ThreadState::Exited;
+        s.threads[cur].frame_valid = false;
+        s.ticks_run = 0;
+        let next = s.pick_next();
+        s.current = next;
         let old = (&mut s.threads[cur].ctx) as *mut Context;
         let new = (&s.threads[next].ctx) as *const Context;
         (old, new)
@@ -479,3 +452,44 @@ static TEST_CTR: AtomicUsize = AtomicUsize::new(0);
 static TEST_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_BUSY: AtomicUsize = AtomicUsize::new(0);
 static TEST_BUSY_DONE: AtomicBool = AtomicBool::new(false);
+
+// ===== 性能基线(上下文切换) =====
+
+/// 乒乓切换次数(每线程)。
+const BENCH_N: usize = 2000;
+static BENCH_SW_START: AtomicUsize = AtomicUsize::new(0);
+static BENCH_SW_DONE: AtomicBool = AtomicBool::new(false);
+
+fn bench_pong_a() {
+    BENCH_SW_START.store(crate::arch::get_time(), Ordering::Relaxed);
+    for _ in 0..BENCH_N {
+        yield_();
+    }
+}
+
+fn bench_pong_b() {
+    for _ in 0..BENCH_N {
+        yield_();
+    }
+    BENCH_SW_DONE.store(true, Ordering::Relaxed);
+}
+
+/// 上下文切换成本基线(约 2×BENCH_N 次切换)。
+pub fn bench() {
+    BENCH_SW_DONE.store(false, Ordering::Relaxed);
+    spawn(bench_pong_a, PRIO_HIGH);
+    spawn(bench_pong_b, PRIO_HIGH);
+    let mut guard = 0;
+    while !BENCH_SW_DONE.load(Ordering::Relaxed) && guard < 200_000 {
+        yield_();
+        guard += 1;
+    }
+    if !BENCH_SW_DONE.load(Ordering::Relaxed) {
+        warn!("bench: context switch timeout");
+        return;
+    }
+    let dt = crate::arch::get_time().wrapping_sub(BENCH_SW_START.load(Ordering::Relaxed));
+    // 10MHz 计时器:dt × 100ns;切换数 ≈ 2×BENCH_N。
+    let ns_per_switch = dt.saturating_mul(100) / (2 * BENCH_N);
+    info!("bench: context switch ≈ {ns_per_switch} ns/op (yield path)");
+}
