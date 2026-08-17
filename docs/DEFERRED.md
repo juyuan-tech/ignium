@@ -22,6 +22,7 @@
 | D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办 |
 | D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | 待办 |
 | D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa;当前无条件用 stimecmp,写读回断言可给出明确诊断) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析落地时) | 待办 |
+| D18 | early_trap 最小诊断输出(真机 bring-up 期 UART 未就绪时静默停机,审计 17 轮 INFO-4;文档化为 bring-up 风险,真机适配时落实) | 审计 17 轮 INFO-4 | 真机 bring-up | 待办 |
 
 ## 已关闭(移动到这里)
 

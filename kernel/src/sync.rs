@@ -1,24 +1,25 @@
 //! 基础同步原语(M1)。
 //!
-//! # SpinLock 使用约束(重要)
-//! 当前仅**主上下文**(关中断外、无调度)使用:
-//! - 定时器 ISR 零分配、零日志,不会与主上下文竞争;
-//! - **ISR 内持锁会与主上下文死锁**(自旋等待)。
-//!
-//! ISR 安全需要在加锁时保存/恢复 SIE(中断安全锁),
-//! 与 IRQ 安全分配一起在调度器里程碑引入(DEFERRED D3/D11)。
+//! # SpinLock 使用约束
+//! MED-3(审计 17 轮):自旋锁为 **IRQ 安全锁** —— 加锁时保存 SIE
+//! 并关中断,释放时恢复。持锁临界区不再被抢占(消除堆/分配器锁
+//! convoy)。约束:
+//! - 定时器 ISR 仍**零分配、零日志**:不会竞争堆/分配器锁;
+//! - 嵌套加锁安全(irq_save/restore 幂等,与 sched 的显式
+//!   irq_save 配合无损)。
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::collections::VecDeque;
 
 use crate::arch;
 use crate::sched;
 
-/// 自旋锁:无调度器时的最小互斥原语。
-/// 单核 + 中断关闭语义下,临界区不应被抢占。
+/// 自旋锁:IRQ 安全(加锁保存 SIE + 关中断,释放恢复)。
+/// 临界区持锁期间不会被定时器抢占,因此不会出现
+/// "持锁线程被切走、他人自旋"的 convoy。
 pub struct SpinLock<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -41,20 +42,27 @@ impl<T> SpinLock<T> {
     /// 获取锁(自旋等待),返回守卫。
     ///
     /// # 并发约束
-    /// 见模块头:主上下文专用;ISR/中断上下文禁止调用。
+    /// IRQ 安全:加锁关中断、守卫释放恢复。ISR 内仍应避免持锁
+    /// (ISR 零分配约定);对已被主上下文持有的锁,ISR 自旋等待
+    /// 也会在中断恢复后正常完成,不再死锁。
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let saved = arch::irq_save();
         while self.locked.swap(true, Ordering::Acquire) {
             while self.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
             }
         }
-        SpinLockGuard { lock: self }
+        SpinLockGuard {
+            lock: self,
+            saved_irq: saved,
+        }
     }
 }
 
-/// 锁守卫:释放时自动解锁。
+/// 锁守卫:释放时恢复中断并解锁。
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    saved_irq: bool,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -73,6 +81,7 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        arch::irq_restore(self.saved_irq);
     }
 }
 
@@ -189,11 +198,16 @@ impl Condvar {
     pub fn wait<'a, T: ?Sized>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         let m = guard.m;
         let irq = arch::irq_save();
-        // 原子地:登记 → 释放互斥(不唤醒其等待者)→ 准备阻塞。
+        // 原子地:登记 → 释放互斥(与 unlock 相同语义,含唤醒队首
+        // 互斥等待者 —— HIGH-1/审计 17 轮:不唤醒会使互斥等待者
+        // 永久阻塞,因为锁已释放却无人 pop)→ 准备阻塞。
         self.waiters.lock().push_back(sched::current_id());
         m.locked.store(false, Ordering::Release);
-        // HIGH-1:必须**消费**守卫 —— 直接 drop 会再次 unlock,
-        // 唤醒互斥等待者并破坏其队列(双重解锁)。
+        if let Some(w) = m.waiters.lock().pop_front() {
+            sched::wake(w);
+        }
+        // HIGH-1(审计 15 轮):必须**消费**守卫 —— 直接 drop 会再次
+        // unlock,唤醒互斥等待者并破坏其队列(双重解锁)。
         core::mem::forget(guard);
         arch::irq_restore(irq);
         sched::block_current();
@@ -227,7 +241,10 @@ impl Condvar {
 static TEST_MUTEX: Mutex<u32> = Mutex::new(0);
 static TEST_MUTEX_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_MUTEX_DONE2: AtomicBool = AtomicBool::new(false);
-static TEST_MUTEX_MIXED_DONE: AtomicBool = AtomicBool::new(false);
+// MED-4(审计 17 轮):混合路径用**完成计数**而非布尔 ——
+// 布尔在任一完成线程置位后主线程即可退出等待,可能观测到
+// 部分计数(非确定性误报)。
+static TEST_MUTEX_MIXED_DONE: AtomicUsize = AtomicUsize::new(0);
 
 /// 互斥自检线程:在锁内递增 1000 次,完成置位。
 fn mutex_inc() {
@@ -270,6 +287,34 @@ fn cond_consumer() {
     }
 }
 
+// HIGH-1(审计 17 轮)回归:竞争释放 —— 消费者先持锁并 wait,
+// 生产者随后阻塞在互斥上。wait 释放互斥时若不同时唤醒互斥
+// 等待者,则无人再能置数据,全系统死锁(原自检掩盖:消费先
+// 入队,互斥队空)。
+static TEST_DATA2: Mutex<u32> = Mutex::new(0);
+static TEST_COND2: Condvar = Condvar::new();
+static TEST_COND2_HAS_LOCK: AtomicBool = AtomicBool::new(false);
+static TEST_COND2_DONE: AtomicBool = AtomicBool::new(false);
+
+fn cond_consumer2() {
+    let mut g = TEST_DATA2.lock();
+    TEST_COND2_HAS_LOCK.store(true, Ordering::Release);
+    while *g != 42 {
+        g = TEST_COND2.wait(g);
+    }
+    if *g == 42 {
+        TEST_COND2_DONE.store(true, Ordering::Release);
+    }
+}
+
+fn cond_producer2() {
+    {
+        let mut g = TEST_DATA2.lock();
+        *g = 42;
+    }
+    TEST_COND2.notify_one();
+}
+
 /// 互斥自检线程:在锁内递增 500 次(8 线程混合切换版本,覆盖
 /// 抢占-协作交错的 ctx_valid/frame_valid 协议)。
 fn mutex_mixed() {
@@ -281,7 +326,7 @@ fn mutex_mixed() {
             sched::yield_();
         }
     }
-    TEST_MUTEX_MIXED_DONE.store(true, Ordering::Release);
+    TEST_MUTEX_MIXED_DONE.fetch_add(1, Ordering::Release);
 }
 
 /// 同步原语自检(须在调度器初始化后、作为线程运行)。
@@ -314,19 +359,44 @@ pub fn self_test() -> Result<(), &'static str> {
         return Err("condvar handshake failed");
     }
 
+    // HIGH-1(审计 17 轮)回归:消费者先持锁并 wait,生产者随后
+    // 阻塞在互斥上 —— 若 wait 释放互斥不唤醒互斥等待者,死锁。
+    *TEST_DATA2.lock() = 0;
+    TEST_COND2_HAS_LOCK.store(false, Ordering::Relaxed);
+    TEST_COND2_DONE.store(false, Ordering::Relaxed);
+    sched::spawn(cond_consumer2, sched::PRIO_HIGH);
+    guard = 0;
+    while !TEST_COND2_HAS_LOCK.load(Ordering::Acquire) && guard < 100_000 {
+        sched::yield_();
+        guard += 1;
+    }
+    if !TEST_COND2_HAS_LOCK.load(Ordering::Acquire) {
+        return Err("cond2: consumer never acquired lock");
+    }
+    // 此刻消费者持有 TEST_DATA2,生产者 spawn 后阻塞在互斥上。
+    sched::spawn(cond_producer2, sched::PRIO_HIGH);
+    guard = 0;
+    while !TEST_COND2_DONE.load(Ordering::Acquire) && guard < 500_000 {
+        sched::yield_();
+        guard += 1;
+    }
+    if !TEST_COND2_DONE.load(Ordering::Acquire) {
+        return Err("condvar contended release deadlock");
+    }
+
     // 混合路径压力:8 线程 × 500 次互斥递增 + 偶次 yield
     // (抢占-协作交错,覆盖 ctx_valid/frame_valid 协议回归)。
     *TEST_MUTEX.lock() = 0;
-    TEST_MUTEX_MIXED_DONE.store(false, Ordering::Relaxed);
+    TEST_MUTEX_MIXED_DONE.store(0, Ordering::Relaxed);
     for _ in 0..8 {
         sched::spawn(mutex_mixed, sched::PRIO_HIGH);
     }
     guard = 0;
-    while !TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) && guard < 500_000 {
+    while TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) != 8 && guard < 500_000 {
         sched::yield_();
         guard += 1;
     }
-    if !TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) {
+    if TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) != 8 {
         return Err("mixed-path mutex timeout");
     }
     if *TEST_MUTEX.lock() != 8 * 500 {

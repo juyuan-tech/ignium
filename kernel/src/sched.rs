@@ -142,9 +142,18 @@ impl Scheduler {
     /// 选中者状态置为 Running(派发即运行;此前缺失导致唤醒线程
     /// 以 Ready 状态进入 block_current 误判"已唤醒"而自旋)。
     ///
-    /// CRITICAL-1:参数 `need_ctx` = true 表示协作路径调用 —— 只选
-    /// ctx_valid 的线程(被抢占线程的 ctx 陈旧,协作切换会错乱);
-    /// = false 表示抢占路径(on_tick),只选 frame_valid 的线程。
+    /// 恢复机制协议(审计 17 轮 MED-1 收严):线程的恢复数据恰有一个
+    /// 有效:`ctx_valid` = 协作切换保存点新鲜(yield/block/exit 后);
+    /// `frame_valid` = 抢占捕获帧新鲜(被定时器抢占后)。二者互斥
+    /// (抢占使 ctx 失效,yield 使帧失效),do_switch 按各自机制恢复
+    /// (ctx → context_switch;仅帧 → frame_restore)。
+    ///
+    /// `need_ctx` = true 表示协作路径调用(yield/block/exit):
+    /// 接受 ctx_valid **或** frame_valid 候选 —— 仅帧有效的线程
+    /// (被抢占后未再 yield)必须可被协作恢复,否则会在
+    /// "唯一可运行线程被抢占后他人退出"时永久滞留。
+    /// = false 表示抢占路径(on_tick):只选 frame_valid 的线程
+    /// (帧恢复是被抢占线程的唯一合法恢复方式)。
     /// 无分配:仅 VecDeque 出/入队(轮转),不满足条件的候选回队尾。
     fn pick_next(&mut self, need_ctx: bool) -> usize {
         for level in 0..PRIO_LEVELS {
@@ -156,7 +165,7 @@ impl Scheduler {
                     continue; // 非 Ready(如 Exited):丢弃。
                 }
                 let ok = if need_ctx {
-                    self.threads[id].ctx_valid
+                    self.threads[id].ctx_valid || self.threads[id].frame_valid
                 } else {
                     self.threads[id].frame_valid
                 };
@@ -167,7 +176,10 @@ impl Scheduler {
                 q.push_back(id); // 暂不满足:轮转到队尾,不丢失。
             }
         }
-        self.idle
+        // 无候选:回当前线程"原地继续"(三个调用方 pick 前均已把
+        // current 的 ctx 置有效;old==new 的 context_switch 即原地
+        // 返回;exit 场景随后停机)。不会选中陈旧恢复数据。
+        self.current
     }
 
     /// 把线程加入就绪队列。
@@ -188,15 +200,26 @@ impl Scheduler {
     }
 
     /// 抢占决策(定时器 ISR 内,中断关闭,不可阻塞):
-    /// 时间片到期且存在**帧有效**的其他就绪线程 → 复制当前帧、
-    /// 返回下一线程帧。否则返回原帧(继续当前线程)。
-    ///
-    /// CRITICAL-3:只允许选中 frame_valid 的线程 —— 否则会用过期帧
-    /// (sepc=thread_entry)恢复一个已 yield 的线程,使其从头重跑。
+    /// 时间片到期**或更高优先级线程就绪**(MED-2/审计 17 轮:
+    /// 优先级抢占应即时,不等时间片)且存在**帧有效**的其他就绪
+    /// 线程 → 复制当前帧、返回下一线程帧。否则返回原帧。
     fn on_tick(&mut self, frame: *mut usize) -> *mut usize {
-        self.ticks_run += 1;
+        // INFO-2(审计 17 轮):wrapping —— overflow-checks 开启下
+        // 2^64 tick 后 ISR 内 panic(工程上不可达,与工程约定一致)。
+        self.ticks_run = self.ticks_run.wrapping_add(1);
         if self.ticks_run < SLICE_TICKS {
-            return frame;
+            // 时间片未到:仅当更高优先级就绪(帧有效)才抢占。
+            let cur_prio = self.threads[self.current].prio as usize;
+            let higher = (0..cur_prio).any(|l| {
+                self.ready[l].iter().any(|&id| {
+                    id != self.current
+                        && self.threads[id].state == ThreadState::Ready
+                        && self.threads[id].frame_valid
+                })
+            });
+            if !higher {
+                return frame;
+            }
         }
         self.ticks_run = 0;
         // 是否存在可抢占的就绪线程(非自身、帧有效)。
@@ -237,15 +260,22 @@ impl Scheduler {
             return frame;
         }
         self.current = next;
-        // 选中者将被帧恢复运行 —— 恢复后可被协作切换(ctx 将
-        // 在它下次 yield 时重存),此处置 ctx_valid 使协作路径可选它。
-        self.threads[next].ctx_valid = true;
+        // 注意:恢复目标 next 不置 ctx_valid —— 其 ctx 陈旧(自上次
+        // yield 后未更新;审计 17 轮自审发现:置有效会让协作路径用
+        // 陈旧 ctx 切换它,复现旧程序点)。它经帧恢复后,下次
+        // yield/block/exit 会重新保存 ctx。
         // 返回下一线程的帧指针,汇编据此 sret 全量恢复。
         self.threads[next].frame.as_mut_ptr()
     }
 
     /// 新建线程:分配栈 + 构造初始帧(sepc=thread_entry,sp=栈顶)。
     fn spawn(&mut self, entry: fn(), prio: u8) -> usize {
+        // INFO-1(审计 17 轮):强制容量上限 —— 容量为 ISR 零分配
+        // 预留(reserve MAX_THREADS),超过即违反该不变量。
+        assert!(
+            self.threads.len() < MAX_THREADS,
+            "thread table full ({MAX_THREADS})"
+        );
         let id = self.next_id;
         self.next_id += 1;
         // 零化-free 栈分配(性能优化):`vec![0u8; N]` 会白付 16KB
@@ -253,13 +283,16 @@ impl Scheduler {
         let stack = alloc_zeroed_free_stack();
         // HIGH-4:sp 须 16 字节对齐(RISC-V ABI);堆指针仅保证 8 对齐。
         let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
-        // 初始帧:sepc = 线程包装器,sstatus:SPIE=1(进线程后开中断)。
+        // 初始帧:sepc = 线程包装器,sstatus:SPIE=1(进线程后开中断)
+        // + SPP=1(审计 17 轮:初始帧可能经**抢占路径 sret 首启**
+        // (on_tick 选中未运行线程)—— SPP=0 会降入 U 模式,取指
+        // 内核文本立即缺页)。此前仅 SPIE,首启必走协作 ctx 掩盖了它。
         // CRITICAL-2(审计 16 轮):帧内 sp/gp 必须有效 —— 恢复路径
         // 会从帧加载 sp;gp 与 trap_vector 入口一致(内核代码可能
         // 生成 gp 相对访问)。
         let mut frame = [0usize; FRAME_WORDS];
         frame[FRAME_SEPC] = thread_entry as *const () as usize;
-        frame[FRAME_SSTATUS] = 1 << 5; // SPIE
+        frame[FRAME_SSTATUS] = (1 << 5) | (1 << 8); // SPIE | SPP
         frame[1] = sp;
         frame[2] = __global_pointer();
         // MED-10(审计 15 轮):优先级越界钳制,防就绪队列越界 panic。
@@ -355,7 +388,7 @@ pub fn init() {
     let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
     let mut frame = [0usize; FRAME_WORDS];
     frame[FRAME_SEPC] = idle_entry as *const () as usize;
-    frame[FRAME_SSTATUS] = 1 << 5;
+    frame[FRAME_SSTATUS] = (1 << 5) | (1 << 8); // SPIE | SPP
     s.threads.push(Thread {
         prio: PRIO_LOW,
         state: ThreadState::Running,
@@ -393,9 +426,8 @@ pub fn spawn(entry: fn(), prio: u8) -> usize {
 /// 协作让出 CPU。
 pub fn yield_() {
     let irq = arch::irq_save();
-    // 单锁作用域:状态变更 + pick + 裸指针提取一次完成
-    // (性能优化:原实现两次取锁)。
-    let (old, new) = {
+    // 单锁作用域:状态变更 + pick + 切换目标提取一次完成。
+    let target = {
         let mut s = SCHED.lock();
         let cur = s.current;
         // C3(审计 15 轮回归):合并锁时丢失 —— yield 后进度在 ctx,
@@ -412,13 +444,11 @@ pub fn yield_() {
         s.ticks_run = 0;
         let next = s.pick_next(true);
         s.current = next;
-        let old = (&mut s.threads[cur].ctx) as *mut Context;
-        let new = (&s.threads[next].ctx) as *const Context;
-        (old, new)
+        switch_target(&mut s, cur, next)
     };
-    // 锁外切换(中断关闭保证原子性;新线程首启经 thread_entry,
-    // 复切经其自身 yield 的恢复点 —— 都不会再抢本锁)。
-    unsafe { arch::context_switch(old, new) };
+    // 锁外切换(中断关闭保证原子性;选中者恢复机制见 switch_target:
+    // ctx 或帧二选一,均新鲜)。
+    do_switch(&target);
     arch::irq_restore(irq);
 }
 
@@ -429,7 +459,7 @@ pub fn yield_() {
 /// 吞掉,线程永久挂起。
 pub fn block_current() {
     let irq = arch::irq_save();
-    let (old, new) = {
+    let target = {
         let mut s = SCHED.lock();
         let cur = s.current;
         if s.threads[cur].state == ThreadState::Ready {
@@ -459,11 +489,10 @@ pub fn block_current() {
         s.ticks_run = 0;
         let n = s.pick_next(true);
         s.current = n;
-        let old = (&mut s.threads[c].ctx) as *mut Context;
-        let new = (&s.threads[n].ctx) as *const Context;
-        (old, new)
+        switch_target(&mut s, c, n)
     };
-    unsafe { arch::context_switch(old, new) };
+    // 锁外切换(中断关闭保证原子性;恢复机制见 switch_target)。
+    do_switch(&target);
     // 醒来:撤销 wake 的入队并消费唤醒标志(防双调度/重入)。
     let mut s = SCHED.lock();
     let cur = s.current;
@@ -499,10 +528,25 @@ pub fn current_id() -> usize {
     id
 }
 
+/// 回收已退出线程的栈(LOW-3/审计 17 轮):idle 循环调用,配合
+/// yield_ 内的回收,保证无 yield 的纯 wfi 周期也能回收。
+///
+/// 只允许在**不会退出/正在使用被回收栈**的上下文调用 ——
+/// idle 线程永不退出,且在自身栈上释放他人栈是安全的(C2)。
+pub fn drain_reaper() {
+    let irq = arch::irq_save();
+    let mut s = SCHED.lock();
+    while let Some(stack) = s.reaper.pop_front() {
+        drop(stack);
+    }
+    drop(s);
+    arch::irq_restore(irq);
+}
+
 /// 线程退出(入口函数返回后调用,不返回)。
 pub fn exit() -> ! {
     let irq = arch::irq_save();
-    let (old, new) = {
+    let target = {
         let mut s = SCHED.lock();
         let cur = s.current;
         // C2(审计 15 轮):**不得释放自身正在使用的栈** —— 把栈 Box
@@ -516,14 +560,47 @@ pub fn exit() -> ! {
         s.ticks_run = 0;
         let next = s.pick_next(true);
         s.current = next;
-        let old = (&mut s.threads[cur].ctx) as *mut Context;
-        let new = (&s.threads[next].ctx) as *const Context;
-        (old, new)
+        switch_target(&mut s, cur, next)
     };
-    unsafe { arch::context_switch(old, new) };
+    // 锁外切换(中断关闭保证原子性;恢复机制见 switch_target)。
+    do_switch(&target);
     // exit_self 切走,不会到达这里;防御性停机。
     arch::irq_restore(irq);
     arch::halt()
+}
+
+/// 切换目标:锁内提取,锁外执行。
+struct SwitchTarget {
+    old_ctx: *mut Context,
+    new_ctx: *const Context,
+    new_frame: *mut usize,
+    use_frame: bool,
+}
+
+/// 锁内构造切换目标(审计 17 轮):恢复机制按选中者的有效数据选择
+/// —— ctx_valid → context_switch;仅帧有效(被抢占后未再 yield)
+/// → frame_restore(从帧 sret,不返回)。选中者由 pick_next 保证
+/// 至少一种有效。
+fn switch_target(s: &mut Scheduler, cur: usize, next: usize) -> SwitchTarget {
+    let use_frame = !s.threads[next].ctx_valid;
+    let old_ctx = (&mut s.threads[cur].ctx) as *mut Context;
+    let new_ctx = (&s.threads[next].ctx) as *const Context;
+    let new_frame = s.threads[next].frame.as_mut_ptr();
+    SwitchTarget {
+        old_ctx,
+        new_ctx,
+        new_frame,
+        use_frame,
+    }
+}
+
+/// 锁外切换(中断关闭保证原子性)。
+fn do_switch(t: &SwitchTarget) {
+    if t.use_frame {
+        unsafe { arch::frame_restore(t.new_frame) }
+    } else {
+        unsafe { arch::context_switch(t.old_ctx, t.new_ctx) }
+    }
 }
 
 /// 定时器 ISR 回调(中断关闭上下文):抢占决策,返回恢复帧。
@@ -571,6 +648,33 @@ pub fn self_test() -> Result<(), &'static str> {
     if !TEST_BUSY_DONE.load(Ordering::Relaxed) {
         return Err("preemption failed: busy thread starved main");
     }
+    // 4) MED-2(审计 17 轮)回归:优先级抢占 —— LOW 忙循环第 5 tick
+    //    spawn 高优先级线程,HIGH 必须在 1 tick 内首启(不允许等满
+    //    时间片);HIGH 先退出后,仅帧有效的 LOW 须经帧恢复继续
+    //    (审计 17 轮:仅帧有效线程的协作恢复,防滞留)。
+    TEST_PRIO_LOW_DONE.store(false, Ordering::Relaxed);
+    TEST_PRIO_HIGH_DONE.store(false, Ordering::Relaxed);
+    TEST_PRIO_LOW_START.store(0, Ordering::Relaxed);
+    TEST_PRIO_HIGH_START.store(0, Ordering::Relaxed);
+    spawn(test_prio_low, PRIO_LOW);
+    guard = 0;
+    while (!TEST_PRIO_LOW_DONE.load(Ordering::Acquire)
+        || !TEST_PRIO_HIGH_DONE.load(Ordering::Acquire))
+        && guard < 500_000
+    {
+        yield_();
+        guard += 1;
+    }
+    if !TEST_PRIO_LOW_DONE.load(Ordering::Acquire) || !TEST_PRIO_HIGH_DONE.load(Ordering::Acquire) {
+        return Err("priority preemption timeout (thread stranded?)");
+    }
+    let delay = TEST_PRIO_HIGH_START
+        .load(Ordering::Relaxed)
+        .wrapping_sub(TEST_PRIO_LOW_START.load(Ordering::Relaxed))
+        .wrapping_sub(5);
+    if delay > 3 {
+        return Err("priority preemption not immediate");
+    }
     Ok(())
 }
 
@@ -599,10 +703,44 @@ fn test_busy() {
     TEST_BUSY_DONE.store(true, Ordering::Relaxed);
 }
 
+/// MED-2 回归:低优先级忙循环 —— 第 5 tick spawn 高优先级线程,
+/// 共运行 25 tick。期间被 HIGH 抢占(帧捕获),HIGH 退出后须经
+/// 帧恢复继续(仅帧有效线程的协作恢复路径)。
+fn test_prio_low() {
+    let s0 = crate::logger::tick();
+    TEST_PRIO_LOW_START.store(s0 as usize, Ordering::Relaxed);
+    let mut spawned = false;
+    while crate::logger::tick().wrapping_sub(s0) < 25 {
+        if !spawned && crate::logger::tick().wrapping_sub(s0) >= 5 {
+            spawn(test_prio_high, PRIO_HIGH);
+            spawned = true;
+        }
+        TEST_PRIO_LOW.fetch_add(1, Ordering::Relaxed);
+    }
+    TEST_PRIO_LOW_DONE.store(true, Ordering::Relaxed);
+}
+
+/// MED-2 回归:高优先级忙循环 —— 记录首启 tick,运行 3 tick 后
+/// 退出。首启应发生在 spawn 后的下一个 tick(即时优先级抢占)。
+fn test_prio_high() {
+    let s0 = crate::logger::tick();
+    TEST_PRIO_HIGH_START.store(s0 as usize, Ordering::Relaxed);
+    while crate::logger::tick().wrapping_sub(s0) < 3 {
+        TEST_PRIO_HIGH.fetch_add(1, Ordering::Relaxed);
+    }
+    TEST_PRIO_HIGH_DONE.store(true, Ordering::Relaxed);
+}
+
 static TEST_CTR: AtomicUsize = AtomicUsize::new(0);
 static TEST_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_BUSY: AtomicUsize = AtomicUsize::new(0);
 static TEST_BUSY_DONE: AtomicBool = AtomicBool::new(false);
+static TEST_PRIO_LOW: AtomicUsize = AtomicUsize::new(0);
+static TEST_PRIO_HIGH: AtomicUsize = AtomicUsize::new(0);
+static TEST_PRIO_LOW_DONE: AtomicBool = AtomicBool::new(false);
+static TEST_PRIO_HIGH_DONE: AtomicBool = AtomicBool::new(false);
+static TEST_PRIO_LOW_START: AtomicUsize = AtomicUsize::new(0);
+static TEST_PRIO_HIGH_START: AtomicUsize = AtomicUsize::new(0);
 
 // ===== 性能基线(上下文切换) =====
 

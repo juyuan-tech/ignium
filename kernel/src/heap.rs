@@ -134,28 +134,29 @@ impl KernelHeap {
     }
 
     /// 从 slab 档分配一个槽(页满则新开一页)。
+    /// HIGH-2(审计 17 轮):**遍历页链**复用任何有空闲槽的页
+    /// (旧实现只看 head 页,非 head 页释放的槽永不分配)。
     unsafe fn slab_alloc(&mut self, idx: usize) -> *mut u8 {
-        if self.classes[idx].head.is_null() {
-            // 首次:新建页并挂为档头(此前曾丢弃返回值导致空指针访存)。
-            let nh = unsafe { self.new_slab(idx) };
-            self.classes[idx].head = nh;
+        // 遍历页链,取第一个有空闲槽的页。
+        let mut page = self.classes[idx].head;
+        while !page.is_null() {
+            let header = unsafe { &mut *page };
+            if header.free_list != usize::MAX {
+                let slot = header.free_list;
+                header.free_list = unsafe { *(slot as *const usize) };
+                return slot as *mut u8;
+            }
+            page = header.next;
         }
-        let head = self.classes[idx].head;
-        let header = unsafe { &mut *head };
-        let slot = header.free_list;
-        if slot == usize::MAX {
-            // 当前页已满:新开一页并链入。
-            let nh = unsafe { self.new_slab(idx) };
-            let nhdr = unsafe { &mut *nh };
-            nhdr.next = head;
-            self.classes[idx].head = nh;
-            // CRITICAL-1:必须**弹出**新页的首个槽 —— 直接返回会让
-            // 新页 free_list 仍指向它,同一槽被分配两次。
-            let slot = nhdr.free_list;
-            nhdr.free_list = unsafe { *(slot as *const usize) };
-            return slot as *mut u8;
-        }
-        header.free_list = unsafe { *(slot as *const usize) };
+        // 所有页已满:新建一页并链入。
+        let nh = unsafe { self.new_slab(idx) };
+        let nhdr = unsafe { &mut *nh };
+        nhdr.next = self.classes[idx].head;
+        self.classes[idx].head = nh;
+        // CRITICAL-1(审计 13 轮):必须**弹出**新页的首个槽 ——
+        // 直接返回会让新页 free_list 仍指向它,同一槽被分配两次。
+        let slot = nhdr.free_list;
+        nhdr.free_list = unsafe { *(slot as *const usize) };
         slot as *mut u8
     }
 
@@ -261,7 +262,8 @@ impl KernelHeap {
 /// 全局分配器(经 `#[global_allocator]` 供 Vec/Box 等使用)。
 pub struct KernelAllocator;
 
-// HEAP 的 SpinLock 约束见 sync.rs:仅主上下文(ISR 零分配)。
+// HEAP 的 SpinLock 约束见 sync.rs:IRQ 安全锁(MED-3,审计 17 轮);
+// ISR 仍零分配(容量预留)。
 static HEAP: SpinLock<KernelHeap> = SpinLock::new(KernelHeap::new());
 
 unsafe impl GlobalAlloc for KernelAllocator {
@@ -339,6 +341,41 @@ pub fn self_test() -> Result<(), &'static str> {
         let x: Box<u32> = Box::new(7);
         drop(x);
     }
+
+    // 6) HIGH-2(审计 17 轮)回归:slab 多页复用 —— 填满 ≥2 页后
+    //    释放**旧页**(非 head)的槽,再分配必须遍历页链复用它
+    //    (页数不增长;旧实现只查 head 页,新开一页 → 泄漏)。
+    let idx = 1; // 32B 档(此前各步骤未触碰该档)
+    let size = SLAB_SIZES[idx];
+    let slots = (mem::PAGE_SIZE - size) / size; // 页内槽数
+    let layout = Layout::from_size_align(size, 8).map_err(|_| "bad layout")?;
+    let mut ptrs: Vec<*mut u8> = Vec::new();
+    // 填满两页(2×slots):page1(旧页)与 page2(head 页)全满。
+    for _ in 0..2 * slots {
+        let p = unsafe { alloc::alloc::alloc(layout) };
+        if p.is_null() {
+            return Err("slab multi-page alloc");
+        }
+        ptrs.push(p);
+    }
+    // 释放旧页(page1)首槽:此时唯一可复用的空闲槽在非 head 页。
+    unsafe { alloc::alloc::dealloc(ptrs[0], layout) };
+    let page_old = (ptrs[0] as usize) & !(mem::PAGE_SIZE - 1);
+    // 再分配:必须遍历页链复用旧页槽(地址落回旧页),不得新建页。
+    let extra = unsafe { alloc::alloc::alloc(layout) };
+    if extra.is_null() {
+        return Err("slab reuse alloc");
+    }
+    let page_new = (extra as usize) & !(mem::PAGE_SIZE - 1);
+    if page_old != page_new {
+        return Err("slab multi-page reuse failed (new page allocated)");
+    }
+    // 清理。
+    for &p in ptrs.iter().skip(1) {
+        unsafe { alloc::alloc::dealloc(p, layout) };
+    }
+    unsafe { alloc::alloc::dealloc(extra, layout) };
+    drop(ptrs);
 
     Ok(())
 }

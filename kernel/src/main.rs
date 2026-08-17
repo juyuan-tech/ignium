@@ -120,8 +120,11 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     );
     // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
     // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。
+    // LOW-3(审计 17 轮):idle 无 yield 路径,退出线程的栈在此回收
+    // (在 idle 自己的栈上释放他人栈,C2 安全)。
     let mut last_tick = 0u64;
     loop {
+        sched::drain_reaper();
         arch::wait_for_interrupt();
         let t = crate::logger::tick();
         // wrapping_sub(L3):tick 回绕/损坏时避免减法下溢导致

@@ -77,8 +77,9 @@ pub struct BuddyAllocator {
 // 为内核全程 —— 跨上下文传递安全(供 SpinLock<T: Send> 的 Sync 约束)。
 unsafe impl Send for BuddyAllocator {}
 
-/// 分配器单例访问:SpinLock 互斥 + 闭包封装(HIGH-1)。
-/// 每次操作恰好一个 `&mut`;ISR 内禁止调用(死锁,见 sync.rs 约束)。
+/// 分配器单例访问:IRQ 安全 SpinLock(MED-3/审计 17 轮:自旋锁
+/// 内部保存/恢复 SIE,持锁临界区不被抢占,消除 convoy)。
+/// 每次操作恰好一个 `&mut`;ISR 零分配(容量预留),无 ISR 竞争路径。
 fn with_allocator<T>(f: impl FnOnce(&mut BuddyAllocator) -> T) -> T {
     f(&mut ALLOCATOR.lock())
 }
@@ -440,7 +441,12 @@ pub fn free_pages(addr: usize) -> Result<(), ()> {
 ///
 /// 用非 volatile 裸指针写:页表初始化期间无并发读者,且编译器
 /// 无法消除对裸指针的写入(不可见副作用),无需 volatile 屏障。
-pub fn zero_page(addr: usize) {
+///
+/// # Safety
+/// `addr` 必须是页对齐且可写(由 `alloc_pages` 分配、未释放)的
+/// 物理地址 —— 写 4KB 字节。安全代码不得以任意地址调用
+/// (LOW-1/审计 17 轮:原 safe fn 允许安全代码损坏任意内存)。
+pub unsafe fn zero_page(addr: usize) {
     debug_assert!(addr.is_multiple_of(PAGE_SIZE));
     let p = addr as *mut u64;
     for i in 0..PAGE_SIZE / core::mem::size_of::<u64>() {

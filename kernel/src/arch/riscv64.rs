@@ -82,12 +82,18 @@ pub struct CpuState {
     pub satp: usize,
 }
 
-extern "C" {
+unsafe extern "C" {
     // 纯汇编实现(riscv64.S)。为什么不用内联汇编:读取 ra/sp/gp/tp
     // 而不声明操作数在 Rust 内联汇编中是形式 UB,见 riscv64.S 注释。
     fn cpu_state_asm(out: *mut CpuState);
     // 协作线程切换(riscv64.S):保存调用者保存寄存器,加载新上下文。
-    pub fn context_switch(old: *mut Context, new: *const Context);
+    // 安全调用者须保证指针有效且中断关闭(由 sched 封装保证)。
+    // LOW-2(审计 17 轮):unsafe 声明 —— 安全代码不得以无效指针调用。
+    pub unsafe fn context_switch(old: *mut Context, new: *const Context);
+    // 从全量陷阱帧恢复并以 sret 进入(riscv64.S;与 trap_vector 恢复
+    // 路径相同,含 sscratch 恒置陷阱栈顶)。用于恢复**仅帧有效**
+    // 的线程(被抢占后未再 yield 的线程)。永不返回。
+    pub unsafe fn frame_restore(frame: *mut usize);
     // trap_vector 的符号地址(riscv64.S 中定义,16 字节对齐)。
     static trap_vector: u8;
     // 陷阱栈边界(linker.ld 定义):异常处理器的专用栈,帧压在其上。

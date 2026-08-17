@@ -85,7 +85,8 @@ unsafe fn ensure_table(parent: *const u64, idx: usize) -> Result<*const u64, ()>
         Ok(sub as *const u64)
     } else {
         let page = mem::alloc_pages(0).ok_or(())?;
-        mem::zero_page(page);
+        // SAFETY:`page` 为 alloc_pages 原样返回(页对齐、可写)。
+        unsafe { mem::zero_page(page) };
         pte_write(parent, idx, pte(page, PTE_V));
         Ok(page as *const u64)
     }
@@ -153,7 +154,8 @@ const PTE_LEAF_RW: u64 = PTE_V | PTE_R | PTE_W | PTE_A | PTE_D;
 pub fn init() {
     // 根表:buddy order-0 页(4KB 对齐,满足 PPN 要求)。
     let root = mem::alloc_pages(0).expect("root page table allocation failed");
-    mem::zero_page(root);
+    // SAFETY:`root` 为 alloc_pages 原样返回(页对齐、可写)。
+    unsafe { mem::zero_page(root) };
 
     // RAM 身份映射:2MB 超页,RWX + A/D(supervisor-only,U=0)。
     // M1.5 细化:内核镜像按 代码 RX / 数据 RW 拆分权限。

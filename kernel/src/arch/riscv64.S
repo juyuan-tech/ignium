@@ -130,16 +130,14 @@ trap_vector:
     beqz a0, 1f
     # ===== 恢复路径 =====
     mv t6, a0
-    # CRITICAL-3(审计 16 轮):sscratch 只在帧位于**陷阱栈**时复位
-    # 为栈顶 —— 抢占切换的帧在堆里(线程 TCB),把 sscratch 设成
-    # 堆地址会让下次 trap 的嵌套检测误判"嵌套"而停机。
-    # 判断:帧 + 帧长 == 陷阱栈顶。
+    # CRITICAL-3(审计 16 轮)+ CRITICAL-1(审计 17 轮):sscratch
+    # **恒置为陷阱栈顶** —— 无论帧在陷阱栈还是线程 TCB:
+    # - 陷阱栈帧:复位防栈顶漂移;
+    # - TCB 帧(抢占切换):上次修复"仅陷阱栈帧复位"导致被抢占
+    #   线程恢复后 sscratch 停在旧帧底,下次 trap 嵌套检测误判
+    #   "第一层"而把栈顶向下漂移 288,逐次累积耗尽陷阱栈。
     la t0, _trap_stack_top
-    addi t1, t6, TRAP_FRAME_SIZE
-    bne t1, t0, 3f
-    # 陷阱栈帧:复位 sscratch 为栈顶,防栈顶漂移。
     csrw sscratch, t0
-3:
     # 恢复 sstatus:清掉 SIE 位再写回 —— sret 时硬件用 SPIE(硬件在
     # trap 入口置 1)恢复 SIE,从而"原子地"重新使能中断,避免在
     # sret 前被打断(被打断时帧已部分恢复,会产生双重恢复错误)。
@@ -241,6 +239,67 @@ context_switch:
     ld s10, 96(a1)
     ld s11, 104(a1)
     ret
+
+# ---------------------------------------------------------------------------
+# frame_restore:从全量陷阱帧恢复并以 sret 进入(不返回)。
+#
+# 用途:协作路径(yield/block/exit)选中"仅帧有效"的线程(如刚被
+# 抢占的 idle)时 —— 该线程的恢复机制是 sret(抢占点),与
+# context_switch 的 ctx 恢复互补(审计 17 轮 MED-1)。
+# 帧槽位与陷阱帧一致(31 GPR + sstatus/sepc)。
+#
+# C ABI:void frame_restore(*mut usize frame);永不返回。
+# ---------------------------------------------------------------------------
+.align 2
+.globl frame_restore
+frame_restore:
+    mv t6, a0
+    # 关中断保护恢复过程;SIE 由帧 sstatus 经 sret 原子恢复。
+    csrci sstatus, 2
+    # CRITICAL-1(审计 17 轮):sscratch 恒置陷阱栈顶 —— 与 trap_vector
+    # 恢复路径一致。若沿用被恢复线程上次 trap 的帧底,下次 trap 的
+    # 嵌套检测会把本帧当作"第二层"而停机。
+    .option norelax
+    la t0, _trap_stack_top
+    .option relax
+    csrw sscratch, t0
+    ld t0, 32*8(t6)
+    andi t0, t0, -3
+    csrw sstatus, t0
+    ld t0, 33*8(t6)
+    csrw sepc, t0
+    ld ra, 0*8(t6)
+    ld sp, 1*8(t6)
+    ld gp, 2*8(t6)
+    ld tp, 3*8(t6)
+    ld t0, 4*8(t6)
+    ld t1, 5*8(t6)
+    ld t2, 6*8(t6)
+    ld s0, 7*8(t6)
+    ld s1, 8*8(t6)
+    ld a0, 9*8(t6)
+    ld a1, 10*8(t6)
+    ld a2, 11*8(t6)
+    ld a3, 12*8(t6)
+    ld a4, 13*8(t6)
+    ld a5, 14*8(t6)
+    ld a6, 15*8(t6)
+    ld a7, 16*8(t6)
+    ld s2, 17*8(t6)
+    ld s3, 18*8(t6)
+    ld s4, 19*8(t6)
+    ld s5, 20*8(t6)
+    ld s6, 21*8(t6)
+    ld s7, 22*8(t6)
+    ld s8, 23*8(t6)
+    ld s9, 24*8(t6)
+    ld s10, 25*8(t6)
+    ld s11, 26*8(t6)
+    ld t3, 27*8(t6)
+    ld t4, 28*8(t6)
+    ld t5, 29*8(t6)
+    ld t6, 30*8(t6)
+    sret
 
 # ---------------------------------------------------------------------------
 # cpu_state_asm:CpuState 快照读取(纯汇编实现)。
