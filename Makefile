@@ -42,6 +42,7 @@ gdb: build
 # 冒烟测试:运行满 10s,收集完整输出,断言:
 #   1) 出现 "M0: boot ok"(成功启动)
 #   2) 出现 "buddy allocator selftest ok"(物理内存分配器自检通过)
+#   2b)出现 "Sv39 paging ok"(页表 + 身份映射 + satp 切换成功)
 #   3) 出现 **至少 2 条** "uptime:"(定时器中断 + sret 恢复链路持续
 #      存活;单条可能是"第一跳后定时器死亡"的假阳性,pro 审计 #6)
 #   4) 未出现 "KERNEL PANIC" 或 "TRAP:"(启动后无故障)
@@ -51,6 +52,7 @@ test: build
 	@timeout 10 $(QEMU) $(QEMUARGS) -kernel $(KERNEL_ELF) > /tmp/ignium-test.log 2>&1 || true
 	@grep -q "M0: boot ok" /tmp/ignium-test.log \
 		&& grep -q "buddy allocator selftest ok" /tmp/ignium-test.log \
+		&& grep -q "Sv39 paging ok" /tmp/ignium-test.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-test.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
 		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)

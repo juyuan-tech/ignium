@@ -25,9 +25,9 @@ pub const MAX_ORDER: usize = 12;
 const FREE_NONE: usize = usize::MAX;
 
 /// QEMU virt 默认 128MB RAM(与 `-m 128M` 一致;真机/FDT 定尺寸为
-/// M1.5 工作,届时替换 RAM_END 来源)。
-const RAM_START: usize = 0x8000_0000;
-const RAM_END: usize = RAM_START + 128 * 1024 * 1024;
+/// M1.5 工作,届时替换 RAM_END 来源)。mmu.rs 的身份映射复用此区间。
+pub const RAM_START: usize = 0x8000_0000;
+pub const RAM_END: usize = RAM_START + 128 * 1024 * 1024;
 
 /// 元数据数组覆盖最大可能的页数(RAM_START 起算)。
 const MAX_PAGES: usize = (RAM_END - RAM_START) / PAGE_SIZE;
@@ -375,6 +375,15 @@ pub fn alloc_pages(order: usize) -> Option<usize> {
 /// 未分配页、预留区、越界页)返回 Err。
 pub fn free_pages(addr: usize) -> Result<(), ()> {
     allocator().free(addr)
+}
+
+/// 整页清零(页表页等需要确定初始内容的内存)。
+pub fn zero_page(addr: usize) {
+    debug_assert!(addr.is_multiple_of(PAGE_SIZE));
+    let p = addr as *mut u64;
+    for i in 0..PAGE_SIZE / core::mem::size_of::<u64>() {
+        unsafe { core::ptr::write_volatile(p.add(i), 0) };
+    }
 }
 
 /// 分配器自检:验证分配/释放/合并/对齐,失败返回错误描述。

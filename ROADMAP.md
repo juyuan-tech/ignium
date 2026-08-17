@@ -24,6 +24,7 @@
 | trap/异常处理(stvec,中断/异常区分,寄存器 dump) | ✅ 完成:陷阱栈 + 可重入 + 完整帧 + sret 恢复 |
 | 定时器中断(SBI set_timer)+ 时钟计数 | ✅ 完成:10ms 节拍,uptime 每秒 +100 tick 实测 |
 | 物理内存 buddy allocator | ✅ 完成:4KB 页 / order 0-12,自检(分配/释放/合并/对齐/双释放)通过 |
+| Sv39 页表 + 内核自身映射 | ✅ 完成:身份映射(2MB 超页 RAM + UART 4KB),satp 切换 + sfence,自检通过 |
 | Sv39 页表 + 内核自身映射 | arch_mmu_map 接口 |
 | 内核堆(slab)+ alloc 稳定 | 内核内 Vec 可用 |
 | 上下文切换 arch_thread_switch | 多线程交替打印无错 |

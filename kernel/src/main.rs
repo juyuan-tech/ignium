@@ -16,6 +16,7 @@
 mod arch;
 mod logger;
 mod mem;
+mod mmu;
 mod panic;
 mod sbi;
 mod uart;
@@ -63,6 +64,16 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
             mem::page_count() * 4
         ),
         Err(e) => panic!("buddy allocator selftest failed: {e}"),
+    }
+    // Sv39 页表 + 内核自身映射(身份映射)并自检。
+    // 须在 irq_enable 之前:中断路径依赖映射成立。
+    mmu::init();
+    match mmu::self_test() {
+        Ok(()) => info!(
+            "M1: Sv39 paging ok (identity map, satp root={:#x})",
+            mmu::satp()
+        ),
+        Err(e) => panic!("Sv39 paging selftest failed: {e}"),
     }
     arch::irq_enable();
     info!(
