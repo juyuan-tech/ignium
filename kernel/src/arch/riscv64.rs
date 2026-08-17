@@ -7,7 +7,6 @@ use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error;
-use crate::warn;
 
 // 架构汇编:引导陷阱向量(trap_vector)与 CPU 状态读取(cpu_state_asm)。
 // 具体约定见 riscv64.S 头部注释。
@@ -224,10 +223,12 @@ pub fn enable_timer() {
     }
     let deadline = get_time() + TIMER_INTERVAL;
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
-    // 首次编程失败则告警(此后 tick 冻结,uptime 日志会进一步暴露)。
-    if crate::sbi::set_timer(deadline) != 0 {
-        warn!("sbi_set_timer failed at boot");
-    }
+    // 首次编程失败 = 内核失去节拍源(M1):warn+挂死不如明确失败,
+    // panic 输出完整诊断后停机(CI 负向断言也能捕获)。
+    assert!(
+        crate::sbi::set_timer(deadline) == 0,
+        "sbi_set_timer failed at boot"
+    );
 }
 
 /// 空闲等待:wfi 令 CPU 进入低功耗等待;若中断被使能,等待可被唤醒。

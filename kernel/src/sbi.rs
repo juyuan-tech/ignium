@@ -33,8 +33,16 @@ pub fn set_timer(stime_value: usize) -> usize {
             in("a7") SBI_EXT_TIME,
             in("a6") 0,
             in("a0") stime_value,
+            // SBI 调用约定(M4):调用方必须假定 a0-a7 全部被覆写,
+            // 编译器可能在这些寄存器里保存活跃值。
             lateout("a0") error,
             lateout("a1") _,
+            lateout("a2") _,
+            lateout("a3") _,
+            lateout("a4") _,
+            lateout("a5") _,
+            lateout("a6") _,
+            lateout("a7") _,
             options(nostack)
         );
     }

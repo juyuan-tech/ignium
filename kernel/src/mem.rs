@@ -155,29 +155,58 @@ impl BuddyAllocator {
             m.order = MAX_ORDER as u8;
             m.used = true; // 永久占用,永不出链
         }
-        // 只把**完整落在 real_count 内**的块入链(HIGH#1):尾部
-        // 跨入补齐页的"半块"绝不出现在空闲链表 —— 否则分配该块会
-        // 把超出物理 RAM 的补齐页交给使用者(自检前的静默损坏源)。
-        // 保留区刻蚀见 carve(CRITICAL#1)。
+        // 保留区收敛到 real_count(自审回归):FDT 区间若越过 RAM
+        // 末尾,不收敛会使 re > page_count,其后所有块被 carve 误判
+        // 为"完全在保留区内"而永久占用。
+        let reserved = (reserved.0.min(count), reserved.1.min(count));
+        if reserved.0 >= reserved.1 {
+            // 无有效保留区:整区入链。先按 order-12 放完整块,
+            // 尾部不足 16MB 的部分按小阶块入链(回收尾部内存,M2)。
+            let mut idx = 0usize;
+            while idx + order_size <= count {
+                self.push(idx, MAX_ORDER);
+                idx += order_size;
+            }
+            while idx < count {
+                let order = (count - idx).ilog2().min(MAX_ORDER as u32) as usize;
+                self.push(idx, order);
+                idx += 1usize << order;
+            }
+            return;
+        }
+        // 自顶向下刻蚀建链:交叠块递归拆分,直到与保留区完全对齐
+        // (CRITICAL#1:只改元数据会把含保留区的块留在链表上)。
         self.carve(0, MAX_ORDER, reserved);
     }
 
     /// 递归刻蚀:构建空闲链表,同时把保留区页标记为永久占用。
     ///
     /// 块(页区间 `[idx, idx + 2^order)`):
+    /// - **进入补齐区**(`s >= real_count`)→ 跳过(init 已标记占用)
+    /// - **跨过补齐边界**(`e > real_count`)→ 拆分,只入链界内部分
     /// - 与保留区**无交叠** → 整块入链
     /// - **完全在**保留区内 → 标记 order=0xFF 永久占用
     /// - **部分交叠** → 拆成两个子块递归处理
     ///
-    /// 由于块总是完整落在 real_count 内(上层已约束保留区上界),
-    /// 此处无需再关心补齐页。
+    /// 补齐区与保留区的处理共同保证:任何入链块都完整落在
+    /// `[0, real_count)` 真实物理页内(HIGH#1)。
     fn carve(&mut self, idx: usize, order: usize, reserved: (usize, usize)) {
         let (rs, re) = reserved;
         let size = 1usize << order;
         let s = idx;
         let e = idx + size;
+        if s >= self.real_count {
+            // 完全在补齐区:init 已标记 order=MAX_ORDER+used,跳过。
+            return;
+        }
+        if e > self.real_count {
+            // 跨过补齐边界:拆分到界内(补齐区部分自然被排除)。
+            self.carve(idx, order - 1, reserved);
+            self.carve(idx + (size >> 1), order - 1, reserved);
+            return;
+        }
         if e <= rs || s >= re {
-            // 完全在保留区外 → 入链(补齐页问题已由上层保证)。
+            // 完全在保留区外 → 入链。
             self.push(idx, order);
             return;
         }
@@ -312,9 +341,9 @@ pub fn init(fdt: usize) {
         panic!("no physical memory available for allocator");
     }
     let count = (RAM_END - base) / PAGE_SIZE;
-    // 保留区 = FDT 页区间(饱和算术防溢出,超出分配区的部分由
-    // init 内部收敛,pro 审计 #2)。
-    let fdt_start = fdt.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    // 保留区 = FDT 页区间(H1:起点**向下**取整 —— 指针未页对齐时
+    // 也必须保护其所在页;终点向上取整;饱和算术防溢出)。
+    let fdt_start = fdt / PAGE_SIZE * PAGE_SIZE;
     let fdt_end = fdt.saturating_add(FDT_RESERVE_SIZE);
     let rs = fdt_start.saturating_sub(base) / PAGE_SIZE;
     let re = fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE);
