@@ -26,7 +26,12 @@ _start:
     mv tp, a0
     # 清洗引导器遗留的陷阱状态(L1):stvec/sscratch 置零,
     # 防止早期 trap 跳到陈旧向量/使用陈旧陷阱栈指针。
-    csrw stvec, zero
+    # 然后立即安装"早期停机 stub":在 init_traps() 之前发生任何
+    # 异常 → 关中断停机(而不是跳到地址 0 乱跑,M3 陷阱窗口)。
+    .option norelax
+    la t0, early_trap
+    .option relax
+    csrw stvec, t0
     csrw sscratch, zero
     # 若上一级引导(或 SBI)遗留了分页开启状态,不清 satp 会带着
     # 残留页表执行,立即崩溃。写入 0 = Bare 模式(直接物理寻址)。
@@ -71,3 +76,11 @@ _start:
 park:
     wfi
     j park
+
+# 早期陷阱停机 stub(init_traps 之前由 stvec 指向):
+# 引导期任何异常都不可恢复,直接关中断停机,避免跳到地址 0。
+.align 2
+early_trap:
+    csrci sstatus, 2
+    wfi
+    j early_trap

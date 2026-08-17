@@ -336,7 +336,7 @@ pub fn init(fdt: usize) {
     // 相对 base 的对齐,绝对地址对齐要求 base 本身对齐到最大块
     // (自检实测抓到:base 仅页对齐时,order-3 块绝对地址不 32KB 对齐,
     // 未来页表/超页/DMA 都需要绝对对齐)。
-    let raw = unsafe { &_alloc_start as *const u8 as usize };
+    let raw = (&raw const _alloc_start).addr();
     let max_block = (1usize << MAX_ORDER) * PAGE_SIZE;
     let base = raw.div_ceil(max_block) * max_block;
     if base >= RAM_END {
@@ -352,9 +352,10 @@ pub fn init(fdt: usize) {
     with_allocator(|a| unsafe { a.init(base, count, (rs, re)) });
 }
 
-/// 可分配页数。
+/// 真实可分配页数(不含补齐页;I2:报告给调用方的应是真实数,
+/// 而非含永久占用补齐页的 padded 值)。
 pub fn page_count() -> usize {
-    with_allocator(|a| a.page_count)
+    with_allocator(|a| a.real_count)
 }
 
 /// 分配 2^order 页,返回物理地址。

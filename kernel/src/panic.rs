@@ -58,10 +58,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// (陷阱栈)。水位扫描必须针对**当前栈**,否则会得到误导性结果
 /// (pro 审计 max #6:旧实现只扫引导栈,陷阱栈 panic 时报 0 已用)。
 fn current_stack_bounds(sp: usize) -> (usize, usize) {
-    let boot_bottom = unsafe { &_stack_bottom as *const u8 as usize };
-    let boot_top = unsafe { &_stack_top as *const u8 as usize };
-    let trap_bottom = unsafe { &_trap_stack_bottom as *const u8 as usize };
-    let trap_top = unsafe { &_trap_stack_top as *const u8 as usize };
+    let boot_bottom = (&raw const _stack_bottom).addr();
+    let boot_top = (&raw const _stack_top).addr();
+    let trap_bottom = (&raw const _trap_stack_bottom).addr();
+    let trap_top = (&raw const _trap_stack_top).addr();
     if sp >= trap_bottom && sp < trap_top {
         (trap_bottom, trap_top)
     } else {

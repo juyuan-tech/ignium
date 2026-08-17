@@ -111,7 +111,7 @@ pub fn init_traps() {
         // (trap_vector 在汇编中以 .align 4 = 16 字节对齐)。
         asm!(
             "csrw stvec, {}",
-            in(reg) &trap_vector as *const u8 as usize,
+            in(reg) (&raw const trap_vector).addr(),
             options(nomem, nostack)
         );
     }
@@ -283,8 +283,8 @@ pub unsafe extern "C" fn trap_handler(
     // 溢出回绕(旧写法 f+288 可回绕越过 top,导致 OOB 解引用)。
     // 必须:帧在陷阱栈内、容纳整个帧、16 字节对齐。
     let f = frame as usize;
-    let bottom = unsafe { &_trap_stack_bottom as *const u8 as usize };
-    let top = unsafe { &_trap_stack_top as *const u8 as usize };
+    let bottom = (&raw const _trap_stack_bottom).addr();
+    let top = (&raw const _trap_stack_top).addr();
     let frame_bytes = TRAP_FRAME_WORDS * 8;
     if top < bottom
         || top - bottom < frame_bytes

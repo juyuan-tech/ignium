@@ -36,8 +36,9 @@ const SUPER_PAGE: usize = 2 * 1024 * 1024;
 
 /// satp 的 Sv39 模式位。
 const SATP_MODE_SV39: usize = 8usize << 60;
-/// satp 的 PPN 字段掩码(位 0-43)。
-const SATP_PPN_MASK: usize = 0xF_FFFF_FFFF;
+/// satp 的 PPN 字段掩码(位 0-43,**44 位**;H1:此前误写为 36 位,
+/// 大内存下会截断根表地址)。
+const SATP_PPN_MASK: usize = 0xFFF_FFFF_FFFF;
 
 /// 物理地址 → PTE 中的 PPN 字段。
 #[inline]
@@ -68,11 +69,16 @@ fn pte_write(table: *const u64, idx: usize, value: u64) {
 ///
 /// # Safety
 /// `parent` 必须是有效页表地址(身份映射下可安全解引用)。
-/// 若该 PTE 已存在:取其 PPN 作为子表地址(若恰为叶子超页,
-/// 调用方负责不在其上继续下沉 —— map_4k/map_super 的索引互斥保证)。
+/// 若该 PTE 已存在:须是**表指针**(V 置位且非叶子 R/W/X),
+/// 否则返回 Err —— 叶子超页不能当作表继续下沉(H2:此前会把
+/// 超页的数据当表写,产生静默损坏)。
 unsafe fn ensure_table(parent: *const u64, idx: usize) -> Result<*const u64, ()> {
     let entry = pte_read(parent, idx);
     if entry & PTE_V != 0 {
+        if entry & (PTE_R | PTE_W | PTE_X) != 0 {
+            // 叶子(超页):不可继续下沉,调用方应 fail-loudly。
+            return Err(());
+        }
         let sub = (((entry >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as usize;
         Ok(sub as *const u64)
     } else {

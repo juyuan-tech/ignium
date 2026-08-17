@@ -36,9 +36,11 @@ SECTIONS
         *(.srodata*)
     }
 
-    /* 可写数据;锚点 __global_pointer$ 放在 .data 末尾(.sdata 之后):
-     * gp 相对寻址覆盖 ±2KB,位于末尾时其后的小数据(.sbss 等)与
-     * 其前的 .sdata 都在范围内(pro 审计 #7 注释修正) */
+    /* 可写数据;锚点 __global_pointer$(L1 诚实说明):gp 相对寻址
+     * ±2KB 只能覆盖 .data/.sdata 尾部附近的小数据;.sbss/.bss 在
+     * 2KB 之外不可达。当前 Rust 裸机目标不生成 gp 相对访问(静态
+     * 落 .data/.bss 而非小数据段),锚点仅为未来优化预留,勿期待
+     * 它覆盖 .sbss。 */
     . = ALIGN(4K);
     _data_start = .;
     .data : {
