@@ -114,6 +114,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 |---|---|
 | M0 ✓ | QEMU 启动 + UART 打印 |
 | M1 ✓ | trap/定时器/内存管理/分页/内核堆/调度/同步原语 |
+| M1.5 | 稳定化与真机准备:FDT 解析/页权限拆分/栈守护页/RVA23 P1/页表接口补全/压力自检 |
 | M2 | 用户进程 + IPC + 能力 |
 | M3 | 用户态服务 + shell |
 | M4 | 健壮性/测试 + OpenHarmony 组件移植 |

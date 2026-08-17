@@ -11,7 +11,6 @@
 | D2 | 页权限拆分(代码 RX / 数据 RW,现整体 RWX) | 多次审计 | M1.5 | 待办 |
 | D3 | 分配器加锁 | 审计 HIGH-1(12 轮):SpinLock 已引入并包装分配器;待办 = IRQ 安全变体 + ISR 分配策略 | 调度器里程碑 | 部分完成 |
 | D4 | 栈守护页(boot/trap 栈) | 审计多轮 | M1.5(MMU 已就绪) | 待办 |
-| D4 | 栈守护页(boot/trap 栈) | 审计多轮 | M1.5(MMU 已就绪) | 待办 |
 | D5 | FDT 解析(RAM/UART/时钟频率/保留区实际大小) | 审计 M4/多轮 | M1.5 | 待办 |
 | D6 | 板级常量 FDT 化(board.rs 为唯一落点) | 审计 11 轮 M4 | 随 D5 | 待办 |
 | D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前 | 待办 |
@@ -20,8 +19,6 @@
 | D10 | 用户页交接前清零(防信息泄漏) | 审计 M4(mem.rs) | M2 用户态 | 待办 |
 | D11 | ISR 内分配安全(与 D3 配套,防死锁) | 优化报告遗留风险 | 调度器里程碑 | **部分完成**:调度器临界区已 irq_save/restore(M1);ISR 内分配仍禁止 |
 | D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办 |
-| D13 | 内核堆(slab)—— 使 `Vec`/`Box` 可用 | ROADMAP M1 | 下一步 | **已关闭**:M1 完成(slab 8 档 + 页路径 + global_allocator) |
-| D14 | 上下文切换 + 调度器 + 同步原语 | ROADMAP M1 | D13 之后 | **已关闭**:M1 完成(协作+抢占调度 / Mutex / Condvar);公平性与统计留待 M2 |
 | D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办 |
 | D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | 待办 |
 
@@ -32,6 +29,8 @@
 | D-旧 | boot 定时器失败 warn 改 panic | 审计 11 轮 M1 已修 |
 | D-旧 | self_test 固定数组改链表 | 审计 11 轮 M2 已修 |
 | D-旧 | SBI a2-a7 clobber 声明 | 审计 9 轮 M1 已修 |
+| D13 | 内核堆(slab)—— 使 `Vec`/`Box` 可用 | M1 完成(slab 8 档 + 页路径 + global_allocator) |
+| D14 | 上下文切换 + 调度器 + 同步原语 | M1 完成(协作+抢占调度 / Mutex / Condvar);公平性与统计留待 M2 |
 
 ## 纪律
 
