@@ -33,15 +33,39 @@
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-const UART_BASE: usize = crate::board::UART_BASE;
-#[allow(clippy::identity_op)] // 显式写出偏移 0x00,与寄存器手册对应
-const UART_DLL: usize = UART_BASE + 0x00;
-const UART_DLM: usize = UART_BASE + 0x01;
-const UART_IER: usize = UART_BASE + 0x01;
-const UART_FCR: usize = UART_BASE + 0x02;
-const UART_LCR: usize = UART_BASE + 0x03;
-const UART_MCR: usize = UART_BASE + 0x04;
-const UART_LSR: usize = UART_BASE + 0x05;
+#[inline]
+fn uart_base() -> usize {
+    crate::board::uart_base()
+}
+#[allow(clippy::identity_op)]
+#[inline]
+fn uart_dll() -> usize {
+    uart_base() + 0x00
+}
+#[inline]
+fn uart_dlm() -> usize {
+    uart_base() + 0x01
+}
+#[inline]
+fn uart_ier() -> usize {
+    uart_base() + 0x01
+}
+#[inline]
+fn uart_fcr() -> usize {
+    uart_base() + 0x02
+}
+#[inline]
+fn uart_lcr() -> usize {
+    uart_base() + 0x03
+}
+#[inline]
+fn uart_mcr() -> usize {
+    uart_base() + 0x04
+}
+#[inline]
+fn uart_lsr() -> usize {
+    uart_base() + 0x05
+}
 
 /// `fmt::Write` 实现,把格式化输出导向串口(日志系统与 println! 共用)。
 pub struct Writer;
@@ -80,7 +104,7 @@ unsafe fn write_u8(addr: usize, val: u8) {
 /// LSR 位 5 = THR 空(发送保持寄存器可写)。
 #[inline]
 fn is_transmit_empty() -> bool {
-    unsafe { read_u8(UART_LSR) & 0x20 != 0 }
+    unsafe { read_u8(uart_lsr()) & 0x20 != 0 }
 }
 
 /// 初始化串口为 8N1、FIFO 开启、关中断。
@@ -96,16 +120,16 @@ fn is_transmit_empty() -> bool {
 /// 计算,见模块头"平台依赖")。
 pub fn init() {
     unsafe {
-        write_u8(UART_LCR, 0x80);
+        write_u8(uart_lcr(), 0x80);
         mmio_fence();
-        write_u8(UART_DLL, 0x0C);
-        write_u8(UART_DLM, 0x00);
+        write_u8(uart_dll(), 0x0C);
+        write_u8(uart_dlm(), 0x00);
         mmio_fence();
-        write_u8(UART_LCR, 0x03);
+        write_u8(uart_lcr(), 0x03);
         mmio_fence();
-        write_u8(UART_IER, 0x00);
-        write_u8(UART_FCR, 0x07);
-        write_u8(UART_MCR, 0x03);
+        write_u8(uart_ier(), 0x00);
+        write_u8(uart_fcr(), 0x07);
+        write_u8(uart_mcr(), 0x03);
     }
 }
 
@@ -133,7 +157,7 @@ pub fn putc(c: u8) {
         // 写前屏障(MED#3):LSR 读 → THR 写 的定序,乱序核上
         // 防止 LSR 轮询结果与本次写交错。
         mmio_fence();
-        write_u8(UART_BASE, c);
+        write_u8(uart_base(), c);
         // 写后屏障:保证后续 LSR 轮询观察到本次写已到达设备。
         mmio_fence();
     }

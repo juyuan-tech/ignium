@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod arch;
 mod board;
+mod fdt;
 mod heap;
 mod logger;
 mod mem;
@@ -72,10 +73,16 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         "M0: boot ok - arch: riscv64, machine: qemu-virt, hartid={}, fdt={:#x}",
         hartid, fdt as usize
     );
+    // FDT 解析:板级参数(RAM/UART/定时器频率/保留区),须在 mem::init 之前。
+    let fdt_params = crate::fdt::Fdt::new(fdt as usize)
+        .as_ref()
+        .map(|f| f.parse())
+        .unwrap_or_default();
+    board::init_from_fdt(&fdt_params);
     // 物理内存初始化(含 FDT 保留区刻蚀)+ 自检。
     // 分配器(M1):IRQ 安全 SpinLock(MED-3),持锁不被抢占;
     // 此项自检须在 irq_enable 之前(避免定时器与自检交错)。
-    mem::init(fdt as usize);
+    mem::init(&fdt_params);
     match mem::self_test() {
         Ok(()) => info!(
             "M1: buddy allocator selftest ok ({} KiB managed)",
@@ -118,7 +125,7 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     arch::irq_enable();
     info!(
         "M1: timer enabled ({}us interval), interrupts on",
-        arch::TIMER_INTERVAL / 10
+        arch::timer_interval() / 10
     );
     // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
     // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。

@@ -28,11 +28,6 @@ const PTE_PPN_SHIFT: u64 = 10;
 /// PPN 44 位掩码。
 const PTE_PPN_MASK: u64 = (1u64 << 44) - 1;
 
-/// RAM 区域(与 board.rs 保持一致,身份映射)。
-const RAM_START: usize = crate::board::RAM_START;
-const RAM_END: usize = crate::board::RAM_END;
-/// UART MMIO 区域(身份映射;基址与 board.rs/uart.rs 一致,4KB 页)。
-const UART_MMIO: usize = crate::board::UART_BASE;
 /// 2MB 超页。
 const SUPER_PAGE: usize = 2 * 1024 * 1024;
 
@@ -159,14 +154,17 @@ pub fn init() {
 
     // RAM 身份映射:2MB 超页,RWX + A/D(supervisor-only,U=0)。
     // M1.5 细化:内核镜像按 代码 RX / 数据 RW 拆分权限。
-    let mut vaddr = RAM_START;
-    while vaddr < RAM_END {
+    let ram_start = crate::board::ram_start();
+    let ram_end = crate::board::ram_end();
+    let mut vaddr = ram_start;
+    while vaddr < ram_end {
         map_super(root, vaddr, vaddr, PTE_LEAF_RWX).expect("RAM superpage mapping failed");
         vaddr += SUPER_PAGE;
     }
 
     // UART MMIO 身份映射:4KB,RW + A/D(无 X;MMIO 不应执行代码)。
-    map_4k(root, UART_MMIO, UART_MMIO, PTE_LEAF_RW).expect("UART MMIO mapping failed");
+    let uart_base = crate::board::uart_base();
+    map_4k(root, uart_base, uart_base, PTE_LEAF_RW).expect("UART MMIO mapping failed");
 
     enable(root);
     debug!("satp switched to Sv39, root={:#x}", root);
@@ -183,7 +181,7 @@ pub fn self_test() -> Result<(), &'static str> {
     //    注意:不能用 0x80000000 做写探针 —— 那是 OpenSBI 固件区,
     //    PMP 禁止 S 模式访问(实测 cause=7 访问故障,映射本身正确)。
     //    MED-13(审计 15 轮):基址走 board 常量,不做地址硬编码。
-    let lsr_addr = (crate::board::UART_BASE + 5) as *const u8;
+    let lsr_addr = (crate::board::uart_base() + 5) as *const u8;
     let lsr = unsafe { core::ptr::read_volatile(lsr_addr) };
     if lsr & 0x20 == 0 {
         return Err("UART identity mapping read failed");

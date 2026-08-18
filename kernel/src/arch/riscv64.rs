@@ -220,8 +220,11 @@ pub fn get_time() -> usize {
     t
 }
 
-/// 定时器节拍间隔(10ms):由板级常量给出(QEMU virt = 10 MHz)。
-pub const TIMER_INTERVAL: usize = crate::board::TIMER_INTERVAL;
+/// 定时器节拍间隔(10ms)。
+#[inline]
+pub fn timer_interval() -> usize {
+    crate::board::timer_interval()
+}
 
 /// 下一次定时器中断的截止时间(mtimer 周期)。
 ///
@@ -269,7 +272,7 @@ pub fn enable_timer() {
         // 内存屏障,防止与后续 ecall 重排。
         asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nostack));
     }
-    let deadline = get_time().wrapping_add(TIMER_INTERVAL);
+    let deadline = get_time().wrapping_add(timer_interval());
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
     // SSTC 直写 stimecmp(性能优化):替代每 tick 的 SBI ecall(M 模式
     // 往返,几百周期)。QEMU virt 与 RVA23 强制平台均支持;无 SSTC
@@ -379,8 +382,8 @@ pub unsafe extern "C" fn trap_handler(
                 // SSTC 直写 stimecmp(替代 ecall,见 enable_timer)。
                 crate::logger::tick_up();
                 let next = TIMER_DEADLINE
-                    .fetch_add(TIMER_INTERVAL, Ordering::Relaxed)
-                    .wrapping_add(TIMER_INTERVAL);
+                    .fetch_add(timer_interval(), Ordering::Relaxed)
+                    .wrapping_add(timer_interval());
                 set_stimecmp(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程
                 // 的帧指针,汇编恢复路径据此 sret 进入新线程

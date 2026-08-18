@@ -17,6 +17,7 @@
 //! - ISR 仍**零分配**(ISR 零分配约定,D11 容量预留兜底);分配
 //!   器锁为 IRQ 安全变体,唤醒不会在中断恢复后再做(无锁唤醒)。
 
+use crate::fdt;
 use crate::sync::SpinLock;
 
 /// 物理页大小(4KB)。
@@ -28,9 +29,9 @@ pub const MAX_ORDER: usize = 12;
 /// 空闲链表空指针标记。
 const FREE_NONE: usize = usize::MAX;
 
-/// 平台常量(RAM 范围等)集中在 board.rs,单文件改板。
-/// 元数据数组覆盖最大可能的页数(RAM_START 起算)。
-pub const MAX_PAGES: usize = (crate::board::RAM_END - crate::board::RAM_START) / PAGE_SIZE;
+/// 页元数据数组容量,基于 QEMU virt 默认 128MB RAM 确定。
+/// 实际可用页数由 buddy init 时的 `real_count` 决定。
+pub const MAX_PAGES: usize = 128 * 1024 * 1024 / PAGE_SIZE;
 
 /// 每页元数据:`order` = 所属块阶,`used` = 已分配。
 #[derive(Clone, Copy)]
@@ -334,42 +335,11 @@ extern "C" {
     static _alloc_start: u8;
 }
 
-/// 读取 FDT 实际大小(HIGH-2:固定 1MB 预留可能不足/过量)。
-/// 校验头部:magic=0xD00DFEED、totalsize(偏移 4)在合理范围。
-/// 无效指针/非法头 → None(调用方回退保守预留)。
-///
-/// MEDIUM-1:FDT 是**大端**布局 —— 逐字节读取后手工组装,不依赖
-/// 原生字节序(此前 read_volatile::<u32> 在小端机器上 magic 校验
-/// 恒失败,实际大小解析从未生效)。
-fn fdt_size(fdt: usize) -> Option<usize> {
-    if fdt == 0 || !fdt.is_multiple_of(4) {
-        return None;
-    }
-    unsafe fn be32(addr: usize) -> u32 {
-        let b = |o: usize| unsafe { core::ptr::read_volatile((addr + o) as *const u8) };
-        (b(0) as u32) << 24 | (b(1) as u32) << 16 | (b(2) as u32) << 8 | b(3) as u32
-    }
-    let magic = unsafe { be32(fdt) };
-    if magic != 0xD00D_FEED {
-        return None;
-    }
-    // MED-9(审计 15 轮):头部读取不得越过 RAM 末尾(靠 RAM 内的
-    // fdt 指针 + 8 字节头边界);fdt_size 只读 8 字节,校验 fdt+8。
-    if fdt.saturating_add(8) > crate::board::RAM_END {
-        return None;
-    }
-    let total = unsafe { be32(fdt + 4) } as usize;
-    if !(8..=16 * 1024 * 1024).contains(&total) {
-        return None;
-    }
-    Some(total)
-}
-
 /// 初始化物理内存管理。启动早期调用(先于 irq_enable)。
 ///
-/// `fdt` 指向引导器传入的设备树,其所在区间在建链时被刻蚀为
-/// 保留区(永久占用),防止未来分配(页表/堆)覆盖引导数据。
-pub fn init(fdt: usize) {
+/// `params` 为 FDT 解析后的板级参数(含保留区,防止分配器覆盖
+/// FDT 数据与固件保留内存)。
+pub fn init(params: &fdt::BoardParams) {
     // _alloc_start 向上对齐到**最大块(16MB)**:buddy 层级只保证
     // 相对 base 的对齐,绝对地址对齐要求 base 本身对齐到最大块
     // (自检实测抓到:base 仅页对齐时,order-3 块绝对地址不 32KB 对齐,
@@ -377,30 +347,37 @@ pub fn init(fdt: usize) {
     let raw = (&raw const _alloc_start).addr();
     let max_block = (1usize << MAX_ORDER) * PAGE_SIZE;
     let base = raw.div_ceil(max_block) * max_block;
-    if base >= crate::board::RAM_END {
+    let ram_end = crate::board::ram_end();
+    if base >= ram_end {
         panic!("no physical memory available for allocator");
     }
-    let count = (crate::board::RAM_END - base) / PAGE_SIZE;
-    // 保留区 = FDT 实际大小(HIGH-2:解析头部 totalsize,回退保守值)。
-    // HIGH-1(审计 14 轮):fdt 指针必须先做合法性校验 —— 无效指针
-    // (0/非对齐/不在 RAM 内)若仍参与区间计算,会把任意块误标为
-    // 保留(浪费内存)或破坏刻蚀不变量。无效 → 跳过保留。
+    let count = (ram_end - base) / PAGE_SIZE;
+    // 保留区:合并 FDT 解析出的所有保留项(含 FDT 自身数据区 +
+    // reserve map + 其他保留区域)。
     let (rs, re) = {
-        let ok = fdt != 0
-            && fdt.is_multiple_of(4)
-            && (crate::board::RAM_START..crate::board::RAM_END).contains(&fdt);
-        if !ok {
-            (0usize, 0usize)
+        let mut rs = count; // 默认为空(无保留)
+        let mut re = 0;
+        for i in 0..params.reserved_count {
+            let (r_addr, r_size) = params.reserved[i];
+            if r_size == 0 {
+                continue;
+            }
+            // 保留区起点向下取整,终点向上取整(页对齐后,上下文变换到 base 相对)。
+            let r_start = r_addr / PAGE_SIZE * PAGE_SIZE;
+            let r_end = r_addr.saturating_add(r_size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            // 跳过不在分配区内的保留区。
+            if r_end <= base || r_start >= ram_end {
+                continue;
+            }
+            let idx_start = r_start.saturating_sub(base) / PAGE_SIZE;
+            let idx_end = r_end.saturating_sub(base).div_ceil(PAGE_SIZE);
+            rs = rs.min(idx_start);
+            re = re.max(idx_end);
+        }
+        if rs < re {
+            (rs, re)
         } else {
-            // 起点**向下**取整(H1:指针未页对齐时也必须保护其所在页);
-            // 终点向上取整;饱和算术防溢出。
-            let reserve = fdt_size(fdt).unwrap_or(crate::board::FDT_RESERVE_SIZE);
-            let fdt_start = fdt / PAGE_SIZE * PAGE_SIZE;
-            let fdt_end = fdt.saturating_add(reserve);
-            (
-                fdt_start.saturating_sub(base) / PAGE_SIZE,
-                fdt_end.saturating_sub(base).div_ceil(PAGE_SIZE),
-            )
+            (0, 0) // 无有效保留区
         }
     };
     with_allocator(|a| unsafe { a.init(base, count, (rs, re)) });
