@@ -85,7 +85,13 @@ impl Fdt {
         if fdt == 0 || !fdt.is_multiple_of(4) {
             return None;
         }
-        if fdt.saturating_add(mem::size_of::<FdtHeader>()) > crate::board::ram_end() {
+        // 保守边界:按 RISC-V Sv39 最大物理地址(2^56 - 1)校验。
+        // 不能用 board::ram_end(此时 board 尚未初始化)。
+        let max_phys: usize = (1usize << 56) - 1;
+        if fdt
+            .checked_add(mem::size_of::<FdtHeader>())
+            .is_none_or(|end| end > max_phys)
+        {
             return None;
         }
         let base = fdt as *const u8;
@@ -124,9 +130,12 @@ impl Fdt {
         let mut params = BoardParams::empty();
         // 1) 保留 FDT 自身数据区。
         params.add_reserved(self.fdt_addr, self.total_size);
-        // 2) 读取 reserve map。
+        // 2) 读取 reserve map(带边界检查,防越界读)。
         let mut off = self.off_rsvmap;
         loop {
+            if off.checked_add(16).is_none_or(|end| end > self.total_size) {
+                break;
+            }
             let addr_hi = unsafe { be32(self.base as usize + off) };
             let addr_lo = unsafe { be32(self.base as usize + off + 4) };
             let size_hi = unsafe { be32(self.base as usize + off + 8) };
@@ -267,7 +276,7 @@ impl Fdt {
         if len == 0 {
             return None;
         }
-        let s = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(start, len)) };
+        let s = core::str::from_utf8(unsafe { core::slice::from_raw_parts(start, len) }).ok()?;
         Some(s)
     }
 }

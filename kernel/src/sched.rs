@@ -187,7 +187,12 @@ impl Scheduler {
         // 无候选:回当前线程"原地继续"(三个调用方 pick 前均已把
         // current 的 ctx 置有效;old==new 的 context_switch 即原地
         // 返回;exit 场景随后停机)。不会选中陈旧恢复数据。
-        self.current
+        // M3(审计 18 轮外部):若当前线程已退出,回 idle 防停机。
+        if self.threads[self.current].state == ThreadState::Exited {
+            self.idle
+        } else {
+            self.current
+        }
     }
 
     /// 把线程加入就绪队列。

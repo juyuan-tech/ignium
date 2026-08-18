@@ -156,6 +156,17 @@ pub fn init() {
     // M1.5 细化:内核镜像按 代码 RX / 数据 RW 拆分权限。
     let ram_start = crate::board::ram_start();
     let ram_end = crate::board::ram_end();
+    // M1(审计 18 轮外部):RAM 必须 2MB 对齐才能用超页映射。
+    assert!(
+        ram_start.is_multiple_of(SUPER_PAGE),
+        "RAM start {:#x} not 2MB-aligned, cannot use superpage mapping",
+        ram_start
+    );
+    assert!(
+        ram_end.is_multiple_of(SUPER_PAGE),
+        "RAM end {:#x} not 2MB-aligned, cannot use superpage mapping",
+        ram_end
+    );
     let mut vaddr = ram_start;
     while vaddr < ram_end {
         map_super(root, vaddr, vaddr, PTE_LEAF_RWX).expect("RAM superpage mapping failed");

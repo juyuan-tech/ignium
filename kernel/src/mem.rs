@@ -352,6 +352,13 @@ pub fn init(params: &fdt::BoardParams) {
         panic!("no physical memory available for allocator");
     }
     let count = (ram_end - base) / PAGE_SIZE;
+    // H3(审计 18 轮外部):MAX_PAGES 系静态数组容量,运行时应检查
+    // FDT 给出的 RAM 大小是否超出,防止 buddy 元数据与 slab 判别表
+    // 越界写(panic 在 debug_assert 中,release 下仍需保证)。
+    assert!(
+        count <= MAX_PAGES,
+        "RAM size ({count} pages) exceeds MAX_PAGES ({MAX_PAGES}); increase MAX_PAGES"
+    );
     // 保留区:合并 FDT 解析出的所有保留项(含 FDT 自身数据区 +
     // reserve map + 其他保留区域)。
     let (rs, re) = {

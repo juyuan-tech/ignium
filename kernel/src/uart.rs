@@ -31,11 +31,20 @@
 //! 输出,或 panic 路径使用独立的紧急输出通道。
 
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// 缓存 UART 基址(避免每次 putc 调用 board::uart_base 的跨模块开销)。
+/// 初始化后写入,此后只读(Relaxed 足够,因 init 与 putc 有 happens-before)。
+static UART_REG_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 #[inline]
 fn uart_base() -> usize {
-    crate::board::uart_base()
+    let v = UART_REG_BASE.load(Ordering::Relaxed);
+    if v != usize::MAX {
+        v
+    } else {
+        crate::board::uart_base()
+    }
 }
 #[allow(clippy::identity_op)]
 #[inline]
@@ -118,7 +127,11 @@ fn is_transmit_empty() -> bool {
 /// 串口对波特率不敏感,此处数值仅为形式正确(经典 1.8432MHz 参考
 /// 时钟下为 9600 波特,与注释"115200"不符 —— 真机必须按实际时钟
 /// 计算,见模块头"平台依赖")。
+///
+/// 缓存 UART 基址,加速后续 putc 热路径。
 pub fn init() {
+    // 缓存基址(避免每次 putc 调用 board::uart_base 的跨模块开销)。
+    UART_REG_BASE.store(crate::board::uart_base(), Ordering::Relaxed);
     unsafe {
         write_u8(uart_lcr(), 0x80);
         mmio_fence();
