@@ -8,6 +8,12 @@
 //! - **UART MMIO**:4KB 映射(RW,无 X)。
 //! - 页表页从 buddy 分配(order-0),逐级按需创建并清零。
 //!
+//! # 公开接口
+//! - `init` / `self_test` —— 初始化与验证
+//! - `satp` / `tlb_flush` —— 页表基址与 TLB 操作
+//! - `map_4k` / `unmap_4k` —— 单页映射/取消映射
+//! - `map_region_4k` —— 区域映射(4KB 粒度)
+//!
 //! # 架构隔离
 //! 本模块是 RISC-V Sv39 的具体实现;x86_64 移植时在 arch 层提供
 //! 等价的 mmu 接口(见 DESIGN.md 的 arch_mmu_* 契约与 ROADMAP 阶段 5)。
@@ -240,8 +246,8 @@ fn map_region_4k(root: usize, start: usize, end: usize, flags: u64) {
 }
 
 /// 取消映射 4KB 页(写 PTE=0),使访问触发页故障。
-/// 仅对已用 4KB 页映射的区域有效(超页需先拆分,见 D4)。
-fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
+/// 仅对已用 4KB 页映射的区域有效(超页需先拆分)。
+pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
     let l2 = (vaddr >> 30) & 0x1FF;
     let l1 = (vaddr >> 21) & 0x1FF;
     let l0 = (vaddr >> 12) & 0x1FF;
@@ -250,6 +256,14 @@ fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
     let l0_t = unsafe { ensure_table(l1_t, l1)? };
     pte_write(l0_t, l0, 0);
     Ok(())
+}
+
+/// 冲刷 TLB(全部)。M2 用户态映射时使用。
+#[allow(dead_code)]
+pub fn tlb_flush() {
+    unsafe {
+        asm!("sfence.vma zero, zero", options(nostack));
+    }
 }
 
 /// 分页自检:satp 模式、身份映射读写、分页后 buddy、根表结构。

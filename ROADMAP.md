@@ -45,7 +45,7 @@
 | 页权限拆分:代码 RX / 数据 RW / MMIO RW(去除整体 RWX) | D2 | 越权访问(写代码段)触发页故障而非静默成功 |
 | 栈守护页:boot/trap 栈下方不可映射页(MMU 已就绪) | D4 | 栈溢出 → 页故障停机(而非静默损坏) | ✅ 完成:linker.ld 插入 4KB guard,mmu::init unmap |
 | RVA23 P1:编译目标 Zba/Zbb/Zbs+Zicond + CI `-cpu max` 矩阵 + ISA 探测 | D16 | 双 CPU 基线 CI 全绿;启动输出 ISA 能力表 | ✅ 完成:make test-rva23 + CI rva23 job;cpu.rs 模块;扩展编译+`-cpu max` 冒烟通过 |
-| 页表接口补全:`arch_mmu_unmap` / TLB flush 封装(接口定稳,x86 移植受益) | 前瞻(M2 前置) | 为 M2 用户态映射打底 |
+| 页表接口补全:`arch_mmu_unmap` / TLB flush 封装(接口定稳,x86 移植受益) | 前瞻(M2 前置) | 为 M2 用户态映射打底 | ✅ 完成:mmu::unmap_4k (pub) + mmu::tlb_flush,模块头文档化公开接口 |
 | 压力自检:调度/互斥高频竞争(万级锁争用、多线程交错) | 审计 13 轮建议 | 10 万次以上锁操作无丢失/重复 | ✅ 完成:sched 16线程×1000=yield 压力测试;sync 8线程×2000=互斥 16000 次操作(含偶次 yield),万级压力通过 |
 | **里程碑验收** | — | 以上全绿 → tag `v0.1.0-M1.5` |
 
