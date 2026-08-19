@@ -50,16 +50,22 @@ pub static mut BOOT_LOCK: u32 = 0;
 ///   FDT 得到 RAM/UART/定时器频率/保留区等参数(见 board::init_from_fdt)。
 ///
 /// # 初始化顺序(依赖关系,勿随意调整)
-/// 1. `arch::irq_disable` —— 在一切操作前建立确定的中断状态
+/// 1. `arch::irq_disable` —— 建立确定的中断状态
 /// 2. `arch::sanitize_csr` —— 清洗引导器遗留的 sie/sip/sstatus 位
-/// 3. `uart::init` —— 日志基础设施,必须先于任何输出
-/// 4. `arch::init_traps` —— stvec 装好之前发生异常会跳到地址 0
-///    (不可恢复),因此必须尽早;但必须在 uart 之后(陷阱日志依赖串口)
-/// 5. `arch::enable_timer` —— 定时器中断源(STIE),必须晚于陷阱向量
-/// 6. `logger::set_level` —— 日志级别,先于任何日志调用
-/// 7. `mem::init(fdt)` + 自检 —— 物理内存(含 FDT 刻蚀),须在页表前
-/// 8. `mmu::init` + 自检 —— Sv39 身份映射,须在中断使能前
-/// 9. `arch::irq_enable` —— 最后才开全局中断(中断源全部就绪之后)
+/// 3. `uart::init` —— 日志基础设施(先用默认基址,供早期输出)
+/// 4. `arch::init_traps` —— stvec 装好前异常会跳地址 0(不可恢复)
+/// 5. `arch::enable_timer` —— 定时器中断源(STIE),晚于陷阱向量
+/// 6. `logger::set_level` —— 日志级别
+/// 7. FDT 解析 + `board::init_from_fdt` —— 得到 RAM/UART/定时器/保留区
+/// 8. `crate::uart::reinit` —— 用 FDT 基址重配置串口
+/// 9. `cpu::init_from_fdt` —— 打印 ISA 能力(诊断)
+/// 10. `mem::init(&fdt_params)` + 自检 —— 物理内存(含保留区刻蚀)
+/// 11. `mmu::init` + 自检 —— Sv39 身份映射(须在中断使能前)
+/// 12. `heap::init` + 自检 —— 内核堆(slab + 页路径)
+/// 13. `sched::init` + 自检 —— 调度器(idle 线程)
+/// 14. `sync::self_test` —— 同步原语
+/// 15. bench —— 性能基线
+/// 16. `arch::irq_enable` —— 最后开全局中断(idle 线程上下文)
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     arch::irq_disable();
