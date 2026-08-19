@@ -390,7 +390,13 @@ pub unsafe extern "C" fn trap_handler(
                     .fetch_add(interval, Ordering::Relaxed)
                     .wrapping_add(interval);
                 let now = get_time();
-                let next = if ideal < now { now + interval } else { ideal };
+                // 自审:now + interval 改用 wrapping —— 与 TIMER_DEADLINE 的
+                // wrapping_add 一致,极端时间(10MHz 下 ~5.8 万年后)不 panic。
+                let next = if ideal < now {
+                    now.wrapping_add(interval)
+                } else {
+                    ideal
+                };
                 TIMER_DEADLINE.store(next, Ordering::Relaxed);
                 set_stimecmp(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程
