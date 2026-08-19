@@ -1,10 +1,10 @@
-//! Sv39 页表与内核自身映射(M1)。
+//! Sv39 页表与内核自身映射(M1.5)。
 //!
 //! # 设计
 //! - **身份映射**:虚拟地址 == 物理地址,内核无需重定位;切换 satp
 //!   后代码/数据/栈/MMIO 地址全部不变,是引导期最安全的过渡方式。
-//! - **RAM**:128MB 用 2MB 超页映射(RWX,supervisor-only,U=0);
-//!   权限细分(代码 RX / 数据 RW)列入 M1.5。
+//! - **RAM**:128MB 用 2MB 超页映射(堆/栈区域 RW,supervisor-only,U=0);
+//!   内核镜像区域按段拆分:代码 RX / 只读数据 R / 可写数据 RW。
 //! - **UART MMIO**:4KB 映射(RW,无 X)。
 //! - 页表页从 buddy 分配(order-0),逐级按需创建并清零。
 //!
@@ -139,46 +139,91 @@ fn enable(root_paddr: usize) {
 /// 置位无害;软件管理 A/D 的核(部分真机)在 A/D 为 0 时首次访问
 /// 会触发页故障,而我们的异常路径是停机 —— 建页即置位兼容两种
 /// 模型,消除真机 boot 期故障。
-const PTE_LEAF_RWX: u64 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D;
 const PTE_LEAF_RW: u64 = PTE_V | PTE_R | PTE_W | PTE_A | PTE_D;
+/// D2:代码段 RX,只读数据段 R。
+const PTE_LEAF_RX: u64 = PTE_V | PTE_R | PTE_X | PTE_A | PTE_D;
+const PTE_LEAF_R: u64 = PTE_V | PTE_R | PTE_A | PTE_D;
+
+// 链接脚本符号:内核镜像段边界(4KB 对齐)。
+extern "C" {
+    static _kernel_start: u8;
+    static _text_start: u8;
+    static _rodata_start: u8;
+    static _data_start: u8;
+    static _bss_start: u8;
+    static _kernel_end: u8;
+}
 
 /// 初始化内核自身映射并启用分页。
 ///
 /// 调用顺序:必须在 `mem::init` 之后(页表页来自 buddy)、
 /// `irq_enable` 之前(中断路径依赖映射)。
 pub fn init() {
-    // 根表:buddy order-0 页(4KB 对齐,满足 PPN 要求)。
     let root = mem::alloc_pages(0).expect("root page table allocation failed");
-    // SAFETY:`root` 为 alloc_pages 原样返回(页对齐、可写)。
     unsafe { mem::zero_page(root) };
 
-    // RAM 身份映射:2MB 超页,RWX + A/D(supervisor-only,U=0)。
-    // M1.5 细化:内核镜像按 代码 RX / 数据 RW 拆分权限。
     let ram_start = crate::board::ram_start();
     let ram_end = crate::board::ram_end();
-    // M1(审计 18 轮外部):RAM 必须 2MB 对齐才能用超页映射。
     assert!(
         ram_start.is_multiple_of(SUPER_PAGE),
-        "RAM start {:#x} not 2MB-aligned, cannot use superpage mapping",
+        "RAM start {:#x} not 2MB-aligned",
         ram_start
     );
     assert!(
         ram_end.is_multiple_of(SUPER_PAGE),
-        "RAM end {:#x} not 2MB-aligned, cannot use superpage mapping",
+        "RAM end {:#x} not 2MB-aligned",
         ram_end
     );
+
+    let kernel_start = (&raw const _kernel_start).addr();
+    let text_start = (&raw const _text_start).addr();
+    let rodata_start = (&raw const _rodata_start).addr();
+    let data_start = (&raw const _data_start).addr();
+    let kernel_end = (&raw const _kernel_end).addr();
+
+    // 1) 内核镜像前的区域(OpenSBI 固件):2MB 超页 RW。
     let mut vaddr = ram_start;
-    while vaddr < ram_end {
-        map_super(root, vaddr, vaddr, PTE_LEAF_RWX).expect("RAM superpage mapping failed");
+    while vaddr < kernel_start {
+        map_super(root, vaddr, vaddr, PTE_LEAF_RW).expect("RAM superpage failed");
         vaddr += SUPER_PAGE;
     }
 
-    // UART MMIO 身份映射:4KB,RW + A/D(无 X;MMIO 不应执行代码)。
+    // 2) 内核镜像:4KB 页,每段按权限映射。
+    map_region_4k(root, kernel_start, text_start, PTE_LEAF_RW);
+    map_region_4k(root, text_start, rodata_start, PTE_LEAF_RX);
+    map_region_4k(root, rodata_start, data_start, PTE_LEAF_R);
+    map_region_4k(root, data_start, kernel_end, PTE_LEAF_RW);
+
+    // 3) 内核镜像所在超页的剩余部分(若有):4KB RW。
+    let kernel_super_end = kernel_end.next_multiple_of(SUPER_PAGE);
+    if kernel_end < kernel_super_end {
+        map_region_4k(root, kernel_end, kernel_super_end, PTE_LEAF_RW);
+    }
+
+    // 4) 内核镜像后的 RAM:2MB 超页 RW,无 X。
+    let mut vaddr = kernel_super_end;
+    while vaddr < ram_end {
+        map_super(root, vaddr, vaddr, PTE_LEAF_RW).expect("RAM superpage failed");
+        vaddr += SUPER_PAGE;
+    }
+
+    // UART MMIO:4KB RW + A/D(无 X)。
     let uart_base = crate::board::uart_base();
     map_4k(root, uart_base, uart_base, PTE_LEAF_RW).expect("UART MMIO mapping failed");
 
     enable(root);
     debug!("satp switched to Sv39, root={:#x}", root);
+}
+
+/// 映射 [start, end) 4KB 对齐区域,每页调用 map_4k。
+fn map_region_4k(root: usize, start: usize, end: usize, flags: u64) {
+    assert!(start.is_multiple_of(4096));
+    assert!(end.is_multiple_of(4096));
+    let mut vaddr = start;
+    while vaddr < end {
+        map_4k(root, vaddr, vaddr, flags).expect("4K page mapping failed");
+        vaddr += 4096;
+    }
 }
 
 /// 分页自检:satp 模式、身份映射读写、分页后 buddy、根表结构。
