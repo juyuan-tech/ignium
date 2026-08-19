@@ -187,9 +187,15 @@ impl BuddyAllocator {
             }
             return;
         }
-        // 自顶向下刻蚀建链:交叠块递归拆分,直到与保留区完全对齐
-        // (CRITICAL#1:只改元数据会把含保留区的块留在链表上)。
-        self.carve(0, MAX_ORDER, reserved);
+        // 自顶向下刻蚀建链:对每个 order-12 块分别刻蚀,防止
+        // 仅处理首块时其余块被遗漏(C1/审计 18 轮外部:前实现只
+        // 调用一次 carve(0, MAX_ORDER, reserved),丢失所有后续块)。
+        let order_size = 1usize << MAX_ORDER;
+        let mut idx = 0;
+        while idx < count {
+            self.carve(idx, MAX_ORDER, reserved);
+            idx += order_size;
+        }
     }
 
     /// 递归刻蚀:构建空闲链表,同时把保留区页标记为永久占用。

@@ -223,8 +223,18 @@ pub fn init() {
     // 5) 栈守护页:unmap 4KB 页,使栈溢出触发页故障(而非静默损坏)。
     let stack_guard = (&raw const _stack_guard).addr();
     let trap_stack_guard = (&raw const _trap_stack_guard).addr();
-    let _ = unmap_4k(root, stack_guard);
-    let _ = unmap_4k(root, trap_stack_guard);
+    // H1(审计 18 轮外部):断言 unmap 成功,若栈跨越 2MB 边界导致
+    // ensure_table 下沉超页失败,则 panic 而非静默忽略。
+    assert!(
+        unmap_4k(root, stack_guard).is_ok(),
+        "failed to unmap stack guard page at {:#x} (crosses 2MB boundary?)",
+        stack_guard
+    );
+    assert!(
+        unmap_4k(root, trap_stack_guard).is_ok(),
+        "failed to unmap trap stack guard page at {:#x} (crosses 2MB boundary?)",
+        trap_stack_guard
+    );
 
     // UART MMIO:4KB RW + A/D(无 X)。
     let uart_base = crate::board::uart_base();
@@ -246,6 +256,7 @@ fn map_region_4k(root: usize, start: usize, end: usize, flags: u64) {
 }
 
 /// 取消映射 4KB 页(写 PTE=0),使访问触发页故障。
+/// 写 PTE 后立即冲刷 TLB,确保后续访问观察到新映射。
 /// 仅对已用 4KB 页映射的区域有效(超页需先拆分)。
 pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
     let l2 = (vaddr >> 30) & 0x1FF;
@@ -255,6 +266,10 @@ pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
     let l1_t = unsafe { ensure_table(root_t, l2)? };
     let l0_t = unsafe { ensure_table(l1_t, l1)? };
     pte_write(l0_t, l0, 0);
+    // H2(审计 18 轮外部):unmap 后立即刷新 TLB,防后续访问命中陈旧映射。
+    unsafe {
+        asm!("sfence.vma zero, zero", options(nostack));
+    }
     Ok(())
 }
 

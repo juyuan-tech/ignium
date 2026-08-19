@@ -245,6 +245,18 @@ impl KernelHeap {
         }
         let class = slab_class_of(page);
         if class != NOT_SLAB {
+            // H6(审计 18 轮外部):校验指针是否槽对齐且在页内。
+            let class_size = SLAB_SIZES[class as usize];
+            let offset = (ptr as usize) - page;
+            if offset < class_size
+                || !offset.is_multiple_of(class_size)
+                || offset + class_size > mem::PAGE_SIZE
+            {
+                panic!(
+                    "kernel heap: invalid slab pointer {:#x} (page={:#x}, class={}, offset={})",
+                    ptr as usize, page, class, offset
+                );
+            }
             // slab 槽:压回页头空闲链表。
             let header = page as *mut SlabHeader;
             unsafe {

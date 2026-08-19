@@ -188,7 +188,11 @@ impl Scheduler {
         // current 的 ctx 置有效;old==new 的 context_switch 即原地
         // 返回;exit 场景随后停机)。不会选中陈旧恢复数据。
         // M3(审计 18 轮外部):若当前线程已退出,回 idle 防停机。
-        if self.threads[self.current].state == ThreadState::Exited {
+        // H3(审计 18 轮外部):回退时若当前线程不是 Running(如
+        // Blocked),强制回 idle 避免 livelock。
+        if self.threads[self.current].state == ThreadState::Exited
+            || self.threads[self.current].state != ThreadState::Running
+        {
             self.idle
         } else {
             self.current
@@ -609,7 +613,8 @@ fn switch_target(s: &mut Scheduler, cur: usize, next: usize) -> SwitchTarget {
 /// 锁外切换(中断关闭保证原子性)。
 fn do_switch(t: &SwitchTarget) {
     if t.use_frame {
-        unsafe { arch::frame_restore(t.new_frame) }
+        // C2:frame_restore 内部先保存 old_ctx 再帧恢复,防上下文丢失。
+        unsafe { arch::frame_restore(t.new_frame, t.old_ctx) }
     } else {
         unsafe { arch::context_switch(t.old_ctx, t.new_ctx) }
     }

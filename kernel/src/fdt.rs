@@ -84,6 +84,7 @@ pub struct Fdt {
     off_struct: usize,
     off_strings: usize,
     off_rsvmap: usize,
+    size_struct: usize,
     /// FDT 数据区自身需保留(从 fdt 指针开始,共 total_size 字节)。
     fdt_addr: usize,
 }
@@ -129,6 +130,7 @@ impl Fdt {
             off_struct,
             off_strings,
             off_rsvmap,
+            size_struct,
             fdt_addr: fdt,
         })
     }
@@ -160,9 +162,12 @@ impl Fdt {
         let struct_ptr = self.base;
         let strings_ptr = self.base;
         let mut pos = self.off_struct;
+        // H5(审计 18 轮外部):结构块边界使用 size_dt_struct 而非 total_size,
+        // 防止属性值从字符串块字节中误解析。
         let struct_end = self
             .off_struct
-            .saturating_add(self.total_size - self.off_struct);
+            .saturating_add(self.size_struct)
+            .min(self.total_size);
         // 当前节点名缓冲。
         let mut current_node: [u8; 64] = [0; 64];
         let mut current_node_len = 0usize;

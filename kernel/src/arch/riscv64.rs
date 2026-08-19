@@ -93,7 +93,8 @@ unsafe extern "C" {
     // 从全量陷阱帧恢复并以 sret 进入(riscv64.S;与 trap_vector 恢复
     // 路径相同,含 sscratch 恒置陷阱栈顶)。用于恢复**仅帧有效**
     // 的线程(被抢占后未再 yield 的线程)。永不返回。
-    pub unsafe fn frame_restore(frame: *mut usize);
+    // C2(审计 18 轮外部):新增 old_ctx 参数,恢复前保存当前上下文。
+    pub unsafe fn frame_restore(frame: *mut usize, old_ctx: *mut Context);
     // trap_vector 的符号地址(riscv64.S 中定义,16 字节对齐)。
     static trap_vector: u8;
     // 陷阱栈边界(linker.ld 定义):异常处理器的专用栈,帧压在其上。

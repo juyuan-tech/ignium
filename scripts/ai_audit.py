@@ -25,10 +25,8 @@ import urllib.request
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API_URL = os.environ.get("IGNIUM_AUDIT_URL", "https://api.deepseek.com/chat/completions")
 MODEL = os.environ.get("IGNIUM_AUDIT_MODEL", "deepseek-v4-pro")
-# 推理强度:max 最彻底(耗时最长,可达 20+ 分钟);high 较快。
-# 按项目要求,默认使用 max;可经 env 临时调低。
 EFFORT = os.environ.get("IGNIUM_AUDIT_EFFORT", "max")
-TIMEOUT = 900
+TIMEOUT = 1800
 
 GLOBS = [
     "kernel/src/**/*.rs",
@@ -50,50 +48,87 @@ GLOBS = [
 INSTRUCTIONS = """\
 You are an independent external reviewer for a from-scratch operating system
 kernel. You are NOT the author. Assume the author's self-review is biased and
-incomplete. Your job is to find what the author missed.
+incomplete. Your job is to find what the author missed. Be thorough and
+exhaustive — do not stop at surface-level issues. Flag everything suspicious.
 
 Project context:
 - Language: Rust (no_std + alloc), edition 2021, toolchain pinned 1.97.1
 - Architecture: RISC-V 64 (riscv64gc), running in S-mode on QEMU virt
   machine (OpenSBI 1.3 firmware), kernel linked at 0x80200000
-- Stage: **M1 complete** (trap/timer/buddy/Sv39 paging/kernel heap/
-  cooperative+preemptive scheduler/Mutex+Condvar). Boot runs a full
-  selftest suite: buddy, Sv39, heap, scheduler (cooperative + tick-based
-  preemption), sync primitives; then idle loop with 1s uptime heartbeat.
-- Timer uses SSTC (direct stimecmp writes); timer-driven preemption
-  switches threads via full trap-frame swap in the ISR (frame_valid
-  protocol). Threads: kernel-mode only, cooperative yield via callee-saved
-  context switch.
-- No MMU page permissions split yet (RWX identity map; D2 deferred).
-- Future direction: microkernel (user processes/IPC/capabilities) with
-  OpenHarmony-compatible userspace layer. M1.5 (stabilization) planned:
-  FDT parsing, permission split, guard pages, RVA23 P1. Audit with that
-  trajectory in mind.
+- Stage: **M1.5 complete** (M1: trap/timer/buddy/Sv39 paging/kernel heap/
+  cooperative+preemptive scheduler/Mutex+Condvar/SpinLock IRQ-safe.
+  M1.5: FDT parser + board params runtime / page permission split (code RX,
+  rodata R, data RW, heap RW no-X) / stack guard pages / RVA23 P1
+  (Zba+Zbb+Zbs+Zicond, -cpu max CI) / pressure stress tests / page table
+  interface (unmap_4k, tlb_flush)).
+- Timer uses SSTC (direct stimecmp writes); timer-driven preemption via
+  full trap-frame swap in the ISR (ctx_valid/frame_valid dual resume
+  protocol). Cooperative yield via callee-saved context switch.
+  Scheduler: 2-level priority, tick-based preemption (10 ticks = 100ms),
+  idle thread, exit/reaper, lost-wake protection (woken flag).
+- IRQ-safe SpinLock (saves/restores SIE on lock/unlock); Mutex (block/wake
+  with waiters queue), Condvar (wait/notify_one/notify_all).
+- Buddy allocator (order 0..12, 4KB pages, 128 MiB max, MAX_PAGES=32768,
+  carve for FDT reserved regions). Slab heap (8 classes 16B..2KB, page
+  chain traversal, page path for large objects).
+- FDT parser (kernel/src/fdt.rs): minimal, extracts RAM range, timebase
+  frequency, UART base, reserved regions. Board params (board.rs): runtime
+  functions with FDT fallback and QEMU virt defaults.
+- Sv39 identity mapping with per-section permissions (D2), stack guard
+  pages (D4, 4KB unmapped below boot/trap stacks).
+- CPU capability detection (cpu.rs): ISA string from FDT (RVA23 P1).
+  RVA23 CI: separate job with -cpu max and Zba+Zbb+Zbs+Zicond extensions.
+- Single-core only (secondary harts parked in entry.S via BOOT_LOCK
+  arbitration). Multi-core planned for M2 (D7 per-hart trap stacks, D8
+  secondary hart wake, D9 console lock, D19 multi-core scheduler).
+- Future: microkernel (user processes/IPC/capabilities) with
+  OpenHarmony-compatible userspace layer. M2: user processes, IPC,
+  capabilities, multi-core bring-up.
 
-Review requirements - examine from ALL of the following perspectives:
+Review requirements — examine from ALL of the following perspectives:
 1. Memory safety: UB, unsafe misuse, volatile access, pointer arithmetic,
-   alignment, integer overflow, dangling references.
+   alignment, integer overflow, dangling references, use-after-free,
+   buffer overflow in static arrays (MAX_PAGES, SLAB_PAGE_CLASS, etc.).
 2. Control flow & state machine: boot sequence, panic paths, infinite loops,
-   unreachable states, catastrophic hang scenarios.
-3. Concurrency & reentrancy: atomic ordering, ISR-safety of log paths,
-   double-fault recursion, future interrupt context hazards.
+   unreachable states, catastrophic hang scenarios, scheduler thread state
+   machine (Ready/Running/Blocked/Exited transitions, ctx_valid/frame_valid
+   dual protocol correctness).
+3. Concurrency & reentrancy: atomic ordering (Acquire/Release correctness),
+   ISR-safety of log paths (zero-logging constraint), double-fault
+   recursion, lock ordering (WAITERS->SCHED->HEAP acyclic?), lost-wake
+   scenarios (woken flag), interrupt context hazards, nested irq_save/
+   restore correctness, SpinLock irq_save/restore pairing.
 4. Threat model: hostile bootloader, corrupted RAM, register/CSR misuse,
-   information leakage, privilege issues, attacker-influenced values.
-5. Build & reproducibility: linker script correctness, orphan sections,
-   toolchain drift, CI pitfalls, debug-vs-release divergence.
-6. Hidden bugs: things that work in QEMU but would break on real hardware.
+   information leakage, privilege issues, attacker-influenced values,
+   FDT parser robustness against malformed/corrupted input (bounds checks,
+   UTF-8 validation, integer overflow).
+5. Build & reproducibility: linker script correctness (section layout,
+   _alloc_start, guard pages), orphan sections, toolchain drift, CI
+   pitfalls, debug-vs-release divergence, RVA23 extension compatibility.
+6. Hidden bugs: things that work in QEMU but would break on real hardware
+   (timing assumptions, cache behavior, MMIO fence correctness, PMP
+   restrictions, missing extensions, SBI vs SSTC timer).
+7. Documentation & comments: stale comments, missing Safety annotations,
+   inaccurate module header claims, mismatch between code and docs,
+   dead code, unused variables/functions.
 
 Output format (markdown):
 ## Executive summary
 ## Findings (severity-ranked: CRITICAL / HIGH / MEDIUM / LOW / INFO)
 For each finding: severity, file:line, description, concrete fix suggestion.
+Distinguish between NEW findings (this audit) and findings that were already
+reported in the previous audit (docs/audit-reports/20260818-103645-deepseek-v4-pro.md).
+Mark NEW findings explicitly with [NEW].
 ## What looks correct (so the author knows what not to change)
-## Blind spots & suggestions for the next milestone (M1: trap handling)
+## Blind spots & suggestions for the next milestone (M2: user processes / IPC
+/ capabilities / multi-core)
 
 Be specific. Cite file paths and line numbers. Do NOT modify any code.
 Do NOT speculate beyond what the code shows. Flag anything suspicious even
-if you cannot prove it is wrong.
-"""
+if you cannot prove it is wrong. Be exhaustive — it is better to flag a
+false positive than to miss a real bug. Think step by step through each
+module, examining every unsafe block, every atomic operation, and every
+state transition."""
 
 
 def collect_files():
@@ -136,9 +171,6 @@ def call_api(key, prompt, retries=3):
                 {"role": "system", "content": "You are a senior OS kernel security reviewer."},
                 {"role": "user", "content": prompt},
             ],
-            # 输出不设实际限制:max 推理会吃掉大量 token(实测单次
-            # 思考可达 30 万字符),代码量增长后只会更多。
-            # 上限取 API 最大值 384K token(实际不可能触达)。
             "max_tokens": 393216,
             "reasoning_effort": EFFORT,
             "stream": False,

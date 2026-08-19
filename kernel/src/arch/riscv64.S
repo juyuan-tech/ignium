@@ -248,11 +248,28 @@ context_switch:
 # context_switch 的 ctx 恢复互补(审计 17 轮 MED-1)。
 # 帧槽位与陷阱帧一致(31 GPR + sstatus/sepc)。
 #
-# C ABI:void frame_restore(*mut usize frame);永不返回。
+# C ABI:void frame_restore(*mut usize frame, *mut Context old_ctx);
+# 永不返回。先保存 old_ctx 再帧恢复,防止上下文丢失(C2)。
 # ---------------------------------------------------------------------------
 .align 2
 .globl frame_restore
 frame_restore:
+    # 保存当前线程的上下文到 old_ctx(a1)
+    sd ra, 0(a1)
+    sd sp, 8(a1)
+    sd s0, 16(a1)
+    sd s1, 24(a1)
+    sd s2, 32(a1)
+    sd s3, 40(a1)
+    sd s4, 48(a1)
+    sd s5, 56(a1)
+    sd s6, 64(a1)
+    sd s7, 72(a1)
+    sd s8, 80(a1)
+    sd s9, 88(a1)
+    sd s10, 96(a1)
+    sd s11, 104(a1)
+    # 恢复新线程的帧(frame 在 a0 中)
     mv t6, a0
     # 关中断保护恢复过程;SIE 由帧 sstatus 经 sret 原子恢复。
     csrci sstatus, 2
