@@ -297,7 +297,7 @@ impl Fdt {
             None => return,
         };
         match name {
-            "reg" if node.starts_with(b"memory") => {
+            "reg" if node == b"memory" || node.starts_with(b"memory@") => {
                 // 2-cell address + 2-cell size。
                 if prop_len >= 16 {
                     let ah = unsafe { be32(struct_ptr as usize + val_start) };
@@ -315,7 +315,10 @@ impl Fdt {
                 }
             }
             "compatible" => {
-                if (node.starts_with(b"uart") || node.starts_with(b"serial"))
+                if (node == b"uart"
+                    || node.starts_with(b"uart@")
+                    || node == b"serial"
+                    || node.starts_with(b"serial@"))
                     && params.uart_base == 0
                 {
                     let compat =
