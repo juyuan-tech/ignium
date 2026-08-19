@@ -13,9 +13,10 @@
 | D4 | 栈守护页(boot/trap 栈) | 审计多轮 | M1.5(MMU 已就绪) | **已实现**(审计 18 轮):linker.ld 插入 4KB guard 页,mmu::init 中 unmap,栈溢出→页故障 |
 | D5 | FDT 解析(RAM/UART/时钟频率/保留区实际大小) | 审计 M4/多轮 | M1.5 | **已实现**(审计 18 轮):kernel/src/fdt.rs 最小解析器,提取 RAM/定时器频率/UART/保留区;board.rs 运行时参数化 |
 | D6 | 板级常量 FDT 化(board.rs 为唯一落点) | 审计 11 轮 M4 | 随 D5 | **已实现**(审计 18 轮):board.rs 由编译期常量改为运行时函数,回退默认值 |
-| D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前 | 待办 |
-| D8 | 副核唤醒与多核 bring-up | 自审/ROADMAP | M2+ | 待办 |
-| D9 | 控制台输出锁(多核防交错) | uart.rs 注释 | 多核唤醒前 | 待办 |
+| D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前(M2) | 待办:陷阱栈从全局单栈改为 per-hart 数组(按 hartid/tp 索引),sscratch 指向 per-hart 栈顶 |
+| D8 | 副核唤醒与多核 bring-up | 自审/ROADMAP | M2+ | 待办:引导者(仲裁赢家)在初始化完成后通过 SBI IPI 或 HSM 扩展唤醒副核;副核从 park 进入内核(初始化 per-hart 陷阱栈后加入调度) |
+| D9 | 控制台输出锁(多核防交错) | uart.rs 注释 | 多核唤醒前(M2) | 待办:Wrap uart::putc in SpinLock,防止多核同时输出在串口上交错 |
+| D19 | 多核调度器支持 | 审计 18 轮 | M2+ | 待办:per-CPU 空闲线程/idle 循环、per-CPU 就绪队列(或全局锁+迁移)、线程亲和性;当前 SCHED 全局锁在单核下正确,多核下可工作但不缩放 |
 | D10 | 用户页交接前清零(防信息泄漏) | 审计 M4(mem.rs) | M2 用户态 | 待办 |
 | D11 | ISR 内分配安全(与 D3 配套,防死锁) | 优化报告遗留风险 | 调度器里程碑 | **已实现**(审计 16 轮):就绪队列/reaper/线程 Vec 容量预留(MAX_THREADS=64),ISR 路径零分配;调度器临界区 irq_save/restore;ISR 内仍禁止主动分配(新需求走 D3 IRQ 安全锁) |
 | D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办 |

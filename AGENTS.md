@@ -38,6 +38,8 @@ make test-rva23 # RVA23 P1:Zba/Zbb/Zbs+Zicond 扩展 + -cpu max 冒烟
    由陷阱栈吸收。M1 之后若需 ISR 日志,先引入锁或 ISR 缓冲。
 6. 工具链/CI 版本两处同步(rust-toolchain.toml + ci.yml)。
 7. 新增 Rust 代码必须写注释:模块级文档 + 每个 unsafe 的 Safety 说明。
+8. **多核限制**:当前单核(副 hart 在 entry.S park)。改多核代码前必须
+   同时实现 D7(per-hart 陷阱栈)+ D9(控制台锁)+ D8(副核唤醒)。
 
 ## 结构速览
 
