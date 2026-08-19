@@ -19,6 +19,10 @@ const SBI_EXT_TIME: usize = 0x5449_4D45;
 
 /// 编程定时器(SBI TIME 扩展)。**回退实现**:当前主路径为 SSTC
 /// 直写 stimecmp(见 arch/riscv64.rs);无 SSTC 平台接入时启用本函数。
+///
+/// # Safety
+/// 通过裸 `ecall` 调用 M 模式固件。调用约定由 `clobber_abi("C")`
+/// 声明全部 caller-saved 寄存器被覆写;错误码经 a0 返回,必须检查。
 #[allow(dead_code)]
 #[inline]
 pub fn set_timer(stime_value: usize) -> usize {

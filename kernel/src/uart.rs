@@ -151,12 +151,18 @@ unsafe fn init_hw() {
         write_u8(uart_lcr(), 0x80);
         mmio_fence();
         write_u8(uart_dll(), 0x0C);
+        // 自审修复(真机健壮性):DLL/DLM 构成 16 位分频,DML 写入时
+        // UART 锁存完整分频 —— 乱序核上若 DLM 先写会以旧 DLL 锁存,
+        // 波特率错误。关键写之间必须有 fence。
+        mmio_fence();
         write_u8(uart_dlm(), 0x00);
         mmio_fence();
         write_u8(uart_lcr(), 0x03);
         mmio_fence();
         write_u8(uart_ier(), 0x00);
+        mmio_fence();
         write_u8(uart_fcr(), 0x07);
+        mmio_fence();
         write_u8(uart_mcr(), 0x03);
     }
 }
