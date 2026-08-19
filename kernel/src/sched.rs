@@ -345,9 +345,6 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     reaper: VecDeque::new(),
 });
 
-/// 线程 id 分配(供外部日志/调试)。
-static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
-
 /// __global_pointer$ 地址(与 entry.S/trap_vector 一致;新线程帧
 /// 的 gp 槽用它,保证内核代码的 gp 相对访问有效)。
 fn __global_pointer() -> usize {
@@ -430,7 +427,6 @@ pub fn spawn(entry: fn(), prio: u8) -> usize {
     let irq = arch::irq_save();
     let mut s = SCHED.lock();
     let id = s.spawn(entry, prio);
-    let _ = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
     drop(s);
     arch::irq_restore(irq);
     id
