@@ -150,8 +150,14 @@ extern "C" {
     static _text_start: u8;
     static _rodata_start: u8;
     static _data_start: u8;
-    static _bss_start: u8;
     static _kernel_end: u8;
+    // 栈守护页(4KB,MMU 不映射)。
+    static _stack_guard: u8;
+    static _stack_bottom: u8;
+    static _stack_top: u8;
+    static _trap_stack_guard: u8;
+    static _trap_stack_bottom: u8;
+    static _trap_stack_top: u8;
 }
 
 /// 初始化内核自身映射并启用分页。
@@ -201,11 +207,18 @@ pub fn init() {
     }
 
     // 4) 内核镜像后的 RAM:2MB 超页 RW,无 X。
+    //    栈区域已在 4KB 映射中覆盖,guard 页被下方 unmap 移除。
     let mut vaddr = kernel_super_end;
     while vaddr < ram_end {
         map_super(root, vaddr, vaddr, PTE_LEAF_RW).expect("RAM superpage failed");
         vaddr += SUPER_PAGE;
     }
+
+    // 5) 栈守护页:unmap 4KB 页,使栈溢出触发页故障(而非静默损坏)。
+    let stack_guard = (&raw const _stack_guard).addr();
+    let trap_stack_guard = (&raw const _trap_stack_guard).addr();
+    let _ = unmap_4k(root, stack_guard);
+    let _ = unmap_4k(root, trap_stack_guard);
 
     // UART MMIO:4KB RW + A/D(无 X)。
     let uart_base = crate::board::uart_base();
@@ -224,6 +237,19 @@ fn map_region_4k(root: usize, start: usize, end: usize, flags: u64) {
         map_4k(root, vaddr, vaddr, flags).expect("4K page mapping failed");
         vaddr += 4096;
     }
+}
+
+/// 取消映射 4KB 页(写 PTE=0),使访问触发页故障。
+/// 仅对已用 4KB 页映射的区域有效(超页需先拆分,见 D4)。
+fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
+    let l2 = (vaddr >> 30) & 0x1FF;
+    let l1 = (vaddr >> 21) & 0x1FF;
+    let l0 = (vaddr >> 12) & 0x1FF;
+    let root_t = root as *const u64;
+    let l1_t = unsafe { ensure_table(root_t, l2)? };
+    let l0_t = unsafe { ensure_table(l1_t, l1)? };
+    pte_write(l0_t, l0, 0);
+    Ok(())
 }
 
 /// 分页自检:satp 模式、身份映射读写、分页后 buddy、根表结构。

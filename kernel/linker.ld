@@ -76,8 +76,10 @@ SECTIONS
      * 这是 panic 栈水位检测成立的前提。
      * 栈向下增长;下方紧邻 _kernel_end(内核数据)——
      * M1 引入 MMU 后须在 _kernel_end 与栈之间加不可映射守护页。
-     * 溢出防护:栈水位(p后诊断)+ M1 守护页(事前防护)。 */
-    .stack (NOLOAD) : {
+     * 溢出防护:栈水位(p后诊断)+ 守护页(事前防护,4KB 页级)。 */
+    .stack (NOLOAD) : ALIGN(4K) {
+        _stack_guard = .;
+        . += 4K;                /* 守护页:MMU 不映射,越界→页故障 */
         _stack_bottom = .;
         . += STACK_SIZE;
         _stack_top = .;
@@ -88,7 +90,9 @@ SECTIONS
      * 也避免 handler 深度使用引导栈(pro 审计 #2)。
      * 多核:唤醒副核前必须改为 per-hart 陷阱栈数组
      * (按 hartid/tp 索引),本单栈仅适用于单核阶段。 */
-    .trap_stack (NOLOAD) : {
+    .trap_stack (NOLOAD) : ALIGN(4K) {
+        _trap_stack_guard = .;
+        . += 4K;                /* 守护页:MMU 不映射 */
         _trap_stack_bottom = .;
         . += TRAP_STACK_SIZE;
         _trap_stack_top = .;
