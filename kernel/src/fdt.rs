@@ -350,11 +350,17 @@ impl Fdt {
                         n
                     };
                     if len > 0 {
-                        // SAFETY:FDT 数据全程有效,延长生命周期到 'static。
-                        let s: &'static str = unsafe {
-                            core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
+                        // 自审修复:用安全 from_utf8 避免恶意 FDT 触发 UB。
+                        let s = if let Ok(s) =
+                            core::str::from_utf8(unsafe { core::slice::from_raw_parts(ptr, len) })
+                        {
+                            s
+                        } else {
+                            return;
                         };
-                        params.isa_string = s;
+                        // SAFETY:FDT 数据全程有效(保留区),延长到 'static 安全。
+                        params.isa_string =
+                            unsafe { core::mem::transmute::<&str, &'static str>(s) };
                     }
                 }
             }

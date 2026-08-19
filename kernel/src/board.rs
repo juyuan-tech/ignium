@@ -44,36 +44,45 @@ extern "C" {
 ///
 /// 会对 FDT 值做基本合理性校验,异常值回退默认值。
 pub fn init_from_fdt(params: &fdt::BoardParams) {
-    // M2(审计 18 轮外部):RAM 边界必须 2MB 对齐,否则 mmu::init 超页映射会 panic。
-    let ram_start = if params.ram_start != 0 && params.ram_start.is_multiple_of(SUPER_PAGE) {
+    // 自审修复:先确定候选 RAM 范围,再统一校验,避免用不同的
+    // ram_start 分别校验 ram_size 与 uart(逻辑不一致)。
+    // 1) 候选 ram_start:非零且 2MB 对齐。
+    let cand_start = if params.ram_start != 0 && params.ram_start.is_multiple_of(SUPER_PAGE) {
         params.ram_start
     } else {
         DEFAULT_RAM_START
     };
-    // V3 审计 #4:验证 RAM 大小合理且不超容量。
-    // - >= 1MB 且 <= MAX_PAGES 页
-    // - 2MB 对齐(超页映射要求)
-    // - ram_end 不超 Sv39 物理窗口
-    // - ram_end 覆盖内核镜像末尾(保证分配器有页可用)
-    let kernel_end = (&raw const _kernel_end).addr();
-    let ram_max = (crate::mem::MAX_PAGES) * 4096;
-    let ram_size = if params.ram_size >= 1024 * 1024
-        && params.ram_size <= ram_max
+    // 2) 候选 ram_size:1MB..MAX_PAGES,2MB 对齐。
+    let cand_size = if params.ram_size >= 1024 * 1024
+        && params.ram_size <= crate::mem::MAX_PAGES * 4096
         && params.ram_size.is_multiple_of(SUPER_PAGE)
-        && params
-            .ram_start
-            .saturating_add(params.ram_size)
-            .is_multiple_of(SUPER_PAGE)
-        && params.ram_start.saturating_add(params.ram_size) <= SV39_MAX_PHYS
     {
         params.ram_size
     } else {
         DEFAULT_RAM_SIZE
     };
+    let cand_end = cand_start.saturating_add(cand_size);
+    // 3) 校验最终 RAM 范围:
+    //    - ram_end 2MB 对齐(超页映射要求)
+    //    - ram_end 在 Sv39 物理窗口内
+    //    - ram_start <= 内核链接基址(covers kernel)
+    //    - ram_end 覆盖内核镜像末尾(分配器有页可用)
+    let kernel_end = (&raw const _kernel_end).addr();
+    let ram_valid = cand_end.is_multiple_of(SUPER_PAGE)
+        && cand_end <= SV39_MAX_PHYS
+        && cand_start <= KERNEL_LINK_BASE
+        && cand_end > kernel_end;
+    let (ram_start, ram_size) = if ram_valid {
+        (cand_start, cand_size)
+    } else {
+        (DEFAULT_RAM_START, DEFAULT_RAM_SIZE)
+    };
+    let ram_end = ram_start.saturating_add(ram_size);
     let uart_base = if params.uart_base != 0
         && params.uart_base.is_multiple_of(4)
         // UART 基址不能在 RAM 区间内(hostile FDT 任意物理写防护)。
-        && (params.uart_base < ram_start || params.uart_base >= ram_start.saturating_add(ram_size))
+        // 用最终 ram_start/ram_end 校验。
+        && (params.uart_base < ram_start || params.uart_base >= ram_end)
     {
         params.uart_base
     } else {
@@ -84,13 +93,6 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     } else {
         DEFAULT_TIMER_FREQ
     };
-    // V3 审计 #4:RAM start 必须覆盖内核(不早于 HART 入口,不晚于内核链接基址)。
-    let ram_start =
-        if ram_start <= KERNEL_LINK_BASE && ram_start.saturating_add(ram_size) > kernel_end {
-            ram_start
-        } else {
-            DEFAULT_RAM_START
-        };
     BOARD_RAM_START.store(ram_start, Ordering::Relaxed);
     BOARD_RAM_SIZE.store(ram_size, Ordering::Relaxed);
     BOARD_UART_BASE.store(uart_base, Ordering::Relaxed);
