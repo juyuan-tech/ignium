@@ -384,15 +384,13 @@ pub unsafe extern "C" fn trap_handler(
                 // M7(审计 18 轮外部):若中断长时间关闭后 deadline 严重
                 // 落后,用 max(now + interval) 防止 tick 风暴。
                 crate::logger::tick_up();
+                // 自审:interval 每 tick 单独读一次(原 3 次原子读)。
+                let interval = timer_interval();
                 let ideal = TIMER_DEADLINE
-                    .fetch_add(timer_interval(), Ordering::Relaxed)
-                    .wrapping_add(timer_interval());
+                    .fetch_add(interval, Ordering::Relaxed)
+                    .wrapping_add(interval);
                 let now = get_time();
-                let next = if ideal < now {
-                    now + timer_interval()
-                } else {
-                    ideal
-                };
+                let next = if ideal < now { now + interval } else { ideal };
                 TIMER_DEADLINE.store(next, Ordering::Relaxed);
                 set_stimecmp(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程

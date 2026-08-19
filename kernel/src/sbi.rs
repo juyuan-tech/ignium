@@ -22,23 +22,19 @@ const SBI_EXT_TIME: usize = 0x5449_4D45;
 #[allow(dead_code)]
 #[inline]
 pub fn set_timer(stime_value: usize) -> usize {
-    let error: usize;
+    let mut error: usize;
     unsafe {
         core::arch::asm!(
             "ecall",
             in("a7") SBI_EXT_TIME,
             in("a6") 0,
             in("a0") stime_value,
-            // SBI 调用约定(M4):调用方必须假定 a0-a7 全部被覆写,
-            // 编译器可能在这些寄存器里保存活跃值。
+            // SBI 约定:调用方必须假定 a0-a7 与 **所有 caller-saved**
+            // 寄存器(t0-t6 等)均被覆写。clobber_abi("C") 声明它们全部
+            // 被破坏 —— 否则编译器可能在 ecall 期间把活跃值存于 t0-t6,
+            // OpenSBI 覆写它们导致误编译(审计 V2 H4,此前漏改)。
             lateout("a0") error,
-            lateout("a1") _,
-            lateout("a2") _,
-            lateout("a3") _,
-            lateout("a4") _,
-            lateout("a5") _,
-            lateout("a6") _,
-            lateout("a7") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }

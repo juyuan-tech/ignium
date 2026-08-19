@@ -73,12 +73,15 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     };
     let cand_end = cand_start.saturating_add(cand_size);
     // 3) 校验最终 RAM 范围:
+    //    - ram_start 不低于 RISC-V 标准 RAM 基址(0x80000000),
+    //      防止恶意 FDT 把 MMIO/未映射区当 RAM 映射(防御纵深)
     //    - ram_end 2MB 对齐(超页映射要求)
     //    - ram_end 在 Sv39 物理窗口内
     //    - ram_start <= 内核链接基址(covers kernel)
     //    - ram_end 覆盖内核镜像末尾(分配器有页可用)
     let kernel_end = (&raw const _kernel_end).addr();
-    let ram_valid = cand_end.is_multiple_of(SUPER_PAGE)
+    let ram_valid = cand_start >= DEFAULT_RAM_START
+        && cand_end.is_multiple_of(SUPER_PAGE)
         && cand_end <= SV39_MAX_PHYS
         && cand_start <= KERNEL_LINK_BASE
         && cand_end > kernel_end;
