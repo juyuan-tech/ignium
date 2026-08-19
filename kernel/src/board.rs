@@ -27,23 +27,25 @@ static BOARD_UART_BASE: AtomicUsize = AtomicUsize::new(0);
 static BOARD_TIMER_FREQ: AtomicUsize = AtomicUsize::new(0);
 
 /// 从 FDT 解析结果初始化板级参数。须在 mem::init 之前调用。
+///
+/// 会对 FDT 值做基本合理性校验,异常值回退默认值。
 pub fn init_from_fdt(params: &fdt::BoardParams) {
-    let ram_start = if params.ram_start != 0 {
+    let ram_start = if params.ram_start != 0 && params.ram_start.is_multiple_of(4096) {
         params.ram_start
     } else {
         DEFAULT_RAM_START
     };
-    let ram_size = if params.ram_size != 0 {
+    let ram_size = if params.ram_size >= 1024 * 1024 && params.ram_size <= 1024 * 1024 * 1024 {
         params.ram_size
     } else {
         DEFAULT_RAM_SIZE
     };
-    let uart_base = if params.uart_base != 0 {
+    let uart_base = if params.uart_base != 0 && params.uart_base.is_multiple_of(4) {
         params.uart_base
     } else {
         DEFAULT_UART_BASE
     };
-    let timer_freq = if params.timebase_freq != 0 {
+    let timer_freq = if params.timebase_freq >= 1000 && params.timebase_freq <= 1_000_000_000 {
         params.timebase_freq
     } else {
         DEFAULT_TIMER_FREQ

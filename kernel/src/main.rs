@@ -79,6 +79,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         .map(|f| f.parse())
         .unwrap_or_default();
     board::init_from_fdt(&fdt_params);
+    // FDT 解析后重初始化 UART(使基址反映 FDT 值)。
+    crate::uart::reinit();
     // 物理内存初始化(含 FDT 保留区刻蚀)+ 自检。
     // 分配器(M1):IRQ 安全 SpinLock(MED-3),持锁不被抢占;
     // 此项自检须在 irq_enable 之前(避免定时器与自检交错)。

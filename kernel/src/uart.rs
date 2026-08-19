@@ -132,6 +132,21 @@ fn is_transmit_empty() -> bool {
 pub fn init() {
     // 缓存基址(避免每次 putc 调用 board::uart_base 的跨模块开销)。
     UART_REG_BASE.store(crate::board::uart_base(), Ordering::Relaxed);
+    unsafe { init_hw() }
+}
+
+/// FDT 解析后重初始化:更新缓存基址并重新配置硬件。
+/// 在 board::init_from_fdt 之后调用,使 UART 反映 FDT 值。
+pub fn reinit() {
+    UART_REG_BASE.store(crate::board::uart_base(), Ordering::Relaxed);
+    unsafe { init_hw() }
+}
+
+/// 硬件初始化序列(寄存器地址从缓存基址计算)。
+///
+/// # Safety
+/// 必须确保 UART_REG_BASE 已更新为正确基址(由 init/reinit 保证)。
+unsafe fn init_hw() {
     unsafe {
         write_u8(uart_lcr(), 0x80);
         mmio_fence();
