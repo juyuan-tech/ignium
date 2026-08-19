@@ -191,7 +191,7 @@ pub fn self_test() -> Result<(), &'static str> {
     // 2) 身份映射可访问:读 UART LSR(MMIO 映射验证)。
     //    注意:不能用 0x80000000 做写探针 —— 那是 OpenSBI 固件区,
     //    PMP 禁止 S 模式访问(实测 cause=7 访问故障,映射本身正确)。
-    //    MED-13(审计 15 轮):基址走 board 常量,不做地址硬编码。
+    //    MED-13(审计 15 轮):基址走 board 函数,不做地址硬编码。
     let lsr_addr = (crate::board::uart_base() + 5) as *const u8;
     let lsr = unsafe { core::ptr::read_volatile(lsr_addr) };
     if lsr & 0x20 == 0 {
