@@ -597,6 +597,13 @@ pub fn exit() -> ! {
 }
 
 /// 切换目标:锁内提取,锁外执行。
+///
+/// **裸指针生命周期保证(自审加深注释)**:`old_ctx`/`new_ctx`/`new_frame`
+/// 指向 `SCHED.threads` 的 Vec 后备存储。锁守卫(s)在 `switch_target`
+/// 返回后、`do_switch` 前已 drop,但 Vec 是 `static SCHED` 的一部分
+/// (非局部堆分配),后备存储在内核全程有效,不会因锁释放而失效。
+/// 单核下 switch→do_switch 间无其它线程能修改 Vec;M2 多核调度若做
+/// 线程迁移/回收 TCB,必须先把目标从 Vec 摘出再切换。
 struct SwitchTarget {
     old_ctx: *mut Context,
     new_ctx: *const Context,

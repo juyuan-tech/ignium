@@ -198,12 +198,13 @@ pub fn init() {
     let data_start = (&raw const _data_start).addr();
     let kernel_end = (&raw const _kernel_end).addr();
 
-    // 1) 内核镜像前的区域(OpenSBI 固件):2MB 超页 RW。
-    // L17(审计 18 轮外部):PMP 可能禁止 S 模式写 OpenSBI 区,
-    // RW 映射仅用于兼容,无实际写操作。
+    // 1) 内核镜像前的区域(OpenSBI 固件):2MB 超页 **只读 R**(无 W/X)。
+    // 自审加深:内核不写固件区(副核停车在自设 park 循环,M2 前无
+    // 共享 mailbox)。映射为 R(而非 RW)使误写触发页故障(fail-loudly),
+    // 而非静默破坏固件。L17 参考:PMP 亦可能禁止 S 写。
     let mut vaddr = ram_start;
     while vaddr < kernel_start {
-        map_super(root, vaddr, vaddr, PTE_LEAF_RW).expect("RAM superpage failed");
+        map_super(root, vaddr, vaddr, PTE_LEAF_R).expect("RAM superpage failed");
         vaddr += SUPER_PAGE;
     }
 

@@ -298,7 +298,7 @@ impl Fdt {
         };
         match name {
             "reg" if node == b"memory" || node.starts_with(b"memory@") => {
-                // 2-cell address + 2-cell size。
+                // 2-cell address + 2-cell size(64-bit 平台惯例)。
                 if prop_len >= 16 {
                     let ah = unsafe { be32(struct_ptr as usize + val_start) };
                     let al = unsafe { be32(struct_ptr as usize + val_start + 4) };
@@ -306,6 +306,13 @@ impl Fdt {
                     let sl = unsafe { be32(struct_ptr as usize + val_start + 12) };
                     params.ram_start = ((ah as u64) << 32 | al as u64) as usize;
                     params.ram_size = ((sh as u64) << 32 | sl as u64) as usize;
+                } else if prop_len >= 8 {
+                    // 自审:1-cell address + 1-cell size(#address-cells=<1>,
+                    // <4GB 平台)。
+                    let a = unsafe { be32(struct_ptr as usize + val_start) } as usize;
+                    let s = unsafe { be32(struct_ptr as usize + val_start + 4) } as usize;
+                    params.ram_start = a;
+                    params.ram_size = s;
                 }
             }
             "timebase-frequency" if node == b"cpus" || node.starts_with(b"cpus@") => {
