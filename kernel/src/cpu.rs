@@ -18,9 +18,9 @@ pub struct Capabilities {
 pub fn init_from_fdt(params: &crate::fdt::BoardParams) {
     let caps = detect_from_fdt(params);
     if let Some(ref caps) = caps {
-        info!("M1: CPU capabilities: {}", caps.isa_string);
+        info!("M1.5: CPU capabilities: {}", caps.isa_string);
     } else {
-        info!("M1: CPU capabilities: rv64imafdc (default, no FDT riscv,isa)");
+        info!("M1.5: CPU capabilities: rv64imafdc (default, no FDT riscv,isa)");
     }
 }
 
