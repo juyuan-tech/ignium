@@ -5,7 +5,8 @@
 
 use crate::info;
 
-/// CPU 能力集合。
+/// CPU 能力集合(当前未使用,预留 M2 运行时回退)。
+#[allow(dead_code)]
 pub struct Capabilities {
     /// ISA 字符串(如 "rv64imafdch_zba_zbb_zbs_zicond")。
     pub isa_string: &'static str,

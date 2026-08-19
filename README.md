@@ -70,14 +70,16 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 ├── kernel/                 # 内核 crate(唯一特权层,workspace 成员)
 │   ├── src/
 │   │   ├── main.rs         # 入口 + 启动顺序(依赖关系见注释)
-│   │   ├── board.rs        # 板级平台常量(单文件改板,FDT 化前的集中点)
+│   │   ├── board.rs        # 板级平台参数(FDT 运行时推导,回退默认值)
+│   │   ├── cpu.rs          # CPU 能力检测与 ISA 诊断(RVA23 P1)
+│   │   ├── fdt.rs          # FDT 最小解析器(RAM/UART/定时器频率/保留区)
 │   │   ├── entry.S         # _start:SIE 清零/gp 初始化/副核停车/清 BSS/设栈/早期 trap stub
 │   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)
 │   │   ├── panic.rs        # panic:位置/消息/CPU dump/栈水位/双 panic 保护
 │   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
-│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(2MB 超页 RAM + MMIO)
+│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分:代码RX/数据RW/堆栈RW)
 │   │   ├── heap.rs         # 内核堆(slab 16B..2KB + buddy 页路径,#[global_allocator])
 │   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出)
 │   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
@@ -106,7 +108,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 
 ## 路线
 
-见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 全部完成**(陷阱/定时器/物理内存/分页/内核堆/调度器/同步原语),下一步 **M1.5(稳定化与真机准备)**。
+见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓**(FDT 解析/页权限拆分/栈守护页/RVA23 P1/压力自检/页表接口),下一步 **M2(用户进程 + IPC + 能力)**。
 
 ## 里程碑
 
@@ -114,7 +116,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 |---|---|
 | M0 ✓ | QEMU 启动 + UART 打印 |
 | M1 ✓ | trap/定时器/内存管理/分页/内核堆/调度/同步原语 |
-| M1.5 | 稳定化与真机就绪(全部 QEMU 内完成):FDT 解析/页权限拆分/栈守护页/RVA23 P1/页表接口补全/压力自检 |
+| M1.5 ✓ | FDT 解析/页权限拆分/栈守护页/RVA23 P1/压力自检/页表接口补全 |
 | M2 | 用户进程 + IPC + 能力 |
 | M3 | 用户态服务 + shell |
 | M4 | 健壮性/测试 + OpenHarmony 组件移植 |

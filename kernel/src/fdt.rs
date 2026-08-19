@@ -316,6 +316,11 @@ struct FdtHeader {
     size_dt_struct: [u8; 4],
 }
 
+/// Read 4 bytes at `addr` as big-endian u32.
+///
+/// # Safety
+/// `addr` must be readable and the 4 bytes at `addr`..`addr+4` must be valid
+/// (caller verifies bounds before calling).
 unsafe fn be32(addr: usize) -> u32 {
     let b = |o: usize| unsafe { core::ptr::read_volatile((addr + o) as *const u8) };
     (b(0) as u32) << 24 | (b(1) as u32) << 16 | (b(2) as u32) << 8 | b(3) as u32
