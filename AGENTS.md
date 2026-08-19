@@ -25,8 +25,9 @@ make test      # QEMU 启动冒烟
 1. **兼容代码永不进内核**:OpenHarmony/POSIX 兼容全部在用户态
    (docs/DESIGN.md);内核只认 IPC 原语。
 2. **初始化顺序** kernel_main:irq_disable → sanitize_csr → uart::init
-   → init_traps → enable_timer → set_level → mem::init(fdt)/mmu::init
-   →(自检)→ irq_enable。trap 窗口(无 stvec 时异常跳地址 0)不可恢复。
+   → init_traps → enable_timer → set_level → board::init_from_fdt
+   → uart::reinit → mem::init(&fdt_params)/mmu::init →(自检)→ irq_enable。
+   trap 窗口(无 stvec 时异常跳地址 0)不可恢复。
 3. **汇编与 Rust 的 ABI 约定**:TRAP_FRAME 布局(riscv64.S 与 riscv64.rs
    必须同步)、CpuState 字段顺序(repr(C))。改一侧必须改另一侧。
 4. **链接脚本符号契约**:_kernel_start/_end、_stack_bottom/_top 等
@@ -40,9 +41,9 @@ make test      # QEMU 启动冒烟
 ## 结构速览
 
 - `kernel/` — 内核 crate(唯一特权层);arch 隔离层在 kernel/src/arch/;
-  关键模块:board.rs(板级常量)、mem.rs(buddy)、mmu.rs(Sv39 页表)、
-  heap.rs(内核堆)、sched.rs(线程调度)、sync.rs(同步原语)、
-  sbi.rs(SBI 调用)、logger/panic/uart
+  关键模块:board.rs(板级参数,运行时 FDT 推导)、fdt.rs(FDT 解析器)、
+  mem.rs(buddy)、mmu.rs(Sv39 页表)、heap.rs(内核堆)、sched.rs(线程调度)、
+  sync.rs(同步原语)、sbi.rs(SBI 调用)、logger/panic/uart
 - `scripts/ai_audit.py` — 外部 AI 审计(密钥走环境变量,见 scripts/README.md)
 - `docs/` — DESIGN.md(架构铁律)、DEFERRED.md(延迟项注册表)、
   reports/(详尽报告)、audit-reports/(外部审计留档)

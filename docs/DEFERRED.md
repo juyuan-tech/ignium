@@ -11,8 +11,8 @@
 | D2 | 页权限拆分(代码 RX / 数据 RW,现整体 RWX) | 多次审计 | M1.5 | 待办 |
 | D3 | 分配器加锁 | 审计 HIGH-1(12 轮):SpinLock 已包装分配器;审计 17 轮 MED-3 完成 **IRQ 安全变体**(加锁保存/恢复 SIE);剩余 = ISR 分配策略(由 D11 容量预留兜底) | 调度器里程碑 | **已实现** |
 | D4 | 栈守护页(boot/trap 栈) | 审计多轮 | M1.5(MMU 已就绪) | 待办 |
-| D5 | FDT 解析(RAM/UART/时钟频率/保留区实际大小) | 审计 M4/多轮 | M1.5 | 待办 |
-| D6 | 板级常量 FDT 化(board.rs 为唯一落点) | 审计 11 轮 M4 | 随 D5 | 待办 |
+| D5 | FDT 解析(RAM/UART/时钟频率/保留区实际大小) | 审计 M4/多轮 | M1.5 | **已实现**(审计 18 轮):kernel/src/fdt.rs 最小解析器,提取 RAM/定时器频率/UART/保留区;board.rs 运行时参数化 |
+| D6 | 板级常量 FDT 化(board.rs 为唯一落点) | 审计 11 轮 M4 | 随 D5 | **已实现**(审计 18 轮):board.rs 由编译期常量改为运行时函数,回退默认值 |
 | D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前 | 待办 |
 | D8 | 副核唤醒与多核 bring-up | 自审/ROADMAP | M2+ | 待办 |
 | D9 | 控制台输出锁(多核防交错) | uart.rs 注释 | 多核唤醒前 | 待办 |
@@ -21,7 +21,7 @@
 | D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办 |
 | D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办 |
 | D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | 待办 |
-| D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa;当前无条件用 stimecmp,写读回断言可给出明确诊断) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析落地时) | 待办 |
+| D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa;当前无条件用 stimecmp,写读回断言可给出明确诊断) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析已落地,可读取 riscv,isa) | 部分完成(FDT 解析就绪,读取 riscv,isa 与 SBI 回退待实现) |
 | D18 | early_trap 最小诊断输出(真机 bring-up 期 UART 未就绪时静默停机,审计 17 轮 INFO-4;文档化为 bring-up 风险,真机适配时落实) | 审计 17 轮 INFO-4 | 真机 bring-up | 待办 |
 
 ## 已关闭(移动到这里)
