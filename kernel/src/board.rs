@@ -26,16 +26,23 @@ static BOARD_RAM_SIZE: AtomicUsize = AtomicUsize::new(0);
 static BOARD_UART_BASE: AtomicUsize = AtomicUsize::new(0);
 static BOARD_TIMER_FREQ: AtomicUsize = AtomicUsize::new(0);
 
+/// 2MB 超页对齐(用于 RAM 超页映射)。
+const SUPER_PAGE: usize = 2 * 1024 * 1024;
+
 /// 从 FDT 解析结果初始化板级参数。须在 mem::init 之前调用。
 ///
 /// 会对 FDT 值做基本合理性校验,异常值回退默认值。
 pub fn init_from_fdt(params: &fdt::BoardParams) {
-    let ram_start = if params.ram_start != 0 && params.ram_start.is_multiple_of(4096) {
+    // M2(审计 18 轮外部):RAM 边界必须 2MB 对齐,否则 mmu::init 超页映射会 panic。
+    let ram_start = if params.ram_start != 0 && params.ram_start.is_multiple_of(SUPER_PAGE) {
         params.ram_start
     } else {
         DEFAULT_RAM_START
     };
-    let ram_size = if params.ram_size >= 1024 * 1024 && params.ram_size <= 1024 * 1024 * 1024 {
+    let ram_size = if params.ram_size >= 1024 * 1024
+        && params.ram_size <= 1024 * 1024 * 1024
+        && params.ram_size.is_multiple_of(SUPER_PAGE)
+    {
         params.ram_size
     } else {
         DEFAULT_RAM_SIZE

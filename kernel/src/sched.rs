@@ -59,7 +59,7 @@ const FRAME_SSTATUS: usize = 32;
 const FRAME_SEPC: usize = 33;
 
 /// 线程状态。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ThreadState {
     Ready,
     Running,
@@ -170,6 +170,13 @@ impl Scheduler {
             for _ in 0..round {
                 let Some(id) = q.pop_front() else { break };
                 if self.threads[id].state != ThreadState::Ready {
+                    // L13(审计 18 轮外部):非 Ready 线程不应在就绪队列中。
+                    debug_assert!(
+                        self.threads[id].state == ThreadState::Exited,
+                        "pick_next: non-Ready thread {} in ready queue (state={:?})",
+                        id,
+                        self.threads[id].state
+                    );
                     continue; // 非 Ready(如 Exited):丢弃。
                 }
                 let ok = if need_ctx {
@@ -179,6 +186,9 @@ impl Scheduler {
                 };
                 if ok {
                     self.threads[id].state = ThreadState::Running;
+                    // M6(审计 18 轮外部):消费唤醒标志,防止下次
+                    // block_current 因陈旧 woken=true 而虚假继续。
+                    self.threads[id].woken = false;
                     return id;
                 }
                 q.push_back(id); // 暂不满足:轮转到队尾,不丢失。

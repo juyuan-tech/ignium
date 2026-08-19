@@ -125,7 +125,8 @@ impl<T: ?Sized> Mutex<T> {
             // 2) 占用:登记等待(防错过唤醒),再尝试一次。
             self.waiters.lock().push_back(sched::current_id());
             if !self.locked.swap(true, Ordering::Acquire) {
-                // 登记后竞争成功:撤销登记,直接持有。
+                // L12(审计 18 轮外部):此分支当前不可达(中断关闭下
+                // 步骤 1 已成功),保留为防御性代码。
                 self.waiters.lock().pop_back();
                 arch::irq_restore(irq);
                 return MutexGuard { m: self };

@@ -38,6 +38,8 @@ _start:
     csrw satp, zero
     # satp 切换后必须冲刷 TLB;`fence` 只是指令序屏障,不是 TLB 冲刷。
     sfence.vma zero, zero
+    # L10(审计 18 轮外部):I-cache 冲刷,防热重启时取指陈旧代码。
+    fence.i
 
     # gp = __global_pointer$:数据量增长后链接器会生成 gp 相对寻址,
     # 必须在早期初始化。norelax 块防止本指令自身被松弛为 gp 相对

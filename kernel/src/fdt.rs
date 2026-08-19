@@ -91,7 +91,8 @@ pub struct Fdt {
 
 impl Fdt {
     pub fn new(fdt: usize) -> Option<Self> {
-        if fdt == 0 || !fdt.is_multiple_of(4) {
+        if fdt == 0 || !fdt.is_multiple_of(8) {
+            // M3(审计 18 轮外部):FDT 规范要求 8 字节对齐。
             return None;
         }
         // 保守边界:按 RISC-V Sv39 最大物理地址(2^56 - 1)校验。
@@ -168,14 +169,24 @@ impl Fdt {
             .off_struct
             .saturating_add(self.size_struct)
             .min(self.total_size);
-        // 当前节点名缓冲。
+        // 当前节点名缓冲(栈式,支持嵌套,M4 修复)。
         let mut current_node: [u8; 64] = [0; 64];
         let mut current_node_len = 0usize;
+        // 节点名栈(深度 ≤ 8,每层保存父节点名,END_NODE 时恢复)。
+        let mut node_stack: [[u8; 64]; 8] = [[0; 64]; 8];
+        let mut node_stack_len: [usize; 8] = [0; 8];
+        let mut depth = 0usize;
         while pos + 4 <= struct_end {
             let token = unsafe { be32(struct_ptr as usize + pos) };
             pos += 4;
             match token {
                 FDT_BEGIN_NODE => {
+                    // 入栈:保存当前节点名到父节点栈。
+                    if depth < node_stack.len() {
+                        node_stack[depth] = current_node;
+                        node_stack_len[depth] = current_node_len;
+                    }
+                    depth += 1;
                     // 读取节点名(最多 63 字节,超出则跳过至 '\0')。
                     current_node_len = 0;
                     while pos < struct_end && current_node_len < 63 {
@@ -202,7 +213,14 @@ impl Fdt {
                     }
                     pos = (pos + 3) & !3; // 对齐到 4 字节
                 }
-                FDT_END_NODE => {}
+                FDT_END_NODE => {
+                    // M4(审计 18 轮外部):出栈,恢复父节点名。
+                    depth = depth.saturating_sub(1);
+                    if depth < node_stack.len() {
+                        current_node = node_stack[depth];
+                        current_node_len = node_stack_len[depth];
+                    }
+                }
                 FDT_PROP => {
                     if pos + 8 > struct_end {
                         break;
@@ -286,7 +304,7 @@ impl Fdt {
         }
     }
 
-    fn read_string<'a>(&self, strings_ptr: *const u8, offset: usize) -> Option<&'a str> {
+    fn read_string(&self, strings_ptr: *const u8, offset: usize) -> Option<&str> {
         if offset >= self.total_size - self.off_strings {
             return None;
         }

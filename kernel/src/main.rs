@@ -46,8 +46,8 @@ pub static mut BOOT_LOCK: u32 = 0;
 ///
 /// # 参数
 /// - `hartid`:当前 hart 编号(OpenSBI 引导时经 a0 传入,原样透传)。
-/// - `fdt`:设备树(FDT)指针(OpenSBI 经 a1 传入)。当前阶段仅记录;
-///   硬件探测(如 UART 基址)仍依赖硬编码常量,真机移植时优先改造这里。
+/// - `fdt`:设备树(FDT)指针(OpenSBI 经 a1 传入)。M1.5 已完整解析
+///   FDT 得到 RAM/UART/定时器频率/保留区等参数(见 board::init_from_fdt)。
 ///
 /// # 初始化顺序(依赖关系,勿随意调整)
 /// 1. `arch::irq_disable` —— 在一切操作前建立确定的中断状态

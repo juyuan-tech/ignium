@@ -381,10 +381,19 @@ pub unsafe extern "C" fn trap_handler(
                 // + 重排下一次中断。wrapping_add(MED-4):overflow-checks
                 // 开启下,极端时间(理论 18 万年后)不触发 panic。
                 // SSTC 直写 stimecmp(替代 ecall,见 enable_timer)。
+                // M7(审计 18 轮外部):若中断长时间关闭后 deadline 严重
+                // 落后,用 max(now + interval) 防止 tick 风暴。
                 crate::logger::tick_up();
-                let next = TIMER_DEADLINE
+                let ideal = TIMER_DEADLINE
                     .fetch_add(timer_interval(), Ordering::Relaxed)
                     .wrapping_add(timer_interval());
+                let now = get_time();
+                let next = if ideal < now {
+                    now + timer_interval()
+                } else {
+                    ideal
+                };
+                TIMER_DEADLINE.store(next, Ordering::Relaxed);
                 set_stimecmp(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程
                 // 的帧指针,汇编恢复路径据此 sret 进入新线程

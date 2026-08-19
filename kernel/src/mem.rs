@@ -137,12 +137,14 @@ impl BuddyAllocator {
     ///
     /// 保留区处理(CRITICAL#1):只改元数据是不够的 —— 含保留区的
     /// 空闲块必须被**拆分/刻蚀**,否则整块仍可被分配、覆盖保留区。
-    /// 做法:自顶向下 carve,与保留区无交叠的块整块入链,完全在
-    /// 保留区内的块标记永久占用,部分交叠的递归拆分。
+    /// 做法:自顶向下 carve,与所有保留区均无交叠的块整块入链,完全在
+    /// 任一保留区内的块标记永久占用,部分交叠的递归拆分。
+    ///
+    /// M8(审计 18 轮外部):支持多个不相交保留区间,避免过度保留。
     ///
     /// # Safety
     /// 只允许调用一次;`base` 必须页对齐;元数据数组容量足够。
-    unsafe fn init(&mut self, base: usize, count: usize, reserved: (usize, usize)) {
+    unsafe fn init(&mut self, base: usize, count: usize, reserved: &[(usize, usize)]) {
         debug_assert!(count <= MAX_PAGES);
         // 向上补齐到 2^MAX_ORDER 的倍数:补齐页标记为**永久占用**,
         // 使所有块都是完整的 order-12 —— 尾部不再产生小阶块,
@@ -168,11 +170,7 @@ impl BuddyAllocator {
             m.order = MAX_ORDER as u8;
             m.used = true; // 永久占用,永不出链
         }
-        // 保留区收敛到 real_count(自审回归):FDT 区间若越过 RAM
-        // 末尾,不收敛会使 re > page_count,其后所有块被 carve 误判
-        // 为"完全在保留区内"而永久占用。
-        let reserved = (reserved.0.min(count), reserved.1.min(count));
-        if reserved.0 >= reserved.1 {
+        if reserved.is_empty() {
             // 无有效保留区:整区入链。先按 order-12 放完整块,
             // 尾部不足 16MB 的部分按小阶块入链(回收尾部内存,M2)。
             let mut idx = 0usize;
@@ -200,43 +198,42 @@ impl BuddyAllocator {
 
     /// 递归刻蚀:构建空闲链表,同时把保留区页标记为永久占用。
     ///
-    /// 块(页区间 `[idx, idx + 2^order)`):
-    /// - **进入补齐区**(`s >= real_count`)→ 跳过(init 已标记占用)
-    /// - **跨过补齐边界**(`e > real_count`)→ 拆分,只入链界内部分
-    /// - 与保留区**无交叠** → 整块入链
-    /// - **完全在**保留区内 → 标记 order=0xFF 永久占用
-    /// - **部分交叠** → 拆成两个子块递归处理
-    ///
-    /// 补齐区与保留区的处理共同保证:任何入链块都完整落在
-    /// `[0, real_count)` 真实物理页内(HIGH#1)。
-    fn carve(&mut self, idx: usize, order: usize, reserved: (usize, usize)) {
-        let (rs, re) = reserved;
+    /// `reserved` 为保留区间列表(页索引,上下界均收敛到 real_count)。
+    /// 块与**所有**保留区间均无交叠时入链;完全在任一区间内时标记
+    /// 永久占用;部分交叠时递归拆分(M8:支持多个不相交区间)。
+    fn carve(&mut self, idx: usize, order: usize, reserved: &[(usize, usize)]) {
         let size = 1usize << order;
         let s = idx;
         let e = idx + size;
         if s >= self.real_count {
-            // 完全在补齐区:init 已标记 order=MAX_ORDER+used,跳过。
             return;
         }
         if e > self.real_count {
-            // 跨过补齐边界:拆分到界内(补齐区部分自然被排除)。
             self.carve(idx, order - 1, reserved);
             self.carve(idx + (size >> 1), order - 1, reserved);
             return;
         }
-        if e <= rs || s >= re {
-            // 完全在保留区外 → 入链。
+        let mut inside_any = false;
+        let mut overlap_any = false;
+        for &(rs, re) in reserved {
+            if s >= rs && e <= re {
+                inside_any = true;
+                break;
+            }
+            if e > rs && s < re {
+                overlap_any = true;
+            }
+        }
+        if !overlap_any {
             self.push(idx, order);
             return;
         }
-        if s >= rs && e <= re {
-            // 完全在保留区内 → 永久占用(永不出链)。
+        if inside_any {
             let m = self.meta(idx);
             m.order = u8::MAX;
             m.used = true;
             return;
         }
-        // 部分交叠 → 拆分。order 0 且部分交叠不可能(保留区页对齐)。
         self.carve(idx, order - 1, reserved);
         self.carve(idx + (size >> 1), order - 1, reserved);
     }
@@ -365,35 +362,31 @@ pub fn init(params: &fdt::BoardParams) {
         count <= MAX_PAGES,
         "RAM size ({count} pages) exceeds MAX_PAGES ({MAX_PAGES}); increase MAX_PAGES"
     );
-    // 保留区:合并 FDT 解析出的所有保留项(含 FDT 自身数据区 +
-    // reserve map + 其他保留区域)。
-    let (rs, re) = {
-        let mut rs = count; // 默认为空(无保留)
-        let mut re = 0;
-        for i in 0..params.reserved_count {
+    // 保留区:将 BoardParams 中的保留区间转换为页索引后传入
+    // allocator 的 init(M8:支持多个不相交区间,避免过度保留)。
+    let reserved_pairs: [(usize, usize); 8] = {
+        let mut pairs = [(0usize, 0usize); 8];
+        let mut n = 0;
+        for i in 0..params.reserved_count.min(8) {
             let (r_addr, r_size) = params.reserved[i];
             if r_size == 0 {
                 continue;
             }
-            // 保留区起点向下取整,终点向上取整(页对齐后,上下文变换到 base 相对)。
             let r_start = r_addr / PAGE_SIZE * PAGE_SIZE;
             let r_end = r_addr.saturating_add(r_size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            // 跳过不在分配区内的保留区。
             if r_end <= base || r_start >= ram_end {
                 continue;
             }
             let idx_start = r_start.saturating_sub(base) / PAGE_SIZE;
             let idx_end = r_end.saturating_sub(base).div_ceil(PAGE_SIZE);
-            rs = rs.min(idx_start);
-            re = re.max(idx_end);
+            if idx_start < idx_end && n < 8 {
+                pairs[n] = (idx_start.min(count), idx_end.min(count));
+                n += 1;
+            }
         }
-        if rs < re {
-            (rs, re)
-        } else {
-            (0, 0) // 无有效保留区
-        }
+        pairs
     };
-    with_allocator(|a| unsafe { a.init(base, count, (rs, re)) });
+    with_allocator(|a| unsafe { a.init(base, count, &reserved_pairs[..]) });
 }
 
 /// 真实可分配页数(不含补齐页;I2:报告给调用方的应是真实数,
