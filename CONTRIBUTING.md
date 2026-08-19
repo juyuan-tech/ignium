@@ -6,7 +6,8 @@
 
 1. 在 WSL2 (Ubuntu 24.04) 配置环境(见 README「快速开始」)
 2. 读 `docs/DESIGN.md`(架构铁律)与 `AGENTS.md`(执行规范)
-3. 从 `ROADMAP.md` 的当前里程碑领任务(未列出的任务先开 Issue 讨论)
+3. 文档与规划另见 [Wiki](https://github.com/juyuan-tech/ignium/wiki)(架构/模块/构建测试/路线图/多核规划)
+4. 从 `ROADMAP.md` 的当前里程碑领任务(未列出的任务先开 Issue 讨论)
 
 ## 开发流程
 

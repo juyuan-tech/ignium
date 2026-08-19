@@ -6,6 +6,7 @@
 - 许可证:Apache-2.0
 - 开发环境:WSL2 (Ubuntu 24.04) + QEMU,无需物理机
 - 启动链:QEMU OpenSBI 固件 → Ignium 内核 @0x80200000(S 模式)
+- 📚 文档 Wiki:[github.com/juyuan-tech/ignium/wiki](https://github.com/juyuan-tech/ignium/wiki)
 
 ## 定位与差异化
 
@@ -103,6 +104,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 ## 团队协作
 
 - 加入团队前必读:`CONTRIBUTING.md`(流程)、`AGENTS.md`(红线)、`docs/DESIGN.md`(架构)
+- 团队 Wiki:架构/模块/构建测试/路线图/多核规划等见 [Wiki](https://github.com/juyuan-tech/ignium/wiki)
 - 质量门禁:clippy 零警告 / fmt / QEMU 冒烟(CI 与本地 `make` 等价)
 - 工具链锁定 1.97.1(rust-toolchain.toml 与 CI 双端同步)
 
