@@ -24,10 +24,13 @@ pub fn init_from_fdt(params: &crate::fdt::BoardParams) {
     }
 }
 
-/// 从 FDT 参数中提取 ISA 信息(当前仅打印,后续用于运行时回退)。
+/// 从 FDT 参数中提取 ISA 信息。
 fn detect_from_fdt(params: &crate::fdt::BoardParams) -> Option<Capabilities> {
-    // FDT 解析器当前不提取 riscv,isa 属性,返回 None。
-    // FDT 遍历扩展留在后续阶段(需要更复杂的节点路径跟踪)。
-    let _ = params;
-    None
+    if params.isa_string.is_empty() {
+        None
+    } else {
+        Some(Capabilities {
+            isa_string: params.isa_string,
+        })
+    }
 }

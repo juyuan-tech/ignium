@@ -47,7 +47,10 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     } else {
         DEFAULT_RAM_SIZE
     };
-    let uart_base = if params.uart_base != 0 && params.uart_base.is_multiple_of(4) {
+    let uart_base = if params.uart_base != 0
+        && params.uart_base.is_multiple_of(4)
+        && (params.uart_base < ram_start || params.uart_base >= ram_start.saturating_add(ram_size))
+    {
         params.uart_base
     } else {
         DEFAULT_UART_BASE

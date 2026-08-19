@@ -51,6 +51,30 @@ kernel. You are NOT the author. Assume the author's self-review is biased and
 incomplete. Your job is to find what the author missed. Be thorough and
 exhaustive — do not stop at surface-level issues. Flag everything suspicious.
 
+IMPORTANT: This is audit V3. The previous audit (V2, 20260819-122344) found
+2 CRITICAL, 6 HIGH, 8 MEDIUM, and 18 LOW issues. ALL of those have been
+fixed and committed. Do NOT re-report them. Focus on finding NEW issues that
+the previous audits and the author's self-reviews missed.
+
+Previously fixed issues (do not re-report):
+- C1: Buddy allocator only free-listed first 16MiB block → fixed: loop over all MAX_ORDER blocks
+- C2: frame_restore lost outgoing context → fixed: frame_restore saves old_ctx before sret
+- H1: Stack guard unmap silently failed on 2MiB boundary → fixed: assert unmap_4k is_ok()
+- H2: unmap_4k didn't flush TLB → fixed: sfence.vma inside unmap_4k
+- H3: pick_next fallback could return Blocked thread → fixed: check state != Running
+- H4: SBI set_timer t0-t6 clobbers → fixed: clobber_abi
+- H5: FDT parser struct_end used total_size → fixed: bound by size_dt_struct
+- H6: heap::dealloc slab path didn't validate slot alignment → fixed: offset/alignment check
+- M1: Thread stacks no guard pages → documented
+- M2: board validation accepts non-2MiB RAM → fixed: 2MiB alignment check
+- M3: FDT 4-byte alignment → fixed: 8-byte alignment
+- M4: FDT node-name tracking not unwound → fixed: node stack
+- M5: read_string unconstrained lifetime → fixed: bound to &self
+- M6: woken flag level-based → fixed: cleared in pick_next
+- M7: Timer deadline storm → fixed: catch-up max(now, ideal)
+- M8: Reserved region single range → fixed: multi-interval carve
+- L1-L18: All low findings addressed (fence.i, comments, docs, etc.)
+
 Project context:
 - Language: Rust (no_std + alloc), edition 2021, toolchain pinned 1.97.1
 - Architecture: RISC-V 64 (riscv64gc), running in S-mode on QEMU virt
@@ -69,13 +93,14 @@ Project context:
 - IRQ-safe SpinLock (saves/restores SIE on lock/unlock); Mutex (block/wake
   with waiters queue), Condvar (wait/notify_one/notify_all).
 - Buddy allocator (order 0..12, 4KB pages, 128 MiB max, MAX_PAGES=32768,
-  carve for FDT reserved regions). Slab heap (8 classes 16B..2KB, page
-  chain traversal, page path for large objects).
+  carve for FDT reserved regions, multi-interval support). Slab heap (8
+  classes 16B..2KB, page chain traversal, page path for large objects).
 - FDT parser (kernel/src/fdt.rs): minimal, extracts RAM range, timebase
-  frequency, UART base, reserved regions. Board params (board.rs): runtime
+  frequency, UART base, reserved regions. 8-byte alignment, node-name stack,
+  struct_end bounded by size_dt_struct. Board params (board.rs): runtime
   functions with FDT fallback and QEMU virt defaults.
 - Sv39 identity mapping with per-section permissions (D2), stack guard
-  pages (D4, 4KB unmapped below boot/trap stacks).
+  pages (D4, 4KB unmapped below boot/trap stacks, assert unmap success).
 - CPU capability detection (cpu.rs): ISA string from FDT (RVA23 P1).
   RVA23 CI: separate job with -cpu max and Zba+Zbb+Zbs+Zicond extensions.
 - Single-core only (secondary harts parked in entry.S via BOOT_LOCK
@@ -116,9 +141,7 @@ Output format (markdown):
 ## Executive summary
 ## Findings (severity-ranked: CRITICAL / HIGH / MEDIUM / LOW / INFO)
 For each finding: severity, file:line, description, concrete fix suggestion.
-Distinguish between NEW findings (this audit) and findings that were already
-reported in the previous audit (docs/audit-reports/20260818-103645-deepseek-v4-pro.md).
-Mark NEW findings explicitly with [NEW].
+Mark ALL findings as [NEW] — do NOT report previously fixed issues.
 ## What looks correct (so the author knows what not to change)
 ## Blind spots & suggestions for the next milestone (M2: user processes / IPC
 / capabilities / multi-core)

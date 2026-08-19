@@ -27,6 +27,8 @@ pub struct BoardParams {
     pub ram_size: usize,
     pub timebase_freq: usize,
     pub uart_base: usize,
+    /// ISA 字符串(由 riscv,isa 属性解析,如 "rv64imafdch")。
+    pub isa_string: &'static str,
     /// 保留区列表(最多 8 项,栈分配)。
     pub reserved: [(usize, usize); 8],
     pub reserved_count: usize,
@@ -39,6 +41,7 @@ impl BoardParams {
             ram_size: 0,
             timebase_freq: 0,
             uart_base: 0,
+            isa_string: "",
             reserved: [(0, 0); 8],
             reserved_count: 0,
         }
@@ -269,7 +272,7 @@ impl Fdt {
             None => return,
         };
         match name {
-            "reg" if node == b"memory" => {
+            "reg" if node.starts_with(b"memory") => {
                 // 2-cell address + 2-cell size。
                 if prop_len >= 16 {
                     let ah = unsafe { be32(struct_ptr as usize + val_start) };
@@ -280,23 +283,50 @@ impl Fdt {
                     params.ram_size = ((sh as u64) << 32 | sl as u64) as usize;
                 }
             }
-            "timebase-frequency" if node == b"cpus" => {
+            "timebase-frequency" if node == b"cpus" || node.starts_with(b"cpus@") => {
                 if prop_len >= 4 {
                     params.timebase_freq =
                         unsafe { be32(struct_ptr as usize + val_start) } as usize;
                 }
             }
             "compatible" => {
-                if node.starts_with(b"serial@") && params.uart_base == 0 {
+                if (node.starts_with(b"uart") || node.starts_with(b"serial"))
+                    && params.uart_base == 0
+                {
                     let compat =
                         unsafe { core::slice::from_raw_parts(struct_ptr.add(val_start), prop_len) };
                     let is_ns16550 = compat.windows(7).any(|w| w == b"ns16550")
                         || compat.windows(8).any(|w| w == b"ns16550a");
                     if is_ns16550 {
-                        let addr_str = &node[7..];
-                        if let Ok(addr) = parse_hex(addr_str) {
-                            params.uart_base = addr;
+                        // 从节点名解析基址(如 "uart@10000000" → 0x10000000)
+                        if let Some(at_pos) = node.iter().position(|&c| c == b'@') {
+                            if let Ok(addr) = parse_hex(&node[at_pos + 1..]) {
+                                params.uart_base = addr;
+                            }
                         }
+                    }
+                }
+            }
+            "riscv,isa" if node.starts_with(b"cpu@") && params.isa_string.is_empty() => {
+                if prop_len > 0 && prop_len < 128 {
+                    let ptr = unsafe { struct_ptr.add(val_start) };
+                    let len = {
+                        let mut n = 0;
+                        while n < prop_len {
+                            let c = unsafe { core::ptr::read_volatile(ptr.add(n)) };
+                            if c == 0 {
+                                break;
+                            }
+                            n += 1;
+                        }
+                        n
+                    };
+                    if len > 0 {
+                        // SAFETY:FDT 数据全程有效,延长生命周期到 'static。
+                        let s: &'static str = unsafe {
+                            core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
+                        };
+                        params.isa_string = s;
                     }
                 }
             }
