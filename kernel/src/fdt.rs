@@ -49,17 +49,25 @@ impl BoardParams {
         if addr == 0 || size == 0 {
             return;
         }
-        // 去重:与已有项有交叠时扩展而非新增。
-        for i in 0..self.reserved_count {
+        let mut addr = addr;
+        let mut size = size;
+        let mut end = addr.saturating_add(size);
+        // 扫描已有项,合并所有交叠的区域(可能跨越多项)。
+        let mut i = 0;
+        while i < self.reserved_count {
             let (r_addr, r_size) = self.reserved[i];
             let r_end = r_addr.saturating_add(r_size);
-            let end = addr.saturating_add(size);
             if addr < r_end && end > r_addr {
-                // 交叠:合并
-                let new_addr = addr.min(r_addr);
-                let new_end = end.max(r_end);
-                self.reserved[i] = (new_addr, new_end.saturating_sub(new_addr));
-                return;
+                // 交叠:合并到当前项,移除被合并项。
+                addr = addr.min(r_addr);
+                end = end.max(r_end);
+                size = end.saturating_sub(addr);
+                // 将被合并项替换为最后一项,然后收缩计数。
+                self.reserved[i] = self.reserved[self.reserved_count - 1];
+                self.reserved_count -= 1;
+                // 不递增 i,继续检查新换入的项。
+            } else {
+                i += 1;
             }
         }
         if self.reserved_count < self.reserved.len() {
@@ -111,7 +119,7 @@ impl Fdt {
         }
         if off_struct.saturating_add(size_struct) > total
             || off_strings.saturating_add(size_strings) > total
-            || off_rsvmap >= total
+            || off_rsvmap.checked_add(16).is_none_or(|end| end > total)
         {
             return None;
         }
@@ -163,7 +171,7 @@ impl Fdt {
             pos += 4;
             match token {
                 FDT_BEGIN_NODE => {
-                    // 读取节点名。
+                    // 读取节点名(最多 63 字节,超出则跳过至 '\0')。
                     current_node_len = 0;
                     while pos < struct_end && current_node_len < 63 {
                         let c = unsafe { core::ptr::read_volatile(struct_ptr.add(pos)) };
@@ -175,7 +183,18 @@ impl Fdt {
                         pos += 1;
                     }
                     current_node[current_node_len] = 0;
-                    pos += 1; // 跳过 '\0'
+                    // 若节点名 >= 63 字节,跳过剩余部分直到 '\0'。
+                    if current_node_len >= 63 {
+                        while pos < struct_end {
+                            let c = unsafe { core::ptr::read_volatile(struct_ptr.add(pos)) };
+                            pos += 1;
+                            if c == 0 {
+                                break;
+                            }
+                        }
+                    } else {
+                        pos += 1; // 跳过 '\0'
+                    }
                     pos = (pos + 3) & !3; // 对齐到 4 字节
                 }
                 FDT_END_NODE => {}
@@ -187,10 +206,12 @@ impl Fdt {
                     let name_off = unsafe { be32(struct_ptr as usize + pos + 4) } as usize;
                     pos += 8;
                     let val_start = pos;
-                    pos += (prop_len + 3) & !3;
-                    if pos > struct_end {
+                    // 检查属性值是否完全在结构块内(含对齐填充)。
+                    let padded = (prop_len + 3) & !3;
+                    if pos.checked_add(padded).is_none_or(|end| end > struct_end) {
                         break;
                     }
+                    pos += padded;
                     self.handle_prop(
                         &current_node[..current_node_len],
                         name_off,
