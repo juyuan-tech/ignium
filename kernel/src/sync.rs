@@ -315,10 +315,10 @@ fn cond_producer2() {
     TEST_COND2.notify_one();
 }
 
-/// 互斥自检线程:在锁内递增 500 次(8 线程混合切换版本,覆盖
-/// 抢占-协作交错的 ctx_valid/frame_valid 协议)。
+/// 互斥自检线程:在锁内递增 2000 次(8 线程混合切换版本,覆盖
+/// 抢占-协作交错的 ctx_valid/frame_valid 协议,万级压力)。
 fn mutex_mixed() {
-    for _ in 0..500 {
+    for _ in 0..2000 {
         let mut g = TEST_MUTEX.lock();
         *g += 1;
         // 偶次迭代让出:制造协作切换与抢占交错的混合路径。
@@ -384,22 +384,22 @@ pub fn self_test() -> Result<(), &'static str> {
         return Err("condvar contended release deadlock");
     }
 
-    // 混合路径压力:8 线程 × 500 次互斥递增 + 偶次 yield
-    // (抢占-协作交错,覆盖 ctx_valid/frame_valid 协议回归)。
+    // 混合路径压力:8 线程 × 2000 次互斥递增 + 偶次 yield
+    // (抢占-协作交错,覆盖 ctx_valid/frame_valid 协议回归,万级压力)。
     *TEST_MUTEX.lock() = 0;
     TEST_MUTEX_MIXED_DONE.store(0, Ordering::Relaxed);
     for _ in 0..8 {
         sched::spawn(mutex_mixed, sched::PRIO_HIGH);
     }
     guard = 0;
-    while TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) != 8 && guard < 500_000 {
+    while TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) != 8 && guard < 2_000_000 {
         sched::yield_();
         guard += 1;
     }
     if TEST_MUTEX_MIXED_DONE.load(Ordering::Acquire) != 8 {
         return Err("mixed-path mutex timeout");
     }
-    if *TEST_MUTEX.lock() != 8 * 500 {
+    if *TEST_MUTEX.lock() != 8 * 2000 {
         return Err("mixed-path mutex counter mismatch");
     }
     Ok(())

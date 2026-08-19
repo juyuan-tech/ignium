@@ -687,6 +687,20 @@ pub fn self_test() -> Result<(), &'static str> {
     if delay > 3 {
         return Err("priority preemption not immediate");
     }
+
+    // 5) 调度压力:16 线程 × 1000 次递增+yield,验证大规模协作。
+    TEST_STRESS_DONE.store(0, Ordering::Relaxed);
+    for _ in 0..16 {
+        spawn(test_stress, PRIO_HIGH);
+    }
+    guard = 0;
+    while TEST_STRESS_DONE.load(Ordering::Relaxed) < 16 * 1000 && guard < 500_000 {
+        yield_();
+        guard += 1;
+    }
+    if TEST_STRESS_DONE.load(Ordering::Relaxed) != 16 * 1000 {
+        return Err("scheduler stress test timeout");
+    }
     Ok(())
 }
 
@@ -743,6 +757,14 @@ fn test_prio_high() {
     TEST_PRIO_HIGH_DONE.store(true, Ordering::Relaxed);
 }
 
+/// 调度压力线程:1000 次递增 + yield,测试大规模协作。
+fn test_stress() {
+    for _ in 0..1000 {
+        TEST_STRESS_DONE.fetch_add(1, Ordering::Relaxed);
+        yield_();
+    }
+}
+
 static TEST_CTR: AtomicUsize = AtomicUsize::new(0);
 static TEST_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_BUSY: AtomicUsize = AtomicUsize::new(0);
@@ -753,6 +775,7 @@ static TEST_PRIO_LOW_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_PRIO_HIGH_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_PRIO_LOW_START: AtomicUsize = AtomicUsize::new(0);
 static TEST_PRIO_HIGH_START: AtomicUsize = AtomicUsize::new(0);
+static TEST_STRESS_DONE: AtomicUsize = AtomicUsize::new(0);
 
 // ===== 性能基线(上下文切换) =====
 
