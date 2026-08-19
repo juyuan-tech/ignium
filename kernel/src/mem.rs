@@ -372,7 +372,18 @@ pub fn init(params: &fdt::BoardParams) {
             continue;
         }
         let r_start = r_addr / PAGE_SIZE * PAGE_SIZE;
-        let r_end = r_addr.saturating_add(r_size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        // 自审修复:恶意 FDT 可给巨大 r_size,使 saturating_add 后
+        // div_ceil*PAGE_SIZE 溢出(panic 或回绕)。把区间收敛到
+        // [0, ram_end) 且用 checked 边界计算,杜绝溢出路径。
+        let r_end_raw = match r_addr.checked_add(r_size) {
+            Some(e) => e,
+            None => ram_end, // 溢出:视为覆盖到 RAM 末端(会被下方裁剪)
+        };
+        let r_end = r_end_raw.min(ram_end);
+        let r_end = r_end
+            .div_ceil(PAGE_SIZE)
+            .checked_mul(PAGE_SIZE)
+            .unwrap_or(ram_end);
         if r_end <= base || r_start >= ram_end {
             continue;
         }

@@ -58,15 +58,25 @@ static mut SLAB_PAGE_CLASS: [u8; mem::MAX_PAGES] = [NOT_SLAB; mem::MAX_PAGES];
 /// 分配区基址缓存(性能优化):`mem::base()` 每次经分配器锁,
 /// 堆快路径(每次 alloc/dealloc)不承受该开销;init 时缓存一次。
 static ALLOC_BASE: AtomicUsize = AtomicUsize::new(0);
+/// 分配区可分配页数缓存(*PAGE_SIZE):`mem::page_count()` 每次经分配器锁,
+/// dealloc 的界检查走本缓存,避免每释放一次就重入一次分配器锁。
+static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// 初始化堆(缓存基址;须在 mem::init 之后、任何堆操作之前)。
 pub fn init() {
     ALLOC_BASE.store(mem::base(), Ordering::Relaxed);
+    ALLOC_BYTES.store(mem::page_count() * mem::PAGE_SIZE, Ordering::Relaxed);
 }
 
 #[inline]
 fn heap_base() -> usize {
     ALLOC_BASE.load(Ordering::Relaxed)
+}
+
+/// 分配区可写字节数(缓存,界检查用)。
+#[inline]
+fn heap_bytes() -> usize {
+    ALLOC_BYTES.load(Ordering::Relaxed)
 }
 
 fn slab_class_of(page: usize) -> u8 {
@@ -237,7 +247,7 @@ impl KernelHeap {
         // 页数** —— 过宽的 MAX_PAGES 检查会让 padding/未分配区的
         // 指针进入大对象路径读 ptr-8(越界)。
         let base = heap_base();
-        if page < base || page - base >= mem::page_count() * mem::PAGE_SIZE {
+        if page < base || page - base >= heap_bytes() {
             panic!(
                 "kernel heap: invalid pointer {:#x} (outside allocatable region)",
                 ptr as usize

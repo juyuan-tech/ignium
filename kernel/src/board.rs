@@ -35,8 +35,9 @@ const KERNEL_LINK_BASE: usize = 0x8020_0000;
 /// Sv39 物理地址上限(2^39)。
 const SV39_MAX_PHYS: usize = 1usize << 39;
 
-// 链接脚本符号:内核镜像结束地址。
+// 链接脚本符号:内核镜像边界。
 extern "C" {
+    static _kernel_start: u8;
     static _kernel_end: u8;
 }
 
@@ -44,6 +45,15 @@ extern "C" {
 ///
 /// 会对 FDT 值做基本合理性校验,异常值回退默认值。
 pub fn init_from_fdt(params: &fdt::BoardParams) {
+    // 自审修复:内核链接基址必须与链接脚本 BASE_ADDRESS 一致,
+    // 否则 RAM 覆盖判定与 mmu 映射全部错位 —— 引导期尽早 panic。
+    let kernel_start = (&raw const _kernel_start).addr();
+    assert!(
+        kernel_start == KERNEL_LINK_BASE,
+        "linker base {:#x} != KERNEL_LINK_BASE {:#x}; update linker.ld and board.rs together",
+        kernel_start,
+        KERNEL_LINK_BASE
+    );
     // 自审修复:先确定候选 RAM 范围,再统一校验,避免用不同的
     // ram_start 分别校验 ram_size 与 uart(逻辑不一致)。
     // 1) 候选 ram_start:非零且 2MB 对齐。
