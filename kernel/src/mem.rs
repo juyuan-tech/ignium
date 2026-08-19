@@ -364,29 +364,27 @@ pub fn init(params: &fdt::BoardParams) {
     );
     // 保留区:将 BoardParams 中的保留区间转换为页索引后传入
     // allocator 的 init(M8:支持多个不相交区间,避免过度保留)。
-    let reserved_pairs: [(usize, usize); 8] = {
-        let mut pairs = [(0usize, 0usize); 8];
-        let mut n = 0;
-        for i in 0..params.reserved_count.min(8) {
-            let (r_addr, r_size) = params.reserved[i];
-            if r_size == 0 {
-                continue;
-            }
-            let r_start = r_addr / PAGE_SIZE * PAGE_SIZE;
-            let r_end = r_addr.saturating_add(r_size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            if r_end <= base || r_start >= ram_end {
-                continue;
-            }
-            let idx_start = r_start.saturating_sub(base) / PAGE_SIZE;
-            let idx_end = r_end.saturating_sub(base).div_ceil(PAGE_SIZE);
-            if idx_start < idx_end && n < 8 {
-                pairs[n] = (idx_start.min(count), idx_end.min(count));
-                n += 1;
-            }
+    let mut reserved_pairs: [(usize, usize); 8] = [(0usize, 0usize); 8];
+    let mut n = 0;
+    for i in 0..params.reserved_count.min(8) {
+        let (r_addr, r_size) = params.reserved[i];
+        if r_size == 0 {
+            continue;
         }
-        pairs
-    };
-    with_allocator(|a| unsafe { a.init(base, count, &reserved_pairs[..]) });
+        let r_start = r_addr / PAGE_SIZE * PAGE_SIZE;
+        let r_end = r_addr.saturating_add(r_size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        if r_end <= base || r_start >= ram_end {
+            continue;
+        }
+        let idx_start = r_start.saturating_sub(base) / PAGE_SIZE;
+        let idx_end = r_end.saturating_sub(base).div_ceil(PAGE_SIZE);
+        if idx_start < idx_end && n < 8 {
+            reserved_pairs[n] = (idx_start.min(count), idx_end.min(count));
+            n += 1;
+        }
+    }
+    // 只传非空区间,使 allocator 的 reserved.is_empty() 快速路径生效。
+    with_allocator(|a| unsafe { a.init(base, count, &reserved_pairs[..n]) });
 }
 
 /// 真实可分配页数(不含补齐页;I2:报告给调用方的应是真实数,
