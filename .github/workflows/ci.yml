@@ -9,7 +9,6 @@ on:
   push:
   pull_request:
 
-# 最小权限:CI 只读仓库内容,不需要写权限。
 permissions:
   contents: read
 
@@ -18,27 +17,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # 工具链版本与 rust-toolchain.toml 严格一致(团队纪律:改版本两处同步)。
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: riscv64gc-unknown-none-elf
           components: llvm-tools, clippy, rustfmt
-      # QEMU 提供 qemu-system-riscv64(启动冒烟测试依赖)。
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
-      # dev + release 双 profile 都要编译通过(开发期 dev 构建带
-      # overflow-checks 与调试信息,两者都可能暴露不同问题)。
       - run: cargo build
       - run: cargo build --release
       - run: cargo clippy --release -- -D warnings
       - run: cargo fmt --check
-      # 启动冒烟:跑满 10s 收集完整输出,断言:
-      # 1) "M0: boot ok"(成功启动)
-      # 2) "buddy allocator selftest ok"(物理内存分配器自检通过)
-      # 3) "Sv39 paging ok"(页表 + 身份映射 + satp 切换成功)
-      # 4) >= 2 条 "uptime:"(定时器中断持续存活;单条可能是
-      #    "第一跳后定时器死亡"的假阳性,pro 审计 #6)
-      # 5) 无 "KERNEL PANIC"/"TRAP:"(启动后无故障)
-      - name: Boot test in QEMU
+      - name: Boot test in QEMU (default CPU)
         run: |
           timeout 10 qemu-system-riscv64 -M virt -m 128M -nographic -bios default \
           -kernel target/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-ci.log 2>&1 || true
@@ -50,3 +38,28 @@ jobs:
           grep -q "sync primitives selftest ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
+
+  rva23:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: riscv64gc-unknown-none-elf
+          components: llvm-tools
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+      # RVA23 P1:编译时启用 Zba+Zbb+Zbs+Zicond,在 -cpu max 下运行。
+      - name: Build with RVA23 extensions
+        run: cargo rustc --release -- -C target-feature=+zba,+zbb,+zbs,+zicond
+      - name: Boot test in QEMU (-cpu max)
+        run: |
+          timeout 10 qemu-system-riscv64 -cpu max -M virt -m 128M -nographic -bios default \
+          -kernel target/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-rva23.log 2>&1 || true
+          grep -q "M0: boot ok" /tmp/ignium-rva23.log
+          grep -q "buddy allocator selftest ok" /tmp/ignium-rva23.log
+          grep -q "Sv39 paging ok" /tmp/ignium-rva23.log
+          grep -q "kernel heap selftest ok" /tmp/ignium-rva23.log
+          grep -q "scheduler selftest ok" /tmp/ignium-rva23.log
+          grep -q "sync primitives selftest ok" /tmp/ignium-rva23.log
+          test "$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2
+          ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log

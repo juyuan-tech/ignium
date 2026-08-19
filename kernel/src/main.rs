@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod arch;
 mod board;
+mod cpu;
 mod fdt;
 mod heap;
 mod logger;
@@ -81,6 +82,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     board::init_from_fdt(&fdt_params);
     // FDT 解析后重初始化 UART(使基址反映 FDT 值)。
     crate::uart::reinit();
+    // CPU 能力检测(RVA23 P1:读取 ISA 信息,打印诊断)。
+    crate::cpu::init_from_fdt(&fdt_params);
     // 物理内存初始化(含 FDT 保留区刻蚀)+ 自检。
     // 分配器(M1):IRQ 安全 SpinLock(MED-3),持锁不被抢占;
     // 此项自检须在 irq_enable 之前(避免定时器与自检交错)。

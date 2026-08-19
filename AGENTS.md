@@ -14,7 +14,8 @@
 ```bash
 make clippy    # cargo clippy --release -- -D warnings(零警告)
 make fmt       # cargo fmt --check
-make test      # QEMU 启动冒烟
+make test      # QEMU 启动冒烟(默认 CPU)
+make test-rva23 # RVA23 P1:Zba/Zbb/Zbs+Zicond 扩展 + -cpu max 冒烟
 ```
 
 三条全绿才能提交。dev 与 release 双 profile 都要能编译:

@@ -69,6 +69,25 @@ test-smp:
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log \
 		&& echo "SMP TEST PASS" || (echo "SMP TEST FAIL"; cat /tmp/ignium-smp.log; exit 1)
 
+# RVA23 P1:使用 Zba+Zbb+Zbs+Zicond 扩展编译,在 -cpu max 下验证。
+RVA23_FEATURES = -C target-feature=+zba,+zbb,+zbs,+zicond
+
+build-rva23:
+	cargo rustc -p ignium-kernel --release -- $(RVA23_FEATURES)
+
+# RVA23 冒烟:与 test 相同断言,但使用 -cpu max(全扩展 CPU)。
+test-rva23: build-rva23
+	@timeout 10 $(QEMU) -cpu max $(QEMUARGS) -kernel $(KERNEL_ELF) > /tmp/ignium-rva23.log 2>&1 || true
+	@grep -q "M0: boot ok" /tmp/ignium-rva23.log \
+		&& grep -q "buddy allocator selftest ok" /tmp/ignium-rva23.log \
+		&& grep -q "Sv39 paging ok" /tmp/ignium-rva23.log \
+		&& grep -q "kernel heap selftest ok" /tmp/ignium-rva23.log \
+		&& grep -q "scheduler selftest ok" /tmp/ignium-rva23.log \
+		&& grep -q "sync primitives selftest ok" /tmp/ignium-rva23.log \
+		&& test "$$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2 \
+		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log \
+		&& echo "RVA23 TEST PASS" || (echo "RVA23 TEST FAIL"; cat /tmp/ignium-rva23.log; exit 1)
+
 clean:
 	cargo clean
 
@@ -78,4 +97,4 @@ clippy:
 fmt:
 	cargo fmt --check
 
-.PHONY: build bin qemu gdb test test-smp clean clippy fmt
+.PHONY: build bin qemu gdb test test-smp test-rva23 clean clippy fmt
