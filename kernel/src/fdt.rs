@@ -335,6 +335,29 @@ impl Fdt {
                     }
                 }
             }
+            "reg"
+                if (node == b"uart"
+                    || node.starts_with(b"uart@")
+                    || node == b"serial"
+                    || node.starts_with(b"serial@"))
+                    && params.uart_base == 0 =>
+            {
+                // 自审:对无地址后缀(@)的 uart/serial 节点,从 reg 属性
+                // 读取基址(替代节点名解析)。2-cell 或 1-cell。
+                if prop_len >= 8 {
+                    let ah = unsafe { be32(struct_ptr as usize + val_start) };
+                    let al = unsafe { be32(struct_ptr as usize + val_start + 4) };
+                    let addr = ((ah as u64) << 32 | al as u64) as usize;
+                    if addr != 0 {
+                        params.uart_base = addr;
+                    }
+                } else if prop_len >= 4 {
+                    let addr = unsafe { be32(struct_ptr as usize + val_start) } as usize;
+                    if addr != 0 {
+                        params.uart_base = addr;
+                    }
+                }
+            }
             "riscv,isa" if node.starts_with(b"cpu@") && params.isa_string.is_empty() => {
                 if prop_len > 0 && prop_len < 128 {
                     let ptr = unsafe { struct_ptr.add(val_start) };
