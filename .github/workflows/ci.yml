@@ -38,6 +38,13 @@ jobs:
           grep -q "sync primitives selftest ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
+      # V3 审计 #11:多核引导仲裁回归测试纳入 CI。
+      - name: SMP boot test (multi-hart arbitration)
+        run: |
+          timeout 10 qemu-system-riscv64 -M virt -m 128M -nographic -bios default -smp 4 \
+          -kernel target/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-smp.log 2>&1 || true
+          test "$(grep -c 'M0: boot ok' /tmp/ignium-smp.log)" -eq 1
+          ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log
 
   rva23:
     runs-on: ubuntu-latest
@@ -50,7 +57,10 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
       # RVA23 P1:编译时启用 Zba+Zbb+Zbs+Zicond,在 -cpu max 下运行。
       - name: Build with RVA23 extensions
-        run: cargo rustc --release -- -C target-feature=+zba,+zbb,+zbs,+zicond
+        run: cargo rustc -p ignium-kernel --release -- -C target-feature=+zba,+zbb,+zbs,+zicond
+      # V3 审计 #11:RVA23 构建同样通过 clippy/fmt 门禁。
+      - run: cargo clippy -- -D warnings
+      - run: cargo fmt --check
       - name: Boot test in QEMU (-cpu max)
         run: |
           timeout 10 qemu-system-riscv64 -cpu max -M virt -m 128M -nographic -bios default \

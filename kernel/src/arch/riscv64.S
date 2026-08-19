@@ -44,6 +44,12 @@ trap_vector:
     csrrw t6, sscratch, t6
     # 在陷阱栈上预留帧(t6 = 帧基址)。
     addi t6, t6, -TRAP_FRAME_SIZE
+    # V3 审计 #3(known limitation):前两次 sd 在嵌套检测之前写入帧。
+    # 原因:csrrw 单寄存器交换(sscratch)只能保留一个值,校验需要
+    # 第二个临时寄存器,会破坏原 t0(无法同时保存 t0 与校验)。
+    # M1.5 单核 S 模式 + 内核可控 sscratch(fit init_traps/frame_restore
+    # 均写 _trap_stack_top),此路径不可被外部触发;M2 用户态引入
+    # 受控 t6 前须重构为双 scratch CSR 或固定控制块方案。
     # 先保存原始 t0(t0 即将被用作临时寄存器;顺序至关重要,
     # 任何"先 clobber 后保存"都会使 dump 显示假值)。
     sd t0, 4*8(t6)

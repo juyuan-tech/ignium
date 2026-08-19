@@ -307,7 +307,8 @@ impl Scheduler {
         self.next_id += 1;
         // 零化-free 栈分配(性能优化):`vec![0u8; N]` 会白付 16KB
         // memset —— 栈内容无需初始化(初始帧/上下文显式构造)。
-        let stack = alloc_zeroed_free_stack();
+        // V3 审计 #10:函数名不再误导为"zeroed"。
+        let stack = alloc_free_stack();
         // HIGH-4:sp 须 16 字节对齐(RISC-V ABI);堆指针仅保证 8 对齐。
         let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
         // 初始帧:sepc = 线程包装器,sstatus:SPIE=1(进线程后开中断)
@@ -389,7 +390,7 @@ impl Drop for KernelStack {
     }
 }
 
-fn alloc_zeroed_free_stack() -> KernelStack {
+fn alloc_free_stack() -> KernelStack {
     let layout = core::alloc::Layout::from_size_align(THREAD_STACK_SIZE, 16).expect("stack layout");
     let ptr = unsafe { alloc::alloc::alloc(layout) };
     assert!(!ptr.is_null(), "kernel heap: thread stack OOM");
@@ -408,7 +409,7 @@ pub fn init() {
     s.threads.reserve(MAX_THREADS);
     // idle 线程:id=0,最低优先级,永不阻塞。
     let idle_id = 0;
-    let stack = alloc_zeroed_free_stack();
+    let stack = alloc_free_stack();
     let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
     let mut frame = [0usize; FRAME_WORDS];
     frame[FRAME_SEPC] = idle_entry as *const () as usize;
@@ -662,9 +663,11 @@ pub fn self_test() -> Result<(), &'static str> {
     if !TEST_DONE.load(Ordering::Relaxed) {
         return Err("thread exit not observed");
     }
-    // 3) 抢占:忙循环线程不 yield,持续到 tick 前进 >= 15
-    //    (150ms > 100ms 时间片 → 必被抢占至少一次,主线程才可能
-    //    继续;HIGH-3:旧测试目标在首片内完成,未真正验证抢占)。
+    // 3) 忙循环线程退出 + 协作恢复:test_busy 不 yield 运行 15 tick
+    //    (150ms),期间主线程(S 级轮转)可运行 —— 时间片到期时
+    //    on_tick 若无其他 frame-valid 线程则不清抢占(has_other 为假),
+    //    故本项实际验证"忙循环线程的正常运行与退出",抢占效果由
+    //    第 4 项(优先级抢占)覆盖。V3 审计 #7 更新说明。
     TEST_BUSY_DONE.store(false, Ordering::Relaxed);
     spawn(test_busy, PRIO_LOW);
     guard = 0;

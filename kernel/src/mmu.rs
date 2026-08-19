@@ -94,6 +94,11 @@ unsafe fn ensure_table(parent: *const u64, idx: usize) -> Result<*const u64, ()>
 }
 
 /// 映射 4KB 页(叶子在 L0)。
+///
+/// V3 审计 #5:此函数用于 init 期建立映射。post-boot 重映射时必须
+/// 先 `unmap_4k`(会刷新 TLB)再 `map_4k`,避免陈旧 TLB 命中;
+/// 且调用方须保证目标地址当前未映射有效 PTE(否则静默覆盖)。
+/// M2 用户态映射前应将此函数收敛为"拒绝覆盖已有 PTE"的 API。
 fn map_4k(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
     let l2 = (vaddr >> 30) & 0x1FF;
     let l1 = (vaddr >> 21) & 0x1FF;

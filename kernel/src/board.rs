@@ -29,6 +29,17 @@ static BOARD_TIMER_FREQ: AtomicUsize = AtomicUsize::new(0);
 /// 2MB 超页对齐(用于 RAM 超页映射)。
 const SUPER_PAGE: usize = 2 * 1024 * 1024;
 
+/// 内核链接基址(QEMU virt,OpenSBI 跳转地址)。
+const KERNEL_LINK_BASE: usize = 0x8020_0000;
+
+/// Sv39 物理地址上限(2^39)。
+const SV39_MAX_PHYS: usize = 1usize << 39;
+
+// 链接脚本符号:内核镜像结束地址。
+extern "C" {
+    static _kernel_end: u8;
+}
+
 /// 从 FDT 解析结果初始化板级参数。须在 mem::init 之前调用。
 ///
 /// 会对 FDT 值做基本合理性校验,异常值回退默认值。
@@ -39,9 +50,21 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     } else {
         DEFAULT_RAM_START
     };
+    // V3 审计 #4:验证 RAM 大小合理且不超容量。
+    // - >= 1MB 且 <= MAX_PAGES 页
+    // - 2MB 对齐(超页映射要求)
+    // - ram_end 不超 Sv39 物理窗口
+    // - ram_end 覆盖内核镜像末尾(保证分配器有页可用)
+    let kernel_end = (&raw const _kernel_end).addr();
+    let ram_max = (crate::mem::MAX_PAGES) * 4096;
     let ram_size = if params.ram_size >= 1024 * 1024
-        && params.ram_size <= 1024 * 1024 * 1024
+        && params.ram_size <= ram_max
         && params.ram_size.is_multiple_of(SUPER_PAGE)
+        && params
+            .ram_start
+            .saturating_add(params.ram_size)
+            .is_multiple_of(SUPER_PAGE)
+        && params.ram_start.saturating_add(params.ram_size) <= SV39_MAX_PHYS
     {
         params.ram_size
     } else {
@@ -49,6 +72,7 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     };
     let uart_base = if params.uart_base != 0
         && params.uart_base.is_multiple_of(4)
+        // UART 基址不能在 RAM 区间内(hostile FDT 任意物理写防护)。
         && (params.uart_base < ram_start || params.uart_base >= ram_start.saturating_add(ram_size))
     {
         params.uart_base
@@ -60,6 +84,13 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     } else {
         DEFAULT_TIMER_FREQ
     };
+    // V3 审计 #4:RAM start 必须覆盖内核(不早于 HART 入口,不晚于内核链接基址)。
+    let ram_start =
+        if ram_start <= KERNEL_LINK_BASE && ram_start.saturating_add(ram_size) > kernel_end {
+            ram_start
+        } else {
+            DEFAULT_RAM_START
+        };
     BOARD_RAM_START.store(ram_start, Ordering::Relaxed);
     BOARD_RAM_SIZE.store(ram_size, Ordering::Relaxed);
     BOARD_UART_BASE.store(uart_base, Ordering::Relaxed);

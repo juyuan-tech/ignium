@@ -119,7 +119,12 @@ impl Fdt {
         let off_rsvmap = be32_val(hdr.off_mem_rsvmap) as usize;
         let size_struct = be32_val(hdr.size_dt_struct) as usize;
         let size_strings = be32_val(hdr.size_dt_strings) as usize;
-        if total < mem::size_of::<FdtHeader>() {
+        // V3 审计 #9:校验 total_size 不过大且 fdt+total 不越物理边。
+        // 防止恶意/corrupt FDT 报巨大 totalsize 导致解析读越界(DoS)。
+        if total < mem::size_of::<FdtHeader>()
+            || total > 16 * 1024 * 1024
+            || fdt.checked_add(total).is_none_or(|end| end > max_phys)
+        {
             return None;
         }
         if off_struct.saturating_add(size_struct) > total
@@ -179,6 +184,8 @@ impl Fdt {
         let mut node_stack: [[u8; 64]; 8] = [[0; 64]; 8];
         let mut node_stack_len: [usize; 8] = [0; 8];
         let mut depth = 0usize;
+        // V3 审计 #9:超过 8 层后不再匹配节点名,防止错配。
+        let mut depth_exceeded = false;
         while pos + 4 <= struct_end {
             let token = unsafe { be32(struct_ptr as usize + pos) };
             pos += 4;
@@ -190,6 +197,10 @@ impl Fdt {
                         node_stack_len[depth] = current_node_len;
                     }
                     depth += 1;
+                    if depth > node_stack.len() {
+                        depth_exceeded = true;
+                    }
+                    // 深度超限:清空节点名,停止属性匹配(V3 审计 #9)。
                     // 读取节点名(最多 63 字节,超出则跳过至 '\0')。
                     current_node_len = 0;
                     while pos < struct_end && current_node_len < 63 {
@@ -223,30 +234,44 @@ impl Fdt {
                         current_node = node_stack[depth];
                         current_node_len = node_stack_len[depth];
                     }
+                    // 深度恢复后重新匹配。
+                    depth_exceeded = depth > node_stack.len();
                 }
                 FDT_PROP => {
                     if pos + 8 > struct_end {
                         break;
                     }
-                    let prop_len = unsafe { be32(struct_ptr as usize + pos) } as usize;
-                    let name_off = unsafe { be32(struct_ptr as usize + pos + 4) } as usize;
-                    pos += 8;
-                    let val_start = pos;
-                    // 检查属性值是否完全在结构块内(含对齐填充)。
-                    let padded = (prop_len + 3) & !3;
-                    if pos.checked_add(padded).is_none_or(|end| end > struct_end) {
-                        break;
+                    // 深度超限时跳过属性匹配(V3 审计 #9)。
+                    if !depth_exceeded {
+                        let prop_len = unsafe { be32(struct_ptr as usize + pos) } as usize;
+                        let name_off = unsafe { be32(struct_ptr as usize + pos + 4) } as usize;
+                        pos += 8;
+                        let val_start = pos;
+                        // 检查属性值是否完全在结构块内(含对齐填充)。
+                        let padded = (prop_len + 3) & !3;
+                        if pos.checked_add(padded).is_none_or(|end| end > struct_end) {
+                            break;
+                        }
+                        pos += padded;
+                        self.handle_prop(
+                            &current_node[..current_node_len],
+                            name_off,
+                            strings_ptr,
+                            val_start,
+                            prop_len,
+                            struct_ptr,
+                            &mut params,
+                        );
+                    } else {
+                        // 跳过属性(读 len + nameoff,移动 pos)。
+                        let prop_len = unsafe { be32(struct_ptr as usize + pos) } as usize;
+                        pos += 8;
+                        let padded = (prop_len + 3) & !3;
+                        if pos.checked_add(padded).is_none_or(|end| end > struct_end) {
+                            break;
+                        }
+                        pos += padded;
                     }
-                    pos += padded;
-                    self.handle_prop(
-                        &current_node[..current_node_len],
-                        name_off,
-                        strings_ptr,
-                        val_start,
-                        prop_len,
-                        struct_ptr,
-                        &mut params,
-                    );
                 }
                 FDT_NOP => {}
                 FDT_END => break,

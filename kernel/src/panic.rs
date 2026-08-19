@@ -109,9 +109,10 @@ fn dump_cpu(state: CpuState) {
             );
         }
         None => {
-            // sp 不在任何已知栈:LOW-2 —— 标记 unknown,不误导。
+            // sp 不在任何已知栈:LOW-2 + V3 审计 #8 —— 可能是
+            // 调度器线程的堆分配栈(16KB,未登记),非损坏。措辞区分。
             error!(
-                "WARNING: sp={:#x} outside all known stacks (corrupted?)",
+                "WARNING: sp={:#x} not in boot/trap stacks (may be a thread stack; watermark unavailable)",
                 sp
             );
             error!(
