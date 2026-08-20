@@ -21,6 +21,7 @@
 //! 等价的 mmu 接口(见 DESIGN.md 的 arch_mmu_* 契约与 ROADMAP 阶段 5)。
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::debug;
 use crate::mem;
@@ -115,10 +116,17 @@ fn map_4k(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()>
 }
 
 // ===========================================================================
-// M2 前置:用户地址空间映射契约(内部用 ensure_table 会带 U 位)。
+// ===========================================================================
+// M2 前置:用户地址空间映射契约(路径表指针只用 V,叶子才带 U)。
 // ===========================================================================
 
-/// 确保下一级表存在(表指针带 **U 位**,用户进程可经此表访问)。
+/// 确保下一级表存在(表指针 **仅 V 位,R/W/X/U/A/D 为 0**)。
+///
+/// RISC-V 规范(Sv39):中间级 PTE 是表指针,除 V 外其它位必须为 0;
+/// 用户访问权限由**叶子** PTE 的 U 位决定。QEMU 8.2 严格实现此点:
+/// 中间级条目带 U/A/D 位直接 `TRANSLATE_FAIL`(实测 scause=0xc,
+/// 用户页看似有效却无法翻译)。此前误用 `PTE_V | PTE_U` 是 M2 T1
+/// U 模式取指故障的根因。
 ///
 /// # Safety
 /// 同 `ensure_table`:parent 必须是有效页表地址。
@@ -133,7 +141,8 @@ unsafe fn ensure_table_user(parent: *const u64, idx: usize) -> Result<*const u64
         Ok(sub as *const u64)
     } else {
         let page = mem::alloc_pages_zeroed(0).ok_or(())?;
-        pte_write(parent, idx, pte(page, PTE_V | PTE_U));
+        // 表指针:仅 V 位(R/W/X/U/A/D 均为 0,见函数注释)。
+        pte_write(parent, idx, pte(page, PTE_V));
         Ok(page as *const u64)
     }
 }
@@ -143,10 +152,10 @@ unsafe fn ensure_table_user(parent: *const u64, idx: usize) -> Result<*const u64
 /// 契约(mmu 模块头 V4 已注明):
 /// - 若 vaddr 处已有有效 PTE(**拒绝覆盖**),返回 Err —— 防误覆盖内核
 ///   映射或其它用户映射;
-/// - 对路径上的中间表置 U 位,确保 U=1 叶子可被用户访问;
+/// - 中间表指针仅 V 位;用户访问权限由叶子 PTE 的 U 位授予;
 /// - 调用方须保证 vaddr 在用户地址空间范围,且 paddr 已用
-///   `mem::alloc_pages_zeroed`(或确认无需清零)。
-/// - 映射后该进程下一次切换需 `tlb_flush`(切换 satp 时统一做)。
+///   `mem::alloc_pages_zeroed`(或确认无需清零);
+/// - 映射后立即冲刷 TLB(首次访问前无陈旧项,保险起见统一刷)。
 #[allow(dead_code)] // 二进制 crate 中 M2 API 未调用
 pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
     // 自审(挑剔视角):Sv39 用户地址空间上限 2^38。越界 vaddr 的
@@ -170,6 +179,10 @@ pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Res
     }
     // M2 用户映射默认叶子需 U 位;调用方可传已含 PTE_U 的 flags。
     pte_write(l0_t, l0, pte(paddr, flags | PTE_U));
+    // TLB 冲刷:映射后立即可见(首次访问前无陈旧项,防护用途)。
+    unsafe {
+        asm!("sfence.vma zero, zero", options(nostack));
+    }
     Ok(())
 }
 
@@ -234,12 +247,22 @@ extern "C" {
     static _trap_stack_top: u8;
 }
 
+/// 内核页表根目录物理地址(M2 T1:用户映射/进程表用它作参照)。
+static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+/// 内核页表根目录物理地址(init 后有效)。
+pub fn kernel_root() -> usize {
+    KERNEL_ROOT.load(Ordering::Relaxed)
+}
+
 /// 初始化内核自身映射并启用分页。
 ///
 /// 调用顺序:必须在 `mem::init` 之后(页表页来自 buddy)、
 /// `irq_enable` 之前(中断路径依赖映射)。
 pub fn init() {
     let root = mem::alloc_pages(0).expect("root page table allocation failed");
+    // M2 T1:记录内核根目录,供用户映射(M2 API)与进程表参照。
+    KERNEL_ROOT.store(root, Ordering::Relaxed);
     unsafe { mem::zero_page(root) };
 
     let ram_start = crate::board::ram_start();

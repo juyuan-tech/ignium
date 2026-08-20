@@ -59,10 +59,10 @@ VisionFive 2)→ 烧录 → 串口/调试器 bring-up → 按 board.rs 抽象换
 > T0→T3 实现(见 M2-DESIGN 第 9 节)。
 
 | 任务 | 产出/验收 |
-|---|---|
-| U/S 特权级 + 每进程地址空间 | 用户代码执行 ecall |
-| 系统调用机制 + **L1 ABI 定义(对齐 LiteOS-A 风格)** | sys_read/write/open 占位 |
-| 进程管理:创建/退出/wait | spawn+exit+wait 全链路 |
+|---|---|---|
+| U/S 特权级 + 每进程地址空间 | ✅ 用户代码执行 ecall(T1 完成:用户线程 U 模式取指、ecall 往返、sys_get_ticks、sys_exit 验证) |
+| 系统调用机制 + **L1 ABI 定义(对齐 LiteOS-A 风格)** | ✅ a7 传 syscall 号、a0 返回值(L1 占位:sys_get_ticks/sys_exit),sys_write/open 待实现 |
+| 进程管理:创建/退出/wait | ✅ spawn_user(用户态线程创建)+ exit_from_trap(用户线程退出,正确帧切换) |
 | ELF 加载器(RISC-V) | 独立编译程序可运行 |
 | **IPC 设计**:同步 IPC + 注册发送 + 阻塞/唤醒 + 优先级继承 | A→B 消息往返正确 |
 | IPC 性能:寄存器小消息 + 共享内存大消息 | 延迟可测并记录 |

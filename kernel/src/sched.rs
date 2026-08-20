@@ -133,6 +133,12 @@ fn idle_entry() {
     }
 }
 
+/// 用户线程占位入口:用户线程经 frame_restore 直接 sret 进 U 模式代码,
+/// **不经过**本 S 模式包装;若被调用即内部错误(fail-loudly)。
+fn user_entry_stub() {
+    panic!("user thread entered kernel wrapper (internal error)");
+}
+
 /// 线程包装:运行入口函数,返回后退出。
 fn thread_entry() {
     // 首个上下文从 SIE=0 切入,显式开启中断(线程常态运行)。
@@ -371,6 +377,66 @@ impl Scheduler {
         self.enqueue(id);
         id
     }
+
+    /// M2 T1:新建**用户态**线程(执行 U 模式代码,经 ecall 进内核)。
+    ///
+    /// `entry_pc` 必须指向用户可执行(U 位)的虚拟地址;`stack_top` 为
+    /// 用户栈顶(用户可访问)。该线程**始终经 frame_restore(sret)恢复**:
+    /// ctx_valid 恒 false,因此协作选中也走帧恢复 → U 模式保持。
+    fn spawn_user(&mut self, entry_pc: usize, stack_top: usize, prio: u8) -> usize {
+        // M2 T0:同 spawn,优先复用已退出线程的 TCB 槽。
+        let reuse = self.free_slots.pop_front();
+        let id = match reuse {
+            Some(idx) => idx,
+            None => {
+                assert!(
+                    self.threads.len() < MAX_THREADS,
+                    "thread table full ({MAX_THREADS})"
+                );
+                self.threads.len()
+            }
+        };
+        // MED-10(审计 15 轮):优先级越界钳制,防就绪队列越界 panic。
+        let prio = prio.min(PRIO_LEVELS as u8 - 1);
+        // 初始帧:sepc = 用户代码入口;SPIE=1(进 U 后开中断)、
+        // **SPP=0 → sret 进入 U 模式**(与内核线程 S 模式不同);
+        // sp = 用户栈顶;gp = 0(用户程序不用内核 gp)。
+        // CRITICAL-2(审计 16 轮):帧内 sp 必须有效 —— 恢复路径会
+        // 从帧加载 sp;gp 与 trap_vector 入口无关(内核 gp 在 trap
+        // 入口重载,此处占位 0)。
+        let mut frame = [0usize; FRAME_WORDS];
+        frame[FRAME_SEPC] = entry_pc;
+        frame[FRAME_SSTATUS] = 1 << 5; // SPIE=1, SPP=0(U 模式)
+        frame[1] = stack_top;
+        frame[2] = 0;
+        let t = Thread {
+            prio,
+            state: ThreadState::Ready,
+            // ctx 占位(用户线程不经协作 ctx 恢复)。
+            ctx: Context {
+                ra: entry_pc,
+                sp: stack_top,
+                s: [0; 12],
+            },
+            frame,
+            // 新线程初始帧有效:可被抢占路径或协作路径选中恢复。
+            frame_valid: true,
+            // 用户线程只经帧恢复(U 模式),协作选中亦走 frame_restore。
+            ctx_valid: false,
+            woken: false,
+            // 占位:用户不经过 thread_entry(S 模式包装);进入即错误。
+            entry: user_entry_stub,
+            // 用户线程无内核栈(其 trap 用全局陷阱栈)。
+            stack: None,
+        };
+        if id < self.threads.len() {
+            self.threads[id] = t;
+        } else {
+            self.threads.push(t);
+        }
+        self.enqueue(id);
+        id
+    }
 }
 
 /// 调度器单例(SpinLock:主上下文/ISR 均不可重入)。
@@ -473,6 +539,18 @@ pub fn spawn(entry: fn(), prio: u8) -> usize {
     let mut s = SCHED.lock();
     let id = s.spawn(entry, prio);
     drop(s);
+    arch::irq_restore(irq);
+    id
+}
+
+/// M2 T1:新建用户态线程(`entry_pc` 为用户可执行虚拟地址,`stack_top`
+/// 为用户栈顶;二者须已按 U 权限映射到当前内核页表)。
+pub fn spawn_user(entry_pc: usize, stack_top: usize, prio: u8) -> usize {
+    let irq = arch::irq_save();
+    let id = {
+        let mut s = SCHED.lock();
+        s.spawn_user(entry_pc, stack_top, prio)
+    };
     arch::irq_restore(irq);
     id
 }
@@ -626,6 +704,60 @@ pub fn exit() -> ! {
     // 锁外切换(中断关闭保证原子性;恢复机制见 switch_target)。
     do_switch(&target);
     // exit_self 切走,不会到达这里;防御性停机。
+    arch::irq_restore(irq);
+    arch::halt()
+}
+
+/// 用户线程从 **trap 上下文**(ecall)退出,永不返回。
+///
+/// 与 `exit()`(从线程自身内核栈调用)不同:本函数在
+/// `trap_vector → trap_handler → ecall 分支` 中执行,CPU 位于
+/// **陷阱栈**上。此时若复用 `exit()` 的 `context_switch` 切到目标
+/// 线程,`sscratch` 会残留为本次 trap 的帧底(只有汇编的
+/// `frame_restore`/trap 恢复路径才重置 sscratch)——目标线程下一次
+/// trap 的嵌套检测(H2,`riscv64.S` label `4`)把残留帧底误判为
+/// "第二层 trap"而停机(实测:用户线程 exit 后 timer 中断一进来即死,
+/// uptime/抢占全停,系统停在 label `4` 的 wfi 死循环)。
+///
+/// 正确做法:把 target(当前 `ctx_valid`)的协作上下文**展开为陷阱帧**,
+/// 返回帧指针交给 trap/恢复路径 `sret`(恢复路径执行
+/// `csrw sscratch, _trap_stack_top` 重置),等价完成切换且不留残留。
+///
+/// # 线程语义
+/// - 当前线程(cur)标记 `Exited`、槽位入 `free_slots`、栈移交 reaper;
+/// - `next` 若 `ctx_valid`,其 ctx.ra/sp/s0-11 展开为帧
+///   (sepc/sp/帧寄存器区),`split ctx_valid=false, frame_valid=true`;
+/// - 之后由 do_switch 经 `frame_restore` sret 进入 next。
+pub fn exit_from_trap() -> ! {
+    let irq = arch::irq_save();
+    let target = {
+        let mut s = SCHED.lock();
+        let cur = s.current;
+        // C2(审计 15 轮):不得释放自身正在使用的栈 —— 交给 idle reaper。
+        // 用户线程 stack=None,下方 take 返回 None,安全无操作。
+        if let Some(stack) = s.threads[cur].stack.take() {
+            s.reaper.push_back(stack);
+        }
+        s.threads[cur].state = ThreadState::Exited;
+        s.threads[cur].frame_valid = false;
+        s.threads[cur].ctx_valid = true;
+        // M2 T0:退出槽入 free_slots 供后续 spawn 复用。
+        s.free_slots.push_back(cur);
+        s.ticks_run = 0;
+        let next = s.pick_next(true);
+        s.current = next;
+        // 从 trap 上下文 exit:本函数在 `trap_handler(ecall)` 的栈帧上
+        // 运行,sscratch 仍是本次 trap 入栈后的"帧底"(trap_vector 写入)。
+        // 直接 context_switch 回目标线程,其 sscratch 会残留该陈旧值,
+        // 导致目标线程下一次 trap 的嵌套检测(H2,riscv64.S)误判为
+        // "第二层 trap"而停机(lablat `4`)。故切换前先把 sscratch
+        // 重置为陷阱栈顶,由下一次 trap 入口正常压帧。
+        crate::arch::set_sscratch_trap_top();
+        switch_target(&mut s, cur, next)
+    };
+    // 锁外切换(context_switch:目标线程的协作上下文恢复)。
+    do_switch(&target);
+    // 切换成功后不会返回此处;防御性停机。
     arch::irq_restore(irq);
     arch::halt()
 }

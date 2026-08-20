@@ -139,6 +139,21 @@ pub fn init_traps() {
     }
 }
 
+/// 重置 sscratch 为陷阱栈顶(用于从 trap 上下文 exit 前确保
+/// 切换后的目标线程下次 trap 的嵌套检测不会误判)。
+#[inline]
+pub fn set_sscratch_trap_top() {
+    unsafe {
+        asm!(
+            "la {tmp}, {top}",
+            "csrw sscratch, {tmp}",
+            tmp = out(reg) _,
+            top = sym _trap_stack_top,
+            options(nostack)
+        );
+    }
+}
+
 /// 读取 CPU 寄存器快照(委托给汇编实现,见 riscv64.S)。
 ///
 /// 注意:读到的 `ra`/`sp` 是**当前调用上下文**(panic 处理器自身),
@@ -361,6 +376,8 @@ const INTERRUPT_BIT: usize = 1 << (usize::BITS - 1);
 
 /// 超级定时器中断 cause 编号(RISC-V 特权规范)。
 const CAUSE_SUPERVISOR_TIMER: usize = 5;
+/// 用户态环境调用(ecall / M2 T1 系统调用入口)。
+const CAUSE_ECALL_FROM_U: usize = 8;
 
 /// 陷阱处理入口,由 trap_vector(汇编)以 C ABI 调用。
 ///
@@ -449,8 +466,19 @@ pub unsafe extern "C" fn trap_handler(
                 halt()
             }
         }
+    } else if scause == CAUSE_ECALL_FROM_U {
+        // M2 T1:用户态系统调用(U 模式 ecall;S 模式 ecall 由 medeleg
+        // 保留给 M,不会回到本向量)。同步异常路径(中断分支已 return)。
+        if unsafe { crate::syscall::handle(frame) } {
+            // 用户请求退出:exit_from_trap 在陷阱上下文直接切换,
+            // 永不返回(见 sched.rs 该函数注释:必须走帧恢复,否则
+            // sscratch 残留导致下一次 trap 嵌套检测误判而停机)。
+            crate::sched::exit_from_trap();
+        }
+        // handle 已写入结果(帧 a0)并前移 sepc;sret 回用户态继续。
+        frame
     } else {
-        // ===== 同步异常路径 =====
+        // ===== 其它同步异常 =====
         error!("TRAP: exception scause={scause:#x} sepc={sepc:#x} stval={stval:#x}");
         dump_trap_frame(frame);
         halt()
