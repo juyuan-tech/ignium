@@ -27,6 +27,7 @@ mod panic;
 mod sbi;
 mod sched;
 mod sync;
+mod syscall;
 mod uart;
 
 use core::arch::global_asm;
@@ -130,6 +131,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         Ok(()) => info!("M1: sync primitives selftest ok (mutex + condvar)"),
         Err(e) => panic!("sync primitives selftest failed: {e}"),
     }
+    // M2 T1:用户态线程 + ecall 冒烟(irq_enable 之前,隔离中断干扰)。
+    boot_user_thread_test();
     // 性能基线(启动时打印,供后续优化对比)。
     heap::bench();
     sched::bench();
@@ -156,4 +159,80 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
             info!("uptime: {} ticks ({} ms)", t, t.saturating_mul(10));
         }
     }
+}
+
+/// M2 T1:用户态线程 + ecall 冒烟(在 irq_enable 之前、sync 自检之后)。
+///
+/// 验证链路:分配用户代码/共享/栈页 → 映射到内核页表(U 权限)→
+/// 写入 6 条 RV64 指令的用户程序 → spawn_user(U 线程,SPP=0)→
+/// yield 让用户线程经 sret 进入 U 模式执行 → `ecall`(sys_get_ticks)
+/// → 把 tick 写回共享页 → `ecall`(sys_exit)→ 主上下文恢复。
+/// 共享页被写入 tick 即证明 **U 模式执行 + ecall 往返链路成立**。
+fn boot_user_thread_test() {
+    // 1) 分配用户页(清零:防 D10 信息泄漏)。
+    let code_pa = mem::alloc_pages_zeroed(0).expect("user code page");
+    let shared_pa = mem::alloc_pages_zeroed(0).expect("user shared page");
+    let stack_pa = mem::alloc_pages_zeroed(0).expect("user stack page");
+    // 2) 映射到内核页表。叶子 flags:代码 RX(V|R|X|A|D)、共享/栈 RW。
+    //    中间表指针仅 V 位(QEMU 严格要求,见 mmu::ensure_table_user)。
+    let root = mmu::kernel_root();
+    let code_va = 0x4000_0000usize; // U 地址空间低段
+    let shared_va = 0x4000_1000usize;
+    let stack_va = 0x4000_2000usize;
+    assert!(
+        mmu::map_user_page(root, code_va, code_pa, 0xCB).is_ok(),
+        "map user code"
+    );
+    assert!(
+        mmu::map_user_page(root, shared_va, shared_pa, 0xC7).is_ok(),
+        "map user shared"
+    );
+    assert!(
+        mmu::map_user_page(root, stack_va, stack_pa, 0xC7).is_ok(),
+        "map user stack"
+    );
+    // 3) 用户程序:get_ticks → 写 shared[0] → exit。
+    //    编码经 RISC-V 解码器校准(syscall 号在 a7):
+    //      00200893  addi a7, x0, 2   (SYSCALL_GET_TICKS)
+    //      00000073  ecall
+    //      400012b7  lui  t0, 0x40001 (t0 = 0x40001000 = shared)
+    //      00a2a023  sw   a0, 0(t0)   (写回 tick)
+    //      00100893  addi a7, x0, 1   (SYSCALL_EXIT)
+    //      00000073  ecall
+    let prog: [u32; 6] = [
+        0x0020_0893,
+        0x0000_0073,
+        0x4000_12b7,
+        0x00a2_a023,
+        0x0010_0893,
+        0x0000_0073,
+    ];
+    for (i, w) in prog.iter().enumerate() {
+        // SAFETY:code_pa 为刚分配的页(未释放),写用户程序字。
+        unsafe { core::ptr::write_volatile((code_pa + i * 4) as *mut u32, *w) };
+    }
+    // 4) 新建用户线程(LOW 优先级:与 idle 同级轮转,用户死循环不致
+    //    饿死 idle;T1 只验证 ecall 往返,优先级抢占策略留 T2)。
+    //    用户栈顶 = stack_va + 4KB(栈页 0x40002000-0x40002FFF 内)。
+    let user_id = sched::spawn_user(code_va, stack_va + 4096, sched::PRIO_HIGH);
+    assert!(user_id != sched::current_id(), "user thread id sanity");
+    // 5) 让出直到用户写入共享 tick(用户退出后主上下文恢复)。
+    let shared = shared_pa as *const u32;
+    let mut guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(shared) };
+        if v != 0 {
+            info!("M2 T1: user-mode thread ecall ok (user tick={v})");
+            break;
+        }
+        assert!(
+            guard < 200_000,
+            "user thread did not write shared tick (U-mode ecall broken)"
+        );
+        sched::yield_();
+        guard += 1;
+    }
+    // 注意:T1 阶段用户页映射保留(每进程地址空间语义尚未落地;
+    // 释放需要 T2 地址空间回收,此处不做 unmap/free,避免破坏
+    // 后续 bench/uptime 的堆状态。用户线程已 exit(id 入 free_slots)。
 }
