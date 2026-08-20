@@ -112,7 +112,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 
 ## 路线
 
-见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓**(FDT 解析/页权限拆分/栈守护页/RVA23 P1/压力自检/页表接口),下一步 **M2(用户进程 + IPC + 能力)**。
+见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓ / M2 T1 ✓**(用户态线程 + ecall 系统调用 + 进程退出),下一步 **M2 T2(IPC)**。
 
 ## 里程碑
 
