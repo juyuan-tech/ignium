@@ -55,16 +55,16 @@ jobs:
           targets: riscv64gc-unknown-none-elf
           components: llvm-tools
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
-      # RVA23 P1:编译时启用 Zba+Zbb+Zbs+Zicond,在 -cpu max 下运行。
+      # RVA23 P1:独立 target 目录编译 Zba+Zbb+Zbs+Zicond,不污染标准 target/。
       - name: Build with RVA23 extensions
-        run: cargo rustc -p ignium-kernel --release -- -C target-feature=+zba,+zbb,+zbs,+zicond
+        run: CARGO_TARGET_DIR=target-rva23 cargo rustc -p ignium-kernel --release -- -C target-feature=+zba,+zbb,+zbs,+zicond
       # V3 审计 #11:RVA23 构建同样通过 clippy/fmt 门禁。
       - run: cargo clippy -- -D warnings
       - run: cargo fmt --check
       - name: Boot test in QEMU (-cpu max)
         run: |
           timeout 10 qemu-system-riscv64 -cpu max -M virt -m 128M -nographic -bios default \
-          -kernel target/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-rva23.log 2>&1 || true
+          -kernel target-rva23/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-rva23.log 2>&1 || true
           grep -q "M0: boot ok" /tmp/ignium-rva23.log
           grep -q "buddy allocator selftest ok" /tmp/ignium-rva23.log
           grep -q "Sv39 paging ok" /tmp/ignium-rva23.log

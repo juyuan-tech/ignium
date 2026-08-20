@@ -70,14 +70,18 @@ test-smp:
 		&& echo "SMP TEST PASS" || (echo "SMP TEST FAIL"; cat /tmp/ignium-smp.log; exit 1)
 
 # RVA23 P1:使用 Zba+Zbb+Zbs+Zicond 扩展编译,在 -cpu max 下验证。
+# V4(自审):产物用独立 target 目录(target-rva23),不污染标准
+# target/ 路径 —— 避免"make test-rva23 后默认 CPU 直跑标准 ELF
+# 因 RVA23 指令而非法指令无输出"的误解(make test 会自愈重建)。
 RVA23_FEATURES = -C target-feature=+zba,+zbb,+zbs,+zicond
+RVA23_TARGET = target-rva23/$(TARGET)/release/ignium-kernel
 
 build-rva23:
-	cargo rustc -p ignium-kernel --release -- $(RVA23_FEATURES)
+	CARGO_TARGET_DIR=target-rva23 cargo rustc -p ignium-kernel --release -- $(RVA23_FEATURES)
 
 # RVA23 冒烟:与 test 相同断言,但使用 -cpu max(全扩展 CPU)。
 test-rva23: build-rva23
-	@timeout 10 $(QEMU) -cpu max $(QEMUARGS) -kernel $(KERNEL_ELF) > /tmp/ignium-rva23.log 2>&1 || true
+	@timeout 10 $(QEMU) -cpu max $(QEMUARGS) -kernel $(RVA23_TARGET) > /tmp/ignium-rva23.log 2>&1 || true
 	@grep -q "M0: boot ok" /tmp/ignium-rva23.log \
 		&& grep -q "buddy allocator selftest ok" /tmp/ignium-rva23.log \
 		&& grep -q "Sv39 paging ok" /tmp/ignium-rva23.log \
@@ -90,6 +94,7 @@ test-rva23: build-rva23
 
 clean:
 	cargo clean
+	rm -rf target-rva23
 
 clippy:
 	cargo clippy --release -- -D warnings
