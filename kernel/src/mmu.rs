@@ -149,6 +149,15 @@ unsafe fn ensure_table_user(parent: *const u64, idx: usize) -> Result<*const u64
 /// - 映射后该进程下一次切换需 `tlb_flush`(切换 satp 时统一做)。
 #[allow(dead_code)] // 二进制 crate 中 M2 API 未调用
 pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
+    // 自审(挑剔视角):Sv39 用户地址空间上限 2^38。越界 vaddr 的
+    // L2/L1/L0 索引会错位(高位省略),映射到错误区域 —— 必须拒绝。
+    if vaddr >= 0x4000_0000_0000 {
+        return Err(());
+    }
+    // paddr 必须页对齐,否则 ppn 掩掉低 12 位 → 映射错页。
+    if !paddr.is_multiple_of(4096) {
+        return Err(());
+    }
     let l2 = (vaddr >> 30) & 0x1FF;
     let l1 = (vaddr >> 21) & 0x1FF;
     let l0 = (vaddr >> 12) & 0x1FF;
