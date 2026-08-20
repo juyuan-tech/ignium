@@ -24,7 +24,7 @@
 | D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办 |
 | D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办 |
 | D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | **P1 已实现**(审计 18 轮):Makefile test-rva23 目标 + CI rva23 job;cpu.rs 模块(ISA 诊断输出);扩展编译+`-cpu max` 冒烟通过 |
-| D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa;当前无条件用 stimecmp,写读回断言可给出明确诊断) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析已落地,可读取 riscv,isa) | 部分完成(FDT 解析就绪,读取 riscv,isa 与 SBI 回退待实现) |
+| D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa;当前无条件用 stimecmp,写读回断言可给出明确诊断) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析已落地,可读取 riscv,isa) | **已实现**(自审 18 轮继续推进):riscv64.rs 增 USE_SSTC 标志 + arm_timer 双路径;enable_timer 首次用 SBI(专不怕 trap),cpu::init_from_fdt 检测 isa 含 sstc 则切 stimecmp |
 | D18 | early_trap 最小诊断输出(真机 bring-up 期 UART 未就绪时静默停机,审计 17 轮 INFO-4;文档化为 bring-up 风险,真机适配时落实) | 审计 17 轮 INFO-4 | 真机 bring-up | 待办 |
 
 ## 已关闭(移动到这里)

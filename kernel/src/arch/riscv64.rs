@@ -4,7 +4,7 @@
 //! 新建 arch/x86_64.rs + 汇编,实现同样一组接口即可。
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error;
 
@@ -235,6 +235,35 @@ pub fn timer_interval() -> usize {
 /// 仅定时器 ISR 写入(fetch_add),启动时初始化一次。
 static TIMER_DEADLINE: AtomicUsize = AtomicUsize::new(0);
 
+/// D17(自审推进):是否使用 SSTC(stimecmp)直写定时器。
+/// - `enable_timer` 首次用 SBI(通用,无非法指令风险);
+/// - FDT 解析后(cpu::init_from_fdt 读 riscv,isa)检测 `sstc`,
+///   有则切回 stimecmp(性能),无则保持 SBI 回退。
+///   与 sbi::set_timer 形成双路径;QEMU virt 有 sstc → 走直写。
+static USE_SSTC: AtomicBool = AtomicBool::new(false);
+
+/// 设置是否使用 SSTC 定时器路径(FDT ISA 解析后调用)。
+pub fn set_sstc(v: bool) {
+    USE_SSTC.store(v, Ordering::Relaxed);
+}
+
+/// 当前是否为 SSTC 定时器路径(M2 多核探测用)。
+#[allow(dead_code)]
+pub fn sstc_available() -> bool {
+    USE_SSTC.load(Ordering::Relaxed)
+}
+
+/// 重排下一次定时器截止:按能力选择 stimecmp(直写)或 SBI set_timer。
+#[inline]
+fn arm_timer(deadline: usize) {
+    if USE_SSTC.load(Ordering::Relaxed) {
+        set_stimecmp(deadline);
+    } else {
+        // SBI 回退:每 tick 一次 M 模式 ecall(慢,但无 SSTC 平台可用)。
+        let _ = crate::sbi::set_timer(deadline);
+    }
+}
+
 /// 清洗中断/特权相关 CSR 到已知安全状态(pro 审计 max #1)。
 ///
 /// 背景:引导器或热重启可能遗留 `sie`/`sip` 的置位位与 `sstatus`
@@ -264,6 +293,12 @@ pub fn sanitize_csr() {
 ///
 /// 调用顺序要求:必须在 `init_traps` 之后(否则定时器中断无陷阱向量
 /// 可达);在 `irq_enable` 之前(先布好中断源,再开全局中断)。
+///
+/// D17(自审推进):首次定时器一律走 **SBI set_timer**(通用,任意平台
+/// 可用),不用 stimecmp —— 无 SSTC 平台执行 `csrw stimecmp` 会触发
+/// 非法指令陷阱 → 停机(原 HIGH-2 探测 panic 不可优雅降级)。FDT
+/// 解析后 `cpu::init_from_fdt` 检测 `riscv,isa` 中是否含 `sstc`,
+/// 含则 `set_sstc(true)`,此后 ISR 切回 stimecmp 直写。
 pub fn enable_timer() {
     unsafe {
         // sie.STIE = bit 5(超级定时器中断使能)。
@@ -275,20 +310,8 @@ pub fn enable_timer() {
     }
     let deadline = get_time().wrapping_add(timer_interval());
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
-    // SSTC 直写 stimecmp(性能优化):替代每 tick 的 SBI ecall(M 模式
-    // 往返,几百周期)。QEMU virt 与 RVA23 强制平台均支持;无 SSTC
-    // 的平台此指令触发非法指令陷阱 → 停机诊断(可接受,见 sbi.rs)。
-    set_stimecmp(deadline);
-    // HIGH-2 探测:写读回一致性断言 —— 若平台无 SSTC 或实现异常,
-    // 在此给出明确 panic 而非静默/后续乱跳。
-    let probe: usize;
-    unsafe {
-        asm!("csrr {}, stimecmp", out(reg) probe, options(nostack));
-    }
-    assert!(
-        probe == deadline,
-        "SSTC stimecmp write/read mismatch (platform lacks SSTC?)"
-    );
+    // 首次:USE_SSTC 尚为 false,走 SBI(通用)。
+    let _ = crate::sbi::set_timer(deadline);
 }
 
 /// 直写 stimecmp(需平台支持 SSTC 扩展)。
@@ -398,7 +421,8 @@ pub unsafe extern "C" fn trap_handler(
                     ideal
                 };
                 TIMER_DEADLINE.store(next, Ordering::Relaxed);
-                set_stimecmp(next);
+                // D17:按能力选 stimecmp 或 SBI 重排下一次中断。
+                arm_timer(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程
                 // 的帧指针,汇编恢复路径据此 sret 进入新线程
                 // (全寄存器恢复,含 t/a)。
