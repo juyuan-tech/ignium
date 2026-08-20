@@ -53,7 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: riscv64gc-unknown-none-elf
-          components: llvm-tools
+          components: llvm-tools, clippy, rustfmt
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
       # RVA23 P1:独立 target 目录编译 Zba+Zbb+Zbs+Zicond,不污染标准 target/。
       - name: Build with RVA23 extensions
