@@ -12,10 +12,9 @@
 //! - `init` / `self_test` —— 初始化与验证
 //! - `satp` / `tlb_flush` —— 页表基址与 TLB 操作(arch 层契约)
 //! - `unmap_4k` —— 取消单页映射(内含 TLB 刷新)
+//! - `map_user_page` —— **M2 用户映射**:拒绝覆盖已有 PTE、路径置 U 位
 //!
 //! `map_4k`/`map_region_4k`/`map_super` 为私有,供 init 期建映射。
-//! V4(外部审计 LOW,文档同步):M2 用户映射前按同契约将其公开并
-//! 定义"拒绝覆盖已有 PTE"语义(见 DEFERRED D15 方向的 API 固化)。
 //!
 //! # 架构隔离
 //! 本模块是 RISC-V Sv39 的具体实现;x86_64 移植时在 arch 层提供
@@ -31,6 +30,8 @@ const PTE_V: u64 = 1 << 0; // 有效
 const PTE_R: u64 = 1 << 1; // 可读
 const PTE_W: u64 = 1 << 2; // 可写
 const PTE_X: u64 = 1 << 3; // 可执行
+#[allow(dead_code)] // M2 用户映射启用
+const PTE_U: u64 = 1 << 4; // 用户可访问(M2 用户映射用)
 const PTE_A: u64 = 1 << 6; // 已访问
 const PTE_D: u64 = 1 << 7; // 已脏
 const PTE_PPN_SHIFT: u64 = 10;
@@ -110,6 +111,56 @@ fn map_4k(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()>
     let l1_t = unsafe { ensure_table(root_t, l2)? };
     let l0_t = unsafe { ensure_table(l1_t, l1)? };
     pte_write(l0_t, l0, pte(paddr, flags));
+    Ok(())
+}
+
+// ===========================================================================
+// M2 前置:用户地址空间映射契约(内部用 ensure_table 会带 U 位)。
+// ===========================================================================
+
+/// 确保下一级表存在(表指针带 **U 位**,用户进程可经此表访问)。
+///
+/// # Safety
+/// 同 `ensure_table`:parent 必须是有效页表地址。
+#[allow(dead_code)] // M2 用户映射启用
+unsafe fn ensure_table_user(parent: *const u64, idx: usize) -> Result<*const u64, ()> {
+    let entry = pte_read(parent, idx);
+    if entry & PTE_V != 0 {
+        if entry & (PTE_R | PTE_W | PTE_X) != 0 {
+            return Err(());
+        }
+        let sub = (((entry >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as usize;
+        Ok(sub as *const u64)
+    } else {
+        let page = mem::alloc_pages_zeroed(0).ok_or(())?;
+        pte_write(parent, idx, pte(page, PTE_V | PTE_U));
+        Ok(page as *const u64)
+    }
+}
+
+/// 映射**用户可访问**的 4KB 页(M2 每进程地址空间用)。
+///
+/// 契约(mmu 模块头 V4 已注明):
+/// - 若 vaddr 处已有有效 PTE(**拒绝覆盖**),返回 Err —— 防误覆盖内核
+///   映射或其它用户映射;
+/// - 对路径上的中间表置 U 位,确保 U=1 叶子可被用户访问;
+/// - 调用方须保证 vaddr 在用户地址空间范围,且 paddr 已用
+///   `mem::alloc_pages_zeroed`(或确认无需清零)。
+/// - 映射后该进程下一次切换需 `tlb_flush`(切换 satp 时统一做)。
+#[allow(dead_code)] // 二进制 crate 中 M2 API 未调用
+pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
+    let l2 = (vaddr >> 30) & 0x1FF;
+    let l1 = (vaddr >> 21) & 0x1FF;
+    let l0 = (vaddr >> 12) & 0x1FF;
+    let root_t = root as *const u64;
+    let l1_t = unsafe { ensure_table_user(root_t, l2)? };
+    let l0_t = unsafe { ensure_table_user(l1_t, l1)? };
+    // 拒绝覆盖:目标 L0 PTE 必须为空。
+    if pte_read(l0_t, l0) & PTE_V != 0 {
+        return Err(());
+    }
+    // M2 用户映射默认叶子需 U 位;调用方可传已含 PTE_U 的 flags。
+    pte_write(l0_t, l0, pte(paddr, flags | PTE_U));
     Ok(())
 }
 

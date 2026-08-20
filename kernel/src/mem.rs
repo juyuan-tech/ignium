@@ -422,6 +422,21 @@ pub fn alloc_pages(order: usize) -> Option<usize> {
     with_allocator(|a| a.alloc(order))
 }
 
+/// 分配并**整块清零**页(M2 前置 D10:用户/敏感数据交接前防信息泄漏)。
+///
+/// 对 order=12(16 MiB)清零 4096 页较慢,仅用于真正必要的交接
+/// (用户栈/页表/敏感缓冲),并应优先用 order=0/小阶。
+#[allow(dead_code)] // M2 用户空间启用
+pub fn alloc_pages_zeroed(order: usize) -> Option<usize> {
+    let block = alloc_pages(order)?;
+    for i in 0..(1usize << order) {
+        let p = block + i * PAGE_SIZE;
+        // SAFETY:刚分配、整块未释放,清零合法。
+        unsafe { zero_page(p) };
+    }
+    Some(block)
+}
+
 /// 释放物理地址处的块。
 ///
 /// # 契约

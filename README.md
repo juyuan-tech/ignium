@@ -91,8 +91,10 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 ├── scripts/                # 工具(ai_audit.py 外部 AI 审计,密钥不入库)
 ├── docs/
 │   ├── DESIGN.md           # 架构设计原则
+│   ├── M2-DESIGN.md        # M2 设计(U/S 切换/ecall ABI/IPC/能力/每进程地址空间)
 │   ├── DEFERRED.md         # 延迟项注册表(含触发条件与状态)
 │   ├── RVA23.md            # RVA23 兼容性差距与分阶段支持计划
+│   ├── benchmarks.md       # 性能基线(M1.5 已建)
 │   ├── reports/            # 详尽报告(每次修复/更新必写)
 │   └── audit-reports/      # 外部 AI 审计留档
 ├── .github/                # CI + Issue/PR 模板
