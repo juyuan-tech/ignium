@@ -72,7 +72,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   ├── src/
 │   │   ├── main.rs         # 入口 + 启动顺序(依赖关系见注释)
 │   │   ├── board.rs        # 板级平台参数(FDT 运行时推导,回退默认值)
-│   │   ├── cpu.rs          # CPU 能力检测与 ISA 诊断(RVA23 P1,当前为诊断输出,运行时回退待 D17)
+│   │   ├── cpu.rs          # CPU 能力检测与 ISA 诊断(RVA23 P1 + D17:驱动 SSTC/SBI 定时器选择)
 │   │   ├── fdt.rs          # FDT 最小解析器(RAM/UART/定时器频率/保留区)
 │   │   ├── entry.S         # _start:SIE 清零/gp 初始化/副核停车/清 BSS/设栈/早期 trap stub
 │   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)

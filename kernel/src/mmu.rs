@@ -10,9 +10,12 @@
 //!
 //! # 公开接口
 //! - `init` / `self_test` —— 初始化与验证
-//! - `satp` / `tlb_flush` —— 页表基址与 TLB 操作
-//! - `map_4k` / `unmap_4k` —— 单页映射/取消映射
-//! - `map_region_4k` —— 区域映射(4KB 粒度)
+//! - `satp` / `tlb_flush` —— 页表基址与 TLB 操作(arch 层契约)
+//! - `unmap_4k` —— 取消单页映射(内含 TLB 刷新)
+//!
+//! `map_4k`/`map_region_4k`/`map_super` 为私有,供 init 期建映射。
+//! V4(外部审计 LOW,文档同步):M2 用户映射前按同契约将其公开并
+//! 定义"拒绝覆盖已有 PTE"语义(见 DEFERRED D15 方向的 API 固化)。
 //!
 //! # 架构隔离
 //! 本模块是 RISC-V Sv39 的具体实现;x86_64 移植时在 arch 层提供

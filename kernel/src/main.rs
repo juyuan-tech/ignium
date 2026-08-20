@@ -134,10 +134,10 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     heap::bench();
     sched::bench();
     arch::irq_enable();
-    info!(
-        "M1: timer enabled ({}us interval), interrupts on",
-        arch::timer_interval() / 10
-    );
+    // V4(外部审计 LOW):用运行时频率换算 µs,不硬编码 10MHz。
+    let interval_us =
+        (arch::timer_interval() as u64 * 1_000_000) / crate::board::timer_freq() as u64;
+    info!("M1: timer enabled ({interval_us}us interval), interrupts on");
     // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
     // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。
     // LOW-3(审计 17 轮):idle 无 yield 路径,退出线程的栈在此回收

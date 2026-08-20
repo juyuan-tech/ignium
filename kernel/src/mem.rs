@@ -452,23 +452,33 @@ pub unsafe fn zero_page(addr: usize) {
 ///
 /// 由 kernel_main 在 irq_enable 之前调用(尚无并发竞争者)。
 pub fn self_test() -> Result<(), &'static str> {
-    // 1) 整区(16MB)分配→释放→再分配:应复用同一区域。
-    let a = alloc_pages(MAX_ORDER).ok_or("alloc(12) failed")?;
-    free_pages(a).map_err(|_| "free(12) failed")?;
-    let b = alloc_pages(MAX_ORDER).ok_or("realloc(12) failed")?;
+    // V4(外部审计 MED):自适应最大可用阶 —— 小/碎片化 RAM 未必有
+    // order-12(16 MiB)整块。探测最大可分配阶,以其为测试基准。
+    let mut max_avail = MAX_ORDER;
+    while max_avail > 0 {
+        if let Some(p) = alloc_pages(max_avail) {
+            free_pages(p).map_err(|_| "probe free failed")?;
+            break;
+        }
+        max_avail -= 1;
+    }
+    // 1) 整块(max_avail)分配→释放→再分配:应复用同一区域。
+    let a = alloc_pages(max_avail).ok_or("big alloc failed")?;
+    free_pages(a).map_err(|_| "big free failed")?;
+    let b = alloc_pages(max_avail).ok_or("re-big alloc failed")?;
     if a != b {
         return Err("buddy reuse mismatch");
     }
-    free_pages(b).map_err(|_| "free(12) #2 failed")?;
+    free_pages(b).map_err(|_| "big free #2 failed")?;
 
     // 2) 全生命周期守恒:按阶**递减**排空(原生弹出不拆分)→
-    //    耗尽后分配必须失败 → 全部释放 → order-12 必须可再次分配。
-    //    最后一步只有当低阶块全部合并回 12 阶时才成立 ——
+    //    耗尽后分配必须失败 → 全部释放 → max_avail 必须可再次分配。
+    //    最后一步只有当低阶块全部合并回 max_avail 阶时才成立 ——
     //    这是对 buddy 合并语义的直接验证,且不依赖块相邻性。
     //    地址用**链表挂在块首字上**(与空闲链表同构):无堆环境
     //    下的无界存储(M2:固定数组在不同内存几何下会溢出误报)。
     let mut head: usize = FREE_NONE;
-    for order in (0..=MAX_ORDER).rev() {
+    for order in (0..=max_avail).rev() {
         while let Some(addr) = alloc_pages(order) {
             unsafe { core::ptr::write(addr as *mut usize, head) };
             head = addr;
@@ -482,12 +492,12 @@ pub fn self_test() -> Result<(), &'static str> {
         free_pages(head).map_err(|_| "free held failed")?;
         head = next;
     }
-    let big = alloc_pages(MAX_ORDER).ok_or("post-free alloc(12) failed")?;
+    let big = alloc_pages(max_avail).ok_or("post-free big alloc failed")?;
     free_pages(big).map_err(|_| "free big failed")?;
 
     // 3) 对齐:每个阶的块都须按自身大小绝对对齐
     //    (base 已对齐到最大块,所有拆分保持对齐)。
-    for order in 0..=MAX_ORDER {
+    for order in 0..=max_avail {
         let a = alloc_pages(order).ok_or("align alloc failed")?;
         let block = PAGE_SIZE * (1usize << order);
         if !a.is_multiple_of(block) {
@@ -504,11 +514,15 @@ pub fn self_test() -> Result<(), &'static str> {
     }
 
     // 5) 块内页地址被拒绝(防空闲链表静默损坏,F1)。
-    let h = alloc_pages(2).ok_or("alloc(2) failed")?;
-    if free_pages(h + PAGE_SIZE).is_ok() {
-        return Err("interior page free accepted");
+    //    用 max_avail 自适应的块阶(至少 order-1 有内页;若 max_avail==0
+    //    仅 1 页,无内页可测,跳过)。
+    if max_avail >= 1 {
+        let h = alloc_pages(max_avail.min(2)).ok_or("interior alloc failed")?;
+        if free_pages(h + PAGE_SIZE).is_ok() {
+            return Err("interior page free accepted");
+        }
+        free_pages(h).map_err(|_| "free h failed")?;
     }
-    free_pages(h).map_err(|_| "free h failed")?;
 
     Ok(())
 }

@@ -186,9 +186,16 @@ impl Scheduler {
                 };
                 if ok {
                     self.threads[id].state = ThreadState::Running;
-                    // M6(审计 18 轮外部):消费唤醒标志,防止下次
-                    // block_current 因陈旧 woken=true 而虚假继续。
-                    self.threads[id].woken = false;
+                    // V4(外部审计 CRITICAL):**不得在此清 woken**。
+                    // 丢失唤醒保护时序:线程在 Mutex/Condvar 的
+                    // irq_restore→block_current 窗口被抢占(Ready+入队),
+                    // 之后被 wake(woken=true,不入队)→ 被本函数选中。
+                    // 若在此清 woken,该线程恢复到 block_current 时会
+                    // 因 woken=false 而真的阻塞 → 通知已消费,死锁。
+                    // 正确做法:woken 只有在 **block_current 自己消费**
+                    // (Ready 早退分支 / woken 分支 / 醒来路径)时才清除。
+                    // M6 的"陈旧 woken 虚假继续"是良性的(互斥/条件循环
+                    // 会重查重等),不以死锁为代价换取该"优化"。
                     return id;
                 }
                 q.push_back(id); // 暂不满足:轮转到队尾,不丢失。
@@ -408,6 +415,11 @@ pub fn init() {
     s.reaper.reserve(MAX_THREADS);
     s.threads.reserve(MAX_THREADS);
     // idle 线程:id=0,最低优先级,永不阻塞。
+    // V4(外部审计 LOW,文档说明):idle 实际运行在**引导栈**
+    // (kernel_main 的 idle 循环),此处分配的 16 KiB 线程栈与
+    // `ctx.ra=idle_entry` 仅为 M3 回退占位 —— 一旦 idle 首次参与
+    // 协作切换,其 ctx 会被真实引导栈上下文覆盖,idle_entry 永不可达。
+    // 该占位栈在内核生命周期内不回收(微小浪费,换取结构统一)。
     let idle_id = 0;
     let stack = alloc_free_stack();
     let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
@@ -838,7 +850,9 @@ pub fn bench() {
         return;
     }
     let dt = crate::arch::get_time().wrapping_sub(BENCH_SW_START.load(Ordering::Relaxed));
-    // 10MHz 计时器:dt × 100ns;切换数 ≈ 2×BENCH_N。
-    let ns_per_switch = dt.saturating_mul(100) / (2 * BENCH_N);
+    // V4(外部审计 LOW):用运行时 timebase 频率换算 ns。
+    let freq = crate::board::timer_freq();
+    let ns_per_tick = 1_000_000_000u64 / freq as u64;
+    let ns_per_switch = (dt as u64).saturating_mul(ns_per_tick) / (2 * BENCH_N) as u64;
     info!("bench: context switch ≈ {ns_per_switch} ns/op (yield path)");
 }

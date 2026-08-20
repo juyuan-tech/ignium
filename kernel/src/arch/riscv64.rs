@@ -242,6 +242,9 @@ static TIMER_DEADLINE: AtomicUsize = AtomicUsize::new(0);
 ///   与 sbi::set_timer 形成双路径;QEMU virt 有 sstc → 走直写。
 static USE_SSTC: AtomicBool = AtomicBool::new(false);
 
+/// SBI 定时器失败已被记录(只告警一次,避免 ISR 刷屏)。
+static SBI_TIMER_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// 设置是否使用 SSTC 定时器路径(FDT ISA 解析后调用)。
 pub fn set_sstc(v: bool) {
     USE_SSTC.store(v, Ordering::Relaxed);
@@ -254,13 +257,19 @@ pub fn sstc_available() -> bool {
 }
 
 /// 重排下一次定时器截止:按能力选择 stimecmp(直写)或 SBI set_timer。
+///
+/// SBI 失败即无后续定时器中断 → 抢占/心跳停摆。首次编程失败在
+/// `enable_timer` panic(V4 外部审计 MED);tick 路径失败用**一次性**
+/// rate-limited ERROR(ISR 日志例外:系统即将冻结,终局诊断)。
 #[inline]
 fn arm_timer(deadline: usize) {
     if USE_SSTC.load(Ordering::Relaxed) {
         set_stimecmp(deadline);
     } else {
-        // SBI 回退:每 tick 一次 M 模式 ecall(慢,但无 SSTC 平台可用)。
-        let _ = crate::sbi::set_timer(deadline);
+        let rc = crate::sbi::set_timer(deadline);
+        if rc != 0 && !SBI_TIMER_FAILED_LOGGED.swap(true, Ordering::Relaxed) {
+            crate::error!("SBI set_timer failed (rc={rc}); timer will stop");
+        }
     }
 }
 
@@ -311,15 +320,20 @@ pub fn enable_timer() {
     let deadline = get_time().wrapping_add(timer_interval());
     TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
     // 首次:USE_SSTC 尚为 false,走 SBI(通用)。
-    let _ = crate::sbi::set_timer(deadline);
+    let rc = crate::sbi::set_timer(deadline);
+    // V4(外部审计 MED):首次编程失败 → 定时器永不触发,明确 panic
+    // (呼应 D-旧"boot 定时器失败 warn 改 panic")。
+    assert!(
+        rc == 0,
+        "SBI set_timer failed at boot (rc=0x{rc:x}); no timer interrupts possible"
+    );
 }
 
 /// 直写 stimecmp(需平台支持 SSTC 扩展)。
 ///
-/// HIGH-2(审计 14 轮):无 SSTC 平台执行 `csrw stimecmp` 会触发
-/// 非法指令陷阱 → 停机诊断。探测见 `enable_timer` 的写读回断言;
-/// **能力检测与 SBI 回退**登记 D17,随 M1.5 的 FDT(riscv,isa)
-/// 解析落地(届时据此选 SSTC 或 SBI 定时器)。
+/// V4(外部审计 LOW,文档同步):仅当 D17 检测到 `sstc` 时经 `arm_timer`
+/// 使用;无 SSTC 平台走 SBI 回退,不再有"写读回断言"(原 enable_timer
+/// 探测已移除,首次定时器一律 SBI)。
 #[inline]
 fn set_stimecmp(next: usize) {
     unsafe {

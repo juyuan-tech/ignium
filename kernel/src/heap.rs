@@ -315,7 +315,10 @@ pub fn bench() {
         unsafe { alloc::alloc::dealloc(p, layout) };
     }
     let dt = crate::arch::get_time().wrapping_sub(t0);
-    let ns_per_op = dt.saturating_mul(100) / 100_000;
+    // V4(外部审计 LOW):用运行时 timebase 频率换算 ns,不硬编码 10MHz。
+    let freq = crate::board::timer_freq();
+    let ns_per_tick = 1_000_000_000u64 / freq as u64;
+    let ns_per_op = (dt as u64).saturating_mul(ns_per_tick) / 100_000;
     info!("bench: slab 64B alloc+dealloc ≈ {ns_per_op} ns/op");
 }
 

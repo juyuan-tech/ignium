@@ -51,29 +51,35 @@ kernel. You are NOT the author. Assume the author's self-review is biased and
 incomplete. Your job is to find what the author missed. Be thorough and
 exhaustive — do not stop at surface-level issues. Flag everything suspicious.
 
-IMPORTANT: This is audit V3. The previous audit (V2, 20260819-122344) found
-2 CRITICAL, 6 HIGH, 8 MEDIUM, and 18 LOW issues. ALL of those have been
-fixed and committed. Do NOT re-report them. Focus on finding NEW issues that
-the previous audits and the author's self-reviews missed.
+IMPORTANT: This is audit V4. The previous audits (V2 20260819-122344, V3
+20260819-135719) found many issues; ALL have been fixed and committed. Since
+V3, the author also completed D17 (SSTC detection + SBI timer fallback) and
+captured an M1.5 benchmark baseline (docs/benchmarks.md). Do NOT re-report
+previously fixed issues. Focus on finding NEW issues the prior audits and the
+author's self-reviews missed.
 
 Previously fixed issues (do not re-report):
-- C1: Buddy allocator only free-listed first 16MiB block → fixed: loop over all MAX_ORDER blocks
-- C2: frame_restore lost outgoing context → fixed: frame_restore saves old_ctx before sret
-- H1: Stack guard unmap silently failed on 2MiB boundary → fixed: assert unmap_4k is_ok()
-- H2: unmap_4k didn't flush TLB → fixed: sfence.vma inside unmap_4k
-- H3: pick_next fallback could return Blocked thread → fixed: check state != Running
-- H4: SBI set_timer t0-t6 clobbers → fixed: clobber_abi
-- H5: FDT parser struct_end used total_size → fixed: bound by size_dt_struct
-- H6: heap::dealloc slab path didn't validate slot alignment → fixed: offset/alignment check
-- M1: Thread stacks no guard pages → documented
-- M2: board validation accepts non-2MiB RAM → fixed: 2MiB alignment check
-- M3: FDT 4-byte alignment → fixed: 8-byte alignment
-- M4: FDT node-name tracking not unwound → fixed: node stack
-- M5: read_string unconstrained lifetime → fixed: bound to &self
-- M6: woken flag level-based → fixed: cleared in pick_next
-- M7: Timer deadline storm → fixed: catch-up max(now, ideal)
-- M8: Reserved region single range → fixed: multi-interval carve
-- L1-L18: All low findings addressed (fence.i, comments, docs, etc.)
+- Buddy/C1: only first 16MiB free-listed with reserved regions → fixed (loop all orders)
+- frame_restore/C2: lost outgoing context → fixed (saves old_ctx before sret)
+- Stack guard/H1: silent unmap failure on 2MiB boundary → assert + fail-loudly
+- unmap_4k/H2: no TLB flush → sfence.vma inside; map_4k documented for post-boot remap
+- pick_next/H3: fallback could return Blocked → state != Running → idle
+- SBI/H4: set_timer t0-t6 clobbers → clobber_abi("C") (also Safety doc)
+- FDT/H5: struct_end used total_size → bound by size_dt_struct
+- heap/H6: slab dealloc no slot-alignment check → offset/is_multiple/range check
+- Thread stacks no guard → registered (DEFERRED D20, M2)
+- RAM alignment & coverage → 2MiB + covers kernel + Sv39 window + start floor >= 0x80000000
+- FDT: 8-byte alignment, node-name stack, read_string lifetime, reserved multi-interval
+- Timer: deadline catch-up (no storm), now+interval wrapping, interval read cached (1x)
+- Scheduler: woken cleared in pick_next, stress tests (16 threads), priority preemption
+- FDT robustness: totalsize bound <=16MiB, fdt+total<=max_phys, depth>8 stops matching,
+  UART base from node name OR reg property, memory 1-cell + 2-cell address support
+- mmu: OpenSBI region [ram_start, kernel_start) read-only R (was RW, write faults loudly)
+- UART init: mmio_fence between DLL/DLM and FCR/MCR writes (real-HW baud divisor)
+- D17: USE_SSTC flag + arm_timer dual path; enable_timer uses SBI first (no illegal-instr
+  trap on non-SSTC); cpu.rs detects 'sstc' in riscv,isa and switches to stimecmp
+- Panic diagnostic for thread stacks; alloc_zeroed_free_stack renamed alloc_free_stack
+- Scheduler test relabeled (busy-thread exit vs preemption intent); CI adds SMP + rva23 clippy/fmt
 
 Project context:
 - Language: Rust (no_std + alloc), edition 2021, toolchain pinned 1.97.1
@@ -82,30 +88,36 @@ Project context:
 - Stage: **M1.5 complete** (M1: trap/timer/buddy/Sv39 paging/kernel heap/
   cooperative+preemptive scheduler/Mutex+Condvar/SpinLock IRQ-safe.
   M1.5: FDT parser + board params runtime / page permission split (code RX,
-  rodata R, data RW, heap RW no-X) / stack guard pages / RVA23 P1
-  (Zba+Zbb+Zbs+Zicond, -cpu max CI) / pressure stress tests / page table
-  interface (unmap_4k, tlb_flush)).
-- Timer uses SSTC (direct stimecmp writes); timer-driven preemption via
-  full trap-frame swap in the ISR (ctx_valid/frame_valid dual resume
-  protocol). Cooperative yield via callee-saved context switch.
-  Scheduler: 2-level priority, tick-based preemption (10 ticks = 100ms),
+  rodata R, data RW, heap RW no-X; OpenSBI region R) / stack guard pages /
+  RVA23 P1 (Zba+Zbb+Zbs+Zicond, -cpu max CI) / pressure stress tests /
+  page table interface (unmap_4k, tlb_flush) / D17 SSTC+SBI timer dual path /
+  benchmark baseline in docs/benchmarks.md).
+- Timer: D17 dual path — first deadline via SBI, after FDT ISA parse switches to
+  stimecmp if 'sstc' present (USE_SSTC flag). timer-driven preemption via full
+  trap-frame swap in the ISR (ctx_valid/frame_valid dual resume protocol).
+  Cooperative yield via callee-saved context switch.
+  Scheduler: 2-level priority (HIGH/LOW), tick-based preemption (10 ticks = 100ms),
   idle thread, exit/reaper, lost-wake protection (woken flag).
 - IRQ-safe SpinLock (saves/restores SIE on lock/unlock); Mutex (block/wake
   with waiters queue), Condvar (wait/notify_one/notify_all).
 - Buddy allocator (order 0..12, 4KB pages, 128 MiB max, MAX_PAGES=32768,
   carve for FDT reserved regions, multi-interval support). Slab heap (8
   classes 16B..2KB, page chain traversal, page path for large objects).
+  HEAP dealloc uses cached allocator byte count (no lock on hot path).
 - FDT parser (kernel/src/fdt.rs): minimal, extracts RAM range, timebase
-  frequency, UART base, reserved regions. 8-byte alignment, node-name stack,
-  struct_end bounded by size_dt_struct. Board params (board.rs): runtime
-  functions with FDT fallback and QEMU virt defaults.
+  frequency, UART base (node name or reg), reserved regions, ISA string.
+  8-byte alignment, node-name stack, struct_end bounded by size_dt_struct,
+  totalsize <=16MiB. Board params (board.rs): runtime functions with FDT
+  fallback and QEMU virt defaults; validated (coverage, alignment, Sv39, floor).
 - Sv39 identity mapping with per-section permissions (D2), stack guard
   pages (D4, 4KB unmapped below boot/trap stacks, assert unmap success).
-- CPU capability detection (cpu.rs): ISA string from FDT (RVA23 P1).
-  RVA23 CI: separate job with -cpu max and Zba+Zbb+Zbs+Zicond extensions.
+- CPU capability detection (cpu.rs): ISA string from FDT (RVA23 P1); drives
+  D17 SSTC choice. RVA23 CI: separate job with -cpu max, Zba+Zbb+Zbs+Zicond.
 - Single-core only (secondary harts parked in entry.S via BOOT_LOCK
   arbitration). Multi-core planned for M2 (D7 per-hart trap stacks, D8
   secondary hart wake, D9 console lock, D19 multi-core scheduler).
+- Perf baseline: slab 64B alloc+dealloc ~19-24ns/op; context switch ~200-284ns/op
+  (yield path), measured on QEMU (see docs/benchmarks.md).
 - Future: microkernel (user processes/IPC/capabilities) with
   OpenHarmony-compatible userspace layer. M2: user processes, IPC,
   capabilities, multi-core bring-up.

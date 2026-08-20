@@ -88,6 +88,7 @@ pub struct Fdt {
     off_strings: usize,
     off_rsvmap: usize,
     size_struct: usize,
+    size_strings: usize,
     /// FDT 数据区自身需保留(从 fdt 指针开始,共 total_size 字节)。
     fdt_addr: usize,
 }
@@ -140,6 +141,7 @@ impl Fdt {
             off_strings,
             off_rsvmap,
             size_struct,
+            size_strings,
             fdt_addr: fdt,
         })
     }
@@ -399,10 +401,13 @@ impl Fdt {
     }
 
     fn read_string(&self, strings_ptr: *const u8, offset: usize) -> Option<&str> {
-        if offset >= self.total_size - self.off_strings {
+        // V4(外部审计 LOW):字符串边界用 size_dt_strings,而非
+        // (total_size - off_strings) —— 后者在 size_strings 明显小于
+        // 该差时会让名称解析落到结构块区域(仍界内,但解析错误)。
+        if offset >= self.size_strings {
             return None;
         }
-        let max_len = self.total_size - self.off_strings - offset;
+        let max_len = self.size_strings - offset;
         let start = unsafe { strings_ptr.add(self.off_strings + offset) };
         let mut len = 0;
         while len < max_len {

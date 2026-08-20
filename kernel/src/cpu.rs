@@ -1,12 +1,13 @@
-//! CPU 能力检测与 ISA 信息(M1.5 RVA23 P1)。
+//! CPU 能力检测与 ISA 信息(M1.5 RVA23 P1 / D17)。
 //!
-//! 在引导早期读取 FDT 的 `riscv,isa` 属性,记录可用扩展。
-//! 当前仅用于诊断输出;运行时回退由后续阶段实现。
+//! 引导早期从 FDT 的 `riscv,isa` 读取 ISA 字符串:
+//! - 输出能力表(诊断);
+//! - 驱动定时器路径选择(D17):含 `sstc` → stimecmp 直写,否则 SBI 回退。
+//!   M2 的其它扩展运行时回退(如 Zicboz 清零)仍待实现。
 
 use crate::info;
 
-/// CPU 能力集合(当前未使用,预留 M2 运行时回退)。
-#[allow(dead_code)]
+/// CPU 能力集合。
 pub struct Capabilities {
     /// ISA 字符串(如 "rv64imafdch_zba_zbb_zbs_zicond")。
     pub isa_string: &'static str,
