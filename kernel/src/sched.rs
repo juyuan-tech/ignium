@@ -110,8 +110,13 @@ struct Scheduler {
     idle: usize,
     /// 当前线程已运行 tick 数。
     ticks_run: u64,
-    /// 下一个线程 id。
-    next_id: usize,
+    /// M2 T0(V4 自审):已退出/可复用的 TCB 槽(FIFO 复用)。
+    /// 使累计 spawn 不受 `threads.len() < MAX_THREADS` 的"累计硬顶"
+    /// 限制 —— 退出线程槽位重新分配(活动线程数决定上限)。
+    /// 复用安全性:退出线程不留在等待队列(wake 已弹出),旧 waiter
+    /// 残留由 woken 协议吸收(良性虚假唤醒);SwitchTarget 裸指针仅
+    /// 在切换期间存续,退出即时可复用。
+    free_slots: VecDeque<usize>,
     /// 已退出线程的栈回收队列(idle 在自身上下文释放)。
     reaper: VecDeque<KernelStack>,
 }
@@ -304,14 +309,20 @@ impl Scheduler {
 
     /// 新建线程:分配栈 + 构造初始帧(sepc=thread_entry,sp=栈顶)。
     fn spawn(&mut self, entry: fn(), prio: u8) -> usize {
-        // INFO-1(审计 17 轮):强制容量上限 —— 容量为 ISR 零分配
-        // 预留(reserve MAX_THREADS),超过即违反该不变量。
-        assert!(
-            self.threads.len() < MAX_THREADS,
-            "thread table full ({MAX_THREADS})"
-        );
-        let id = self.next_id;
-        self.next_id += 1;
+        // M2 T0(V4 自审):优先复用已退出线程的 TCB 槽。
+        let reuse = self.free_slots.pop_front();
+        let id = match reuse {
+            Some(idx) => idx,
+            None => {
+                // INFO-1(审计 17 轮)+ T0:强制容量上限 —— 容量为
+                // ISR 零分配预留(reserve MAX_THREADS),超过即违反。
+                assert!(
+                    self.threads.len() < MAX_THREADS,
+                    "thread table full ({MAX_THREADS})"
+                );
+                self.threads.len()
+            }
+        };
         // 零化-free 栈分配(性能优化):`vec![0u8; N]` 会白付 16KB
         // memset —— 栈内容无需初始化(初始帧/上下文显式构造)。
         // V3 审计 #10:函数名不再误导为"zeroed"。
@@ -350,7 +361,13 @@ impl Scheduler {
             entry,
             stack: Some(stack),
         };
-        self.threads.push(t);
+        if id < self.threads.len() {
+            // 复用已退出线程的槽
+            self.threads[id] = t;
+        } else {
+            // 新线程表扩展(idx == len)
+            self.threads.push(t);
+        }
         self.enqueue(id);
         id
     }
@@ -363,7 +380,7 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     current: 0,
     idle: 0,
     ticks_run: 0,
-    next_id: 1,
+    free_slots: VecDeque::new(),
     reaper: VecDeque::new(),
 });
 
@@ -414,12 +431,13 @@ pub fn init() {
     }
     s.reaper.reserve(MAX_THREADS);
     s.threads.reserve(MAX_THREADS);
-    // idle 线程:id=0,最低优先级,永不阻塞。
-    // V4(外部审计 LOW,文档说明):idle 实际运行在**引导栈**
-    // (kernel_main 的 idle 循环),此处分配的 16 KiB 线程栈与
-    // `ctx.ra=idle_entry` 仅为 M3 回退占位 —— 一旦 idle 首次参与
-    // 协作切换,其 ctx 会被真实引导栈上下文覆盖,idle_entry 永不可达。
-    // 该占位栈在内核生命周期内不回收(微小浪费,换取结构统一)。
+    s.free_slots.reserve(MAX_THREADS); // M2 T0:退出槽复用
+                                       // idle 线程:id=0,最低优先级,永不阻塞。
+                                       // V4(外部审计 LOW,文档说明):idle 实际运行在**引导栈**
+                                       // (kernel_main 的 idle 循环),此处分配的 16 KiB 线程栈与
+                                       // `ctx.ra=idle_entry` 仅为 M3 回退占位 —— 一旦 idle 首次参与
+                                       // 协作切换,其 ctx 会被真实引导栈上下文覆盖,idle_entry 永不可达。
+                                       // 该占位栈在内核生命周期内不回收(微小浪费,换取结构统一)。
     let idle_id = 0;
     let stack = alloc_free_stack();
     let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
@@ -596,6 +614,10 @@ pub fn exit() -> ! {
         s.threads[cur].state = ThreadState::Exited;
         s.threads[cur].frame_valid = false;
         s.threads[cur].ctx_valid = true;
+        // M2 T0(V4 自审):释放 TCB 槽供后续 spawn 复用。
+        // 安全性:woken 残留由 wait 循环吸收;退出线程必不在就绪/等待
+        // 队列(pick 已弹出、wake 已消费),复用即安全。
+        s.free_slots.push_back(cur);
         s.ticks_run = 0;
         let next = s.pick_next(true);
         s.current = next;
