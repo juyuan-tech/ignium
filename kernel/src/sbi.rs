@@ -8,22 +8,20 @@
 //!   返回 `a0` = 错误码(SBI_SUCCESS=0),`a1` = 附加返回值。
 //! - 错误处理:**所有调用方必须检查返回值**。
 //!
-//! # 定时器:当前使用 SSTC 直写 stimecmp(性能优化)
-//! `set_timer`(TIME 扩展)保留为**无 SSTC 平台的回退/参考实现**;
-//! 主路径见 arch/riscv64.rs 的 `set_stimecmp`。RVA23 强制平台均
-//! 具备 SSTC。
+//! # 定时器:主路径按能力选择(D17)
+//! `enable_timer` 首次用 SBI `set_timer` 编程(通用,无非法指令风险),
+//! FDT 解析后检测到 `sstc` 扩展才切回 stimecmp 直写(见
+//! arch/riscv64.rs 的 arm_timer)。因此 `set_timer` 是**活跃回退路径**。
 
-/// SBI TIME 扩展号(ASCII "TIME")。回退实现保留,当前未使用。
-#[allow(dead_code)]
+/// SBI TIME 扩展号(ASCII "TIME")。
 const SBI_EXT_TIME: usize = 0x5449_4D45;
 
 /// 编程定时器(SBI TIME 扩展)。**回退实现**:当前主路径为 SSTC
 /// 直写 stimecmp(见 arch/riscv64.rs);无 SSTC 平台接入时启用本函数。
 ///
-/// # Safety
+/// Safety
 /// 通过裸 `ecall` 调用 M 模式固件。调用约定由 `clobber_abi("C")`
 /// 声明全部 caller-saved 寄存器被覆写;错误码经 a0 返回,必须检查。
-#[allow(dead_code)]
 #[inline]
 pub fn set_timer(stime_value: usize) -> usize {
     let mut error: usize;

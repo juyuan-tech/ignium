@@ -18,7 +18,7 @@
 | D9 | 控制台输出锁(多核防交错) | uart.rs 注释 | 多核唤醒前(M2) | 待办:Wrap uart::putc in SpinLock,防止多核同时输出在串口上交错 |
 | D19 | 多核调度器支持 | 审计 18 轮 | M2+ | 待办:per-CPU 空闲线程/idle 循环、per-CPU 就绪队列(或全局锁+迁移)、线程亲和性;当前 SCHED 全局锁在单核下正确,多核下可工作但不缩放 |
 | D20 | 线程栈守护页(堆分配 16KB 无 guard) | 审计 V3 M1 | M2(每进程地址空间) | 待办:线程栈越界→静默破坏相邻堆内存;boot/trap 栈已有 guard(D4)。运行期 sp 水位检测不可靠(idle 实际跑引导栈会误报),M2 用户态按进程地址空间天然隔离 |
-| D21 | UART 波特率分频按 FDT clock-frequency 计算 | 审计多轮 pro #6 | M1.5(真机 bring-up 前) | 待办:当前固定分频 0x0C(QEMU 忽略);读串口节点 clock-frequency,分频 = clk/(16×波特率) |
+| D21 | UART 波特率分频按 FDT clock-frequency 计算 | 审计多轮 pro #6 | 真机 bring-up 前(不属 M1.5:M1.5 全部 QEMU 内) | 待办:当前固定分频 0x0C(QEMU 忽略);读串口节点 clock-frequency,分频 = clk/(16×波特率) |
 | D10 | 用户页交接前清零(防信息泄漏) | 审计 M4(mem.rs) | M2 用户态 | 待办 |
 | D11 | ISR 内分配安全(与 D3 配套,防死锁) | 优化报告遗留风险 | 调度器里程碑 | **已实现**(审计 16 轮):就绪队列/reaper/线程 Vec 容量预留(MAX_THREADS=64),ISR 路径零分配;调度器临界区 irq_save/restore;ISR 内仍禁止主动分配(新需求走 D3 IRQ 安全锁) |
 | D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办 |
