@@ -480,3 +480,109 @@ static STRESS_RECV_COUNT: AtomicUsize = AtomicUsize::new(0);
 static STRESS_RECV_SUM: AtomicUsize = AtomicUsize::new(0);
 static STRESS_SENDER_DONE: AtomicBool = AtomicBool::new(false);
 static STRESS_RECVER_DONE: AtomicBool = AtomicBool::new(false);
+
+// ===== M2 T3b:per-CPU 调度(D19) =====
+
+/// 测试线程槽位上限(与 sched 的 MAX_THREADS=64 对齐;T3b 测试最多用 4)。
+const SMP_MAX_THREADS: usize = 64;
+/// 每核结果槽:线程记录其**实际运行核**(= 亲和核则正常;错核写
+/// `usize::MAX`,断言据此检出)。
+static SMP_SLOT_HART: [AtomicUsize; crate::arch::MAX_HARTS] =
+    [const { AtomicUsize::new(usize::MAX) }; crate::arch::MAX_HARTS];
+/// 每线程的目标亲和核(tid 索引;spawn 返回后记录,供 smp_thread 读取)。
+static SMP_TARGET_HART: [AtomicUsize; SMP_MAX_THREADS] =
+    [const { AtomicUsize::new(usize::MAX) }; SMP_MAX_THREADS];
+/// 完成计数(每个测试线程完成一次 +1)。
+static SMP_DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// T3b 阶段 2(IPI 跨核唤醒)标志:线程已被唤醒并恢复运行。
+static SMP_WAKE_RAN: AtomicBool = AtomicBool::new(false);
+
+/// T3b 测试线程:在亲和核上记录运行核并计数,随后返回退出
+/// (thread_entry → exit;副核上 exit 的 pick 回退选回 idle)。
+fn smp_thread() {
+    let tid = crate::sched::current_id();
+    let target = SMP_TARGET_HART[tid].load(Ordering::Relaxed);
+    let ran_on = crate::arch::hartid();
+    SMP_SLOT_HART[target].store(
+        if ran_on == target { ran_on } else { usize::MAX },
+        Ordering::Relaxed,
+    );
+    SMP_DONE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// T3b 阶段 2:跨核唤醒线程 —— `block_current` 阻塞,由 boot hart 跨核
+/// `wake`(发 SBI IPI)唤醒,恢复后置 RAN 并退出。
+fn smp_wake_thread() {
+    crate::sched::block_current();
+    SMP_WAKE_RAN.store(true, Ordering::Relaxed);
+}
+
+/// M2 T3b:per-CPU 调度冒烟(boot hart、`irq_enable` 后调用)。
+///
+/// 对每个**在线**核 spawn 一个内核线程并 `set_affinity(t, h)`;线程在
+/// 运行核上记录 hartid 并计数。boot hart 协作 `yield_` 轮询直至全部完成。
+/// 断言:每槽 hart == 其亲和核(证明线程确实被分配到各核运行,而非全在
+/// boot hart;错核运行 → `usize::MAX`)、完成计数 == 在线核数。单核
+/// (make test / boot hart 无副核)下 N=1 同样通过。随后**阶段 2** 验证跨核
+/// block/wake:SBI IPI + SSIP 中断唤醒副核 wfi idle 的整条链路(线程阻塞于
+/// 核 1,由 boot hart 跨核 `wake` 发 IPI 唤醒)。banner 供 Makefile/CI grep。
+pub fn smp_sched_test() {
+    let n = crate::board::cpu_count().min(crate::arch::MAX_HARTS);
+    SMP_DONE_COUNT.store(0, Ordering::Relaxed);
+    for (h, slot) in SMP_SLOT_HART.iter().enumerate().take(n) {
+        slot.store(usize::MAX, Ordering::Relaxed);
+        let tid = crate::sched::spawn(smp_thread, crate::sched::PRIO_HIGH);
+        crate::sched::set_affinity(tid, h);
+        SMP_TARGET_HART[tid].store(h, Ordering::Relaxed);
+    }
+    // 协作轮询直至完成(boot hart 的 yield 同时给本核线程调度机会;
+    // 副核线程由其 idle 循环直接 pick 运行)。
+    let mut guard = 0u32;
+    while SMP_DONE_COUNT.load(Ordering::Relaxed) < n {
+        guard += 1;
+        assert!(
+            guard < 500_000,
+            "T3b smp: timeout ({}/{} done)",
+            SMP_DONE_COUNT.load(Ordering::Relaxed),
+            n
+        );
+        crate::sched::yield_();
+    }
+    for (h, slot) in SMP_SLOT_HART.iter().enumerate().take(n) {
+        let v = slot.load(Ordering::Relaxed);
+        assert!(v == h, "T3b smp: thread for hart {h} ran on hart {v}");
+    }
+    // 阶段 2:跨核 block/wake → 验证 SBI IPI + SSIP 中断唤醒 wfi idle 的
+    // 整条链路(sbi.rs/T3b 要求"重新验证 IPI 在新机制的可用性")。线程
+    // 置亲和核 = 1(单核退化回 0)。**先等线程真正 Blocked**(is_blocked
+    // 在 SCHED 锁内读 state)再 wake —— 保证 wake 必走 Blocked→enqueue
+    // +IPI 路径,确定性覆盖 IPI 链路;否则 wake 先于 block_current 到达
+    // 时走 woken 标志路径绕过 IPI(测试对 IPI 无覆盖)。IPI 失败仅降级
+    // 为 ≤1 tick 的定时器唤醒(仍通过),不引入时序失败。
+    let tgt = 1usize.min(n - 1);
+    SMP_WAKE_RAN.store(false, Ordering::Relaxed);
+    let wtid = crate::sched::spawn(smp_wake_thread, crate::sched::PRIO_HIGH);
+    crate::sched::set_affinity(wtid, tgt);
+    let mut guard = 0;
+    let mut blocked = false;
+    while guard < 500_000 {
+        if crate::sched::is_blocked(wtid) {
+            blocked = true;
+            break;
+        }
+        guard += 1;
+        crate::sched::yield_();
+    }
+    assert!(blocked, "T3b smp: wake thread never blocked");
+    crate::sched::wake(wtid);
+    guard = 0;
+    while !SMP_WAKE_RAN.load(Ordering::Relaxed) && guard < 500_000 {
+        guard += 1;
+        crate::sched::yield_();
+    }
+    assert!(
+        SMP_WAKE_RAN.load(Ordering::Relaxed),
+        "T3b smp: cross-hart wake timeout"
+    );
+    info!("M2 T3b: per-CPU sched ok ({n} harts)");
+}

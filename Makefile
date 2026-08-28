@@ -65,6 +65,7 @@ test: build
 		&& grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-test.log \
 		&& grep -q "M2 T2b: IPC stress ok" /tmp/ignium-test.log \
 		&& grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-test.log \
+		&& grep -q "M2 T3b: per-CPU sched ok" /tmp/ignium-test.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-test.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
 		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)
@@ -79,6 +80,7 @@ test-smp:
 	@test "$$(grep -c 'M0: boot ok' /tmp/ignium-smp.log)" -eq 1 \
 		&& test "$$(grep -c 'hart [0-9] online' /tmp/ignium-smp.log)" -eq 3 \
 		&& grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-smp.log \
+		&& grep -q "M2 T3b: per-CPU sched ok" /tmp/ignium-smp.log \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log \
 		&& echo "SMP TEST PASS" || (echo "SMP TEST FAIL"; cat /tmp/ignium-smp.log; exit 1)
 
@@ -108,6 +110,7 @@ test-rva23: build-rva23
 		&& grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-rva23.log \
 		&& grep -q "M2 T2b: IPC stress ok" /tmp/ignium-rva23.log \
 		&& grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-rva23.log \
+		&& grep -q "M2 T3b: per-CPU sched ok" /tmp/ignium-rva23.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log \
 		&& echo "RVA23 TEST PASS" || (echo "RVA23 TEST FAIL"; cat /tmp/ignium-rva23.log; exit 1)

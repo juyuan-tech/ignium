@@ -32,13 +32,20 @@
 //!   `do_switch`/`on_tick` 在切换前经 `mmu::switch_root` 切换 satp
 //!   (与当前相同则 no-op);用户线程恒走 frame_restore(sret),切换点
 //!   在 Rust 侧(汇编恢复路径不碰 satp,见 riscv64.S)。
+//! - **D19 多核调度(M2 T3b)**:就绪队列/当前/idle/时间片全部 per-CPU
+//!   化(数组 `[..; MAX_HARTS]`),`Thread.hart` = 亲和性(默认 = 创建时
+//!   当前核)。**全局 SCHED 锁保留** → 无数据竞争,只改语义:线程恒在
+//!   `ready[threads[id].hart]` 且只在亲和核上运行。`wake` 把线程放进
+//!   目标核队列,若目标核 idle 且非本核 → SBI IPI 唤醒其 wfi(判定与发
+//!   IPI 同在 SCHED 锁临界区 → 无丢失唤醒窗口)。副核 idle 循环 =
+//!   `pick_next(hart)` 有就绪 → `do_switch`,否则 `wait_for_interrupt`。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::arch::{self, Context};
+use crate::arch::{self, Context, MAX_HARTS};
 use crate::info;
 use crate::sync::SpinLock;
 use crate::warn;
@@ -113,6 +120,10 @@ struct Thread {
     /// M2 T1.5:所属进程(None = 内核线程,运行于内核根表)。
     /// M2 T2a:IPC 能力查表经 `current_proc()` 读取。
     proc: Option<usize>,
+    /// M2 T3b(D19):亲和性 —— 本线程所属的核(其就绪队列 / 运行核)。
+    /// 默认 = 创建时当前 hart;`set_affinity` 可迁移(仅非运行线程)。
+    /// 不变量:线程恒在 `ready[hart]`,且只在 `hart` 上运行。
+    hart: usize,
     /// M2 T1.5:本线程应运行的 satp 根表(内核线程 = kernel_root,
     /// 用户线程 = 所属进程根表)。**缓存到 Thread**(非切换时查进程表),
     /// 使 ISR 路径(on_tick)零分配读根表。
@@ -144,17 +155,19 @@ const MAX_DONATIONS: usize = MAX_THREADS;
 /// 调度器。
 struct Scheduler {
     threads: Vec<Thread>,
-    /// 就绪队列(按**有效**优先级 —— 捐赠经 `enqueue` 的 eff_prio 生效)。
-    ready: [VecDeque<usize>; PRIO_LEVELS],
+    /// M2 T3b(D19)per-CPU 就绪队列:`ready[hart][prio]`。线程按**其亲和性
+    /// hart**(`threads[id].hart`)入队,只在亲和核上运行。全局 SCHED 锁
+    /// 保留 → 无数据竞争(只改语义)。
+    ready: [[VecDeque<usize>; PRIO_LEVELS]; MAX_HARTS],
     /// M2 T2b(PIP):优先级捐赠表(见 `Donation`)。ISR(on_tick)只读扫描,
     /// 变更仅在外路径(阻塞/唤醒);容量 init 预留,零分配。
     donations: Vec<Donation>,
-    /// 当前线程 id。
-    current: usize,
-    /// idle 线程 id(最低优先级,永不阻塞)。
-    idle: usize,
-    /// 当前线程已运行 tick 数。
-    ticks_run: u64,
+    /// M2 T3b(D19):每核当前线程 id。
+    current: [usize; MAX_HARTS],
+    /// M2 T3b(D19):每核 idle 线程 id(最低优先级,永不阻塞)。
+    idle: [usize; MAX_HARTS],
+    /// M2 T3b(D19):每核当前线程已运行 tick 数。
+    ticks_run: [u64; MAX_HARTS],
     /// M2 T0(V4 自审):已退出/可复用的 TCB 槽(FIFO 复用)。
     /// 使累计 spawn 不受 `threads.len() < MAX_THREADS` 的"累计硬顶"
     /// 限制 —— 退出线程槽位重新分配(活动线程数决定上限)。
@@ -191,7 +204,7 @@ fn thread_entry() {
     let irq = arch::irq_save();
     let entry = {
         let mut s = SCHED.lock();
-        let id = s.current;
+        let id = s.current[arch::hartid()];
         // 初始帧已被消费(本次进入),此后进度在 ctx(CRITICAL-3)。
         s.threads[id].frame_valid = false;
         s.threads[id].entry
@@ -220,9 +233,13 @@ impl Scheduler {
     /// **被唤醒的 ctx 线程**(D22:`ctx_valid && woken`,on_tick 会把它
     /// 展开为帧再恢复) —— 帧恢复是被抢占线程的唯一合法恢复方式。
     /// 无分配:仅 VecDeque 出/入队(轮转),不满足条件的候选回队尾。
-    fn pick_next(&mut self, need_ctx: bool) -> usize {
+    ///
+    /// D19:`hart` = 运行核 —— 只从该核的 ready 队列选(就绪队列中的
+    /// 线程按定义恒在其亲和核队列,见 `enqueue`);回退同理用该核的
+    /// current/idle。
+    fn pick_next(&mut self, hart: usize, need_ctx: bool) -> usize {
         for level in 0..PRIO_LEVELS {
-            let q = &mut self.ready[level];
+            let q = &mut self.ready[hart][level];
             let round = q.len();
             for _ in 0..round {
                 let Some(id) = q.pop_front() else { break };
@@ -268,21 +285,26 @@ impl Scheduler {
         // M3(审计 18 轮外部):若当前线程已退出,回 idle 防停机。
         // H3(审计 18 轮外部):回退时若当前线程不是 Running(如
         // Blocked),强制回 idle 避免 livelock。
-        if self.threads[self.current].state == ThreadState::Exited
-            || self.threads[self.current].state != ThreadState::Running
+        if self.threads[self.current[hart]].state == ThreadState::Exited
+            || self.threads[self.current[hart]].state != ThreadState::Running
         {
-            self.idle
+            self.idle[hart]
         } else {
-            self.current
+            self.current[hart]
         }
     }
 
     /// 把线程加入就绪队列。按**有效优先级**选队:捐赠(见 `Donation`)
     /// 可临时抬升所属进程线程的优先级,spawn/spawn_user/requeue 一律
     /// 经本函数 → 捐赠对"晚 spawn 的接收方"也自动生效。
+    ///
+    /// D19:队列按线程的**亲和性核**索引(`ready[threads[id].hart]`)——
+    /// 线程只在亲和核上运行;唤醒/迁移(set_affinity)后由本函数把线程
+    /// 放入目标核队列。
     fn enqueue(&mut self, id: usize) {
         let prio = self.eff_prio(id) as usize;
-        self.ready[prio].push_back(id);
+        let h = self.threads[id].hart;
+        self.ready[h][prio].push_back(id);
         self.threads[id].state = ThreadState::Ready;
     }
 
@@ -312,12 +334,12 @@ impl Scheduler {
     /// 重查重等,不适用于 IPC 的原子"登记+阻塞")。
     fn requeue_proc_threads(&mut self, proc: usize) {
         // 栈数组收集:本函数只在外路径调用(非 ISR),容量固定,零堆分配。
-        // 从**任意**就绪队列移除该进程全部就绪线程(可能散布于不同
-        // 优先队列),再逐个按有效优先级 enqueue 重排 —— 抬升(注册)
-        // 与回落(撤销)都正确。
+        // 从**任意核、任意优先**就绪队列移除该进程全部就绪线程(可能
+        // 散布于不同核/优先队列),再逐个按有效优先级 enqueue 重排 ——
+        // 抬升(注册)与回落(撤销)都正确(D19:enqueue 按线程亲和核归位)。
         let mut buf = [0usize; MAX_THREADS];
         let mut n = 0usize;
-        for q in self.ready.iter_mut() {
+        for q in self.ready.iter_mut().flatten() {
             q.retain(|&id| {
                 if self.threads[id].proc == Some(proc) {
                     if n < MAX_THREADS {
@@ -382,8 +404,10 @@ impl Scheduler {
     }
 
     /// 从就绪队列撤销一个线程(block_current 的"已唤醒则继续"路径)。
+    /// D19:线程只在亲和核队列中 → 只扫 `ready[threads[id].hart]`。
     fn remove_from_ready(&mut self, id: usize) {
-        for q in self.ready.iter_mut() {
+        let h = self.threads[id].hart;
+        for q in self.ready[h].iter_mut() {
             if let Some(pos) = q.iter().position(|&x| x == id) {
                 q.remove(pos);
                 return;
@@ -406,16 +430,18 @@ impl Scheduler {
     /// 优先级抢占应即时,不等时间片)且存在可抢占的其他就绪线程
     /// (D22:帧有效或被唤醒的 ctx 线程)→ 复制当前帧、返回下一线程帧。
     /// 否则返回原帧。
-    fn on_tick(&mut self, frame: *mut usize) -> *mut usize {
+    /// D19:`hart` = 当前运行核(ISR 内由 trap_handler 传入)。抢占只作用
+    /// 于本核的 current / 本核就绪队列(每核独立时间片)。
+    fn on_tick(&mut self, frame: *mut usize, hart: usize) -> *mut usize {
         // INFO-2(审计 17 轮):wrapping —— overflow-checks 开启下
         // 2^64 tick 后 ISR 内 panic(工程上不可达,与工程约定一致)。
-        self.ticks_run = self.ticks_run.wrapping_add(1);
-        if self.ticks_run < SLICE_TICKS {
+        self.ticks_run[hart] = self.ticks_run[hart].wrapping_add(1);
+        if self.ticks_run[hart] < SLICE_TICKS {
             // 时间片未到:仅当更高优先级就绪(可抢占)才抢占。
             // M2 T2b(PIP):用**有效**优先级判断当前线程 —— 被捐赠抬升的
             // 线程(如持资源的 LOW 进程线程)在继承 HIGH 期间,中间优先级
             // 不得抢占它(否则 PIP 失效:抬升了还是被 MED 打断)。
-            let cur_prio = self.eff_prio(self.current) as usize;
+            let cur_prio = self.eff_prio(self.current[hart]) as usize;
             // P2(本轮性能):当前线程已是最高优先级(0)时,更高优先级
             // 扫描范围 `0..cur_prio` 必然为空 → higher 恒 false ——
             // 直接早退,省掉最常见的无抢占路径(tick 内)的就绪队列
@@ -424,25 +450,25 @@ impl Scheduler {
                 return frame;
             }
             let higher = (0..cur_prio).any(|l| {
-                self.ready[l]
+                self.ready[hart][l]
                     .iter()
-                    .any(|&id| id != self.current && self.preemptable(id))
+                    .any(|&id| id != self.current[hart] && self.preemptable(id))
             });
             if !higher {
                 return frame;
             }
         }
-        self.ticks_run = 0;
+        self.ticks_run[hart] = 0;
         // 是否存在可抢占的就绪线程(非自身)。
         let has_other = (0..PRIO_LEVELS).any(|l| {
-            self.ready[l]
+            self.ready[hart][l]
                 .iter()
-                .any(|&id| id != self.current && self.preemptable(id))
+                .any(|&id| id != self.current[hart] && self.preemptable(id))
         });
         if !has_other {
             return frame;
         }
-        let cur = self.current;
+        let cur = self.current[hart];
         // 把被中断线程的全量帧复制进其 TCB(帧此刻有效)。
         self.threads[cur]
             .frame
@@ -454,8 +480,8 @@ impl Scheduler {
         self.threads[cur].state = ThreadState::Ready;
         // 加入就绪(排到队尾,轮转)。
         self.enqueue(cur);
-        // CRITICAL-1:抢占路径选帧有效线程。
-        let next = self.pick_next(false);
+        // CRITICAL-1:抢占路径选帧有效线程(本核队列)。
+        let next = self.pick_next(hart, false);
         if next == cur {
             // 前瞻(审计 16 轮自审):轮转可能把刚入队的 cur 选回
             // (其帧有效)—— 白做一次捕获/恢复循环。撤销入队并
@@ -468,7 +494,7 @@ impl Scheduler {
             self.threads[cur].ctx_valid = false;
             return frame;
         }
-        self.current = next;
+        self.current[hart] = next;
         // M2 T2a(D22):选中者可能是「被唤醒的 ctx 线程」(仅 ctx_valid)——
         // 帧恢复是其唯一合法恢复方式,先把 ctx 展开为 S 模式陷阱帧
         // (expand_ctx_to_frame 置 frame_valid=true、清 woken)。帧有效者
@@ -569,6 +595,8 @@ impl Scheduler {
             woken: false,
             // 内核线程:不属任何进程,运行于内核根表。
             proc: None,
+            // D19:亲和性 = 创建时当前核(spawn 后可用 set_affinity 迁移)。
+            hart: arch::hartid(),
             root: crate::mmu::kernel_root(),
             entry,
             stack: Some(stack),
@@ -637,6 +665,8 @@ impl Scheduler {
             ctx_valid: false,
             woken: false,
             proc: Some(proc_id),
+            // D19:亲和性 = 创建时当前核(用户线程同理,只在亲和核运行)。
+            hart: arch::hartid(),
             root,
             // 占位:用户不经过 thread_entry(S 模式包装);进入即错误。
             entry: user_entry_stub,
@@ -655,13 +685,15 @@ impl Scheduler {
 }
 
 /// 调度器单例(SpinLock:主上下文/ISR 均不可重入)。
+/// D19:就绪队列/当前/idle/时间片均为 per-CPU 数组(MAX_HARTS 槽);
+/// 空 VecDeque 用内联 const 重复初始化(非 Copy 元素)。
 static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     threads: Vec::new(),
-    ready: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+    ready: [const { [const { VecDeque::new() }; PRIO_LEVELS] }; MAX_HARTS],
     donations: Vec::new(),
-    current: 0,
-    idle: 0,
-    ticks_run: 0,
+    current: [0; MAX_HARTS],
+    idle: [0; MAX_HARTS],
+    ticks_run: [0; MAX_HARTS],
     free_slots: VecDeque::new(),
     reaper: VecDeque::new(),
 });
@@ -703,53 +735,59 @@ fn alloc_free_stack() -> KernelStack {
     KernelStack { ptr }
 }
 
-/// 初始化调度器(创建 idle 线程;须在堆就绪后、irq_enable 前调用)。
+/// 初始化调度器(每核一个 idle 线程;须在堆就绪后、irq_enable 前调用)。
 pub fn init() {
     let irq = arch::irq_save();
     let mut s = SCHED.lock();
     // HIGH-5:预留容量 —— 此后 ISR 内的 enqueue/栈移交均零分配。
-    for q in s.ready.iter_mut() {
+    // D19:每核每优先队列都预留(全局 ISR 零分配约定不变)。
+    for q in s.ready.iter_mut().flatten() {
         q.reserve(MAX_THREADS);
     }
     s.reaper.reserve(MAX_THREADS);
     s.threads.reserve(MAX_THREADS);
     s.free_slots.reserve(MAX_THREADS); // M2 T0:退出槽复用
     s.donations.reserve(MAX_DONATIONS); // M2 T2b(PIP):捐赠表
-                                        // idle 线程:id=0,最低优先级,永不阻塞。
-                                        // V4(外部审计 LOW,文档说明):idle 实际运行在**引导栈**
-                                        // (kernel_main 的 idle 循环),此处分配的 16 KiB 线程栈与
-                                        // `ctx.ra=idle_entry` 仅为 M3 回退占位 —— 一旦 idle 首次参与
-                                        // 协作切换,其 ctx 会被真实引导栈上下文覆盖,idle_entry 永不可达。
-                                        // 该占位栈在内核生命周期内不回收(微小浪费,换取结构统一)。
-    let idle_id = 0;
-    let stack = alloc_free_stack();
-    let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
-    let mut frame = [0usize; FRAME_WORDS];
-    frame[FRAME_SEPC] = idle_entry as *const () as usize;
-    frame[FRAME_SSTATUS] = (1 << 5) | (1 << 8); // SPIE | SPP
-    s.threads.push(Thread {
-        prio: PRIO_LOW,
-        state: ThreadState::Running,
-        ctx: Context {
-            ra: idle_entry as *const () as usize,
-            sp,
-            s: [0; 12],
-        },
-        frame,
-        // idle 以主流程直接运行(非经切换),初始帧从未被使用 →
-        // 无效;其帧在真正被抢占时才会捕获。
-        frame_valid: false,
-        ctx_valid: true,
-        woken: false,
-        // idle 为内核线程:运行于内核根表。
-        proc: None,
-        root: crate::mmu::kernel_root(),
-        entry: idle_entry,
-        stack: Some(stack),
-        ipc_msg: None,
-    });
-    s.current = idle_id;
-    s.idle = idle_id;
+                                        // D19:每个 hart 一个 idle 线程(每核独立 idle;副核由 entry.S 在
+                                        // per-hart idle 栈上引导进入 secondary_main,再入本 idle 循环)。
+                                        // V4(外部审计 LOW,文档说明):idle 实际运行在**引导栈 / per-hart
+                                        // idle 栈**(boot hart = kernel_main 的 idle 循环),此处分配的
+                                        // 16 KiB 线程栈与 `ctx.ra=idle_entry` 仅为 M3 回退占位 —— 一旦 idle
+                                        // 首次参与协作切换,其 ctx 会被真实引导栈上下文覆盖,idle_entry
+                                        // 永不可达。该占位栈在内核生命周期内不回收(微小浪费,换取结构统一)。
+    for h in 0..MAX_HARTS {
+        let idle_id = s.threads.len();
+        let stack = alloc_free_stack();
+        let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
+        let mut frame = [0usize; FRAME_WORDS];
+        frame[FRAME_SEPC] = idle_entry as *const () as usize;
+        frame[FRAME_SSTATUS] = (1 << 5) | (1 << 8); // SPIE | SPP
+        s.threads.push(Thread {
+            prio: PRIO_LOW,
+            state: ThreadState::Running,
+            ctx: Context {
+                ra: idle_entry as *const () as usize,
+                sp,
+                s: [0; 12],
+            },
+            frame,
+            // idle 以引导上下文直接运行(非经切换),初始帧从未被使用 →
+            // 无效;其帧在真正被抢占时才会捕获。
+            frame_valid: false,
+            ctx_valid: true,
+            woken: false,
+            // idle 为内核线程:运行于内核根表。
+            proc: None,
+            // D19:idle 恒属其核(占位语义;实际运行在引导/per-hart 栈)。
+            hart: h,
+            root: crate::mmu::kernel_root(),
+            entry: idle_entry,
+            stack: Some(stack),
+            ipc_msg: None,
+        });
+        s.current[h] = idle_id;
+        s.idle[h] = idle_id;
+    }
     drop(s);
     arch::irq_restore(irq);
 }
@@ -815,7 +853,7 @@ pub fn take_ipc_msg() -> Option<[usize; crate::ipc::MSG_WORDS]> {
     let irq = arch::irq_save();
     let msg = {
         let mut s = SCHED.lock();
-        let id = s.current;
+        let id = s.current[arch::hartid()];
         s.threads[id].ipc_msg.take()
     };
     arch::irq_restore(irq);
@@ -839,7 +877,8 @@ pub fn yield_() {
     // 单锁作用域:状态变更 + pick + 切换目标提取一次完成。
     let target = {
         let mut s = SCHED.lock();
-        let cur = s.current;
+        let h = arch::hartid();
+        let cur = s.current[h];
         // C3(审计 15 轮回归):合并锁时丢失 —— yield 后进度在 ctx,
         // 帧必须失效,否则抢占会用过期帧恢复线程(从头重跑)。
         // CRITICAL-1:ctx 刚保存(有效),协作路径可选本线程。
@@ -851,9 +890,9 @@ pub fn yield_() {
             drop(stack);
         }
         s.enqueue(cur);
-        s.ticks_run = 0;
-        let next = s.pick_next(true);
-        s.current = next;
+        s.ticks_run[h] = 0;
+        let next = s.pick_next(h, true);
+        s.current[h] = next;
         switch_target(&mut s, cur, next)
     };
     // 锁外切换(中断关闭保证原子性;选中者恢复机制见 switch_target:
@@ -871,7 +910,8 @@ pub fn block_current() {
     let irq = arch::irq_save();
     let target = {
         let mut s = SCHED.lock();
-        let cur = s.current;
+        let h = arch::hartid();
+        let cur = s.current[h];
         if s.threads[cur].state == ThreadState::Ready {
             // 已被唤醒(队列中):撤销本次入队,继续运行。
             s.remove_from_ready(cur);
@@ -895,20 +935,20 @@ pub fn block_current() {
             arch::irq_restore(irq);
             return;
         }
-        let c = s.current;
+        let c = s.current[h];
         s.threads[c].state = ThreadState::Blocked;
         s.threads[c].frame_valid = false;
         s.threads[c].ctx_valid = true;
-        s.ticks_run = 0;
-        let n = s.pick_next(true);
-        s.current = n;
+        s.ticks_run[h] = 0;
+        let n = s.pick_next(h, true);
+        s.current[h] = n;
         switch_target(&mut s, c, n)
     };
     // 锁外切换(中断关闭保证原子性;恢复机制见 switch_target)。
     do_switch(&target);
     // 醒来:撤销 wake 的入队并消费唤醒标志(防双调度/重入)。
     let mut s = SCHED.lock();
-    let cur = s.current;
+    let cur = s.current[arch::hartid()];
     s.remove_from_ready(cur);
     s.threads[cur].woken = false;
     drop(s);
@@ -918,13 +958,27 @@ pub fn block_current() {
 /// 唤醒指定线程:无条件记录唤醒标志(C5 —— 唤醒可能发生在目标
 /// 线程"登记之后、阻塞之前",此时其 state 尚非 Blocked,靠标志
 /// 兜底,block_current 会消费它),若已阻塞则入队。
+///
+/// D19:线程入其**亲和核**的队列;若目标核 idle 且非本核 → 发 SBI IPI
+/// 唤醒目标核 wfi 中的 idle(判定与发 IPI 同在 SCHED 锁临界区,与目标
+/// 核"查空 → wfi"的临界区互斥 → 无丢失唤醒窗口)。IPI 失败仅降级为
+/// 最长一个 tick 的唤醒延迟(定时器仍会唤醒 wfi 并重 pick),不破坏正确性。
 pub fn wake(id: usize) {
     let irq = arch::irq_save();
+    let my_hart = arch::hartid();
     let mut s = SCHED.lock();
     if id < s.threads.len() {
         s.threads[id].woken = true;
         if s.threads[id].state == ThreadState::Blocked {
+            let tgt = s.threads[id].hart;
             s.enqueue(id);
+            if tgt != my_hart && s.current[tgt] == s.idle[tgt] {
+                static IPI_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
+                let rc = crate::sbi::send_ipi(1u64 << tgt, 0);
+                if rc != 0 && !IPI_FAILED_LOGGED.swap(true, Ordering::Relaxed) {
+                    warn!("SBI send_ipi(hart {tgt}) failed (rc=0x{rc:x}); wakeup via timer only");
+                }
+            }
         }
     }
     drop(s);
@@ -972,11 +1026,11 @@ pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
     arch::irq_restore(irq);
 }
 
-/// 当前线程 id。
+/// 当前线程 id(D19:本核的 current)。
 pub fn current_id() -> usize {
     let irq = arch::irq_save();
     let s = SCHED.lock();
-    let id = s.current;
+    let id = s.current[arch::hartid()];
     drop(s);
     arch::irq_restore(irq);
     id
@@ -990,7 +1044,7 @@ pub fn current_proc() -> usize {
     let irq = arch::irq_save();
     let p = {
         let s = SCHED.lock();
-        s.threads[s.current].proc
+        s.threads[s.current[arch::hartid()]].proc
     };
     arch::irq_restore(irq);
     p.expect("current_proc: current thread is not a user thread")
@@ -1016,7 +1070,8 @@ pub fn exit() -> ! {
     let irq = arch::irq_save();
     let target = {
         let mut s = SCHED.lock();
-        let cur = s.current;
+        let h = arch::hartid();
+        let cur = s.current[h];
         // C2(审计 15 轮):**不得释放自身正在使用的栈** —— 把栈 Box
         // 移交回收队列,由 idle(在它自己的栈上)安全释放。
         if let Some(stack) = s.threads[cur].stack.take() {
@@ -1029,9 +1084,9 @@ pub fn exit() -> ! {
         // 安全性:woken 残留由 wait 循环吸收;退出线程必不在就绪/等待
         // 队列(pick 已弹出、wake 已消费),复用即安全。
         s.free_slots.push_back(cur);
-        s.ticks_run = 0;
-        let next = s.pick_next(true);
-        s.current = next;
+        s.ticks_run[h] = 0;
+        let next = s.pick_next(h, true);
+        s.current[h] = next;
         switch_target(&mut s, cur, next)
     };
     // 锁外切换(中断关闭保证原子性;恢复机制见 switch_target)。
@@ -1066,7 +1121,8 @@ pub fn exit_from_trap() -> ! {
     let irq = arch::irq_save();
     let target = {
         let mut s = SCHED.lock();
-        let cur = s.current;
+        let h = arch::hartid();
+        let cur = s.current[h];
         // C2(审计 15 轮):不得释放自身正在使用的栈 —— 交给 idle reaper。
         // 用户线程 stack=None,下方 take 返回 None,安全无操作。
         if let Some(stack) = s.threads[cur].stack.take() {
@@ -1077,9 +1133,9 @@ pub fn exit_from_trap() -> ! {
         s.threads[cur].ctx_valid = true;
         // M2 T0:退出槽入 free_slots 供后续 spawn 复用。
         s.free_slots.push_back(cur);
-        s.ticks_run = 0;
-        let next = s.pick_next(true);
-        s.current = next;
+        s.ticks_run[h] = 0;
+        let next = s.pick_next(h, true);
+        s.current[h] = next;
         // 从 trap 上下文 exit:本函数在 `trap_handler(ecall)` 的栈帧上
         // 运行,sscratch 仍是本次 trap 入栈后的"帧底"(trap_vector 写入)。
         // 直接 context_switch 回目标线程,其 sscratch 会残留该陈旧值,
@@ -1110,7 +1166,8 @@ pub unsafe fn block_user_from_trap(frame: *mut usize) -> ! {
     let irq = arch::irq_save();
     let target = {
         let mut s = SCHED.lock();
-        let cur = s.current;
+        let h = arch::hartid();
+        let cur = s.current[h];
         // 当前帧复制进 TCB(与 on_tick 捕获同款)供恢复与配对写结果。
         s.threads[cur]
             .frame
@@ -1122,9 +1179,9 @@ pub unsafe fn block_user_from_trap(frame: *mut usize) -> ! {
         // 保证配对,不依赖 wake 的 woken 协议)。
         s.threads[cur].woken = false;
         s.threads[cur].state = ThreadState::Blocked;
-        s.ticks_run = 0;
-        let next = s.pick_next(true);
-        s.current = next;
+        s.ticks_run[h] = 0;
+        let next = s.pick_next(h, true);
+        s.current[h] = next;
         // 与 exit_from_trap 同理:切换前重置 sscratch,防目标线程下次
         // trap 的嵌套检测(H2,riscv64.S label 4)误判为第二层而停机
         // (本帧已入 TCB,陷阱栈可复用)。
@@ -1188,13 +1245,97 @@ fn do_switch(t: &SwitchTarget) {
     }
 }
 
-/// 定时器 ISR 回调(中断关闭上下文):抢占决策,返回恢复帧。
+/// 定时器 ISR 回调(中断关闭上下文):本核抢占决策,返回恢复帧。
+///
+/// # 参数
+/// `hart`:当前运行核(trap_handler 已按 sscratch 推导,避免重复推导)。
 ///
 /// # Safety
 /// `frame` 必须是当前陷阱帧(见 trap_handler)。
-pub unsafe fn on_tick(frame: *mut usize) -> *mut usize {
+pub unsafe fn on_tick(frame: *mut usize, hart: usize) -> *mut usize {
     let mut s = SCHED.lock();
-    s.on_tick(frame)
+    s.on_tick(frame, hart)
+}
+
+/// M2 T3b(D19):把线程 `id` 的亲和性设为 `hart`(迁移其就绪队列)。
+///
+/// 仅允许迁移**非运行**线程:Ready(已在队列)→ 从原核队列移除再入
+/// 目标核队列;Blocked → 只改 hart(醒来时 wake 按新亲和核入队)。
+/// Running/Exited 属内部错误,fail-loudly。本函数在 SCHED 锁内完成
+/// 迁移与入队,目标核若 idle 由下一轮 pick/定时器自然取到(测试场景
+/// 为"分配线程到各核",无需即时 IPI)。
+pub fn set_affinity(id: usize, hart: usize) {
+    let irq = arch::irq_save();
+    let mut s = SCHED.lock();
+    assert!(id < s.threads.len(), "set_affinity: thread {id} OOB");
+    let h = hart.min(MAX_HARTS - 1);
+    match s.threads[id].state {
+        ThreadState::Ready => {
+            if s.threads[id].hart != h {
+                s.remove_from_ready(id);
+                s.threads[id].hart = h;
+                s.enqueue(id);
+            }
+        }
+        ThreadState::Blocked => s.threads[id].hart = h,
+        other => panic!("set_affinity: thread {id} is {other:?} (not migratable)"),
+    }
+    drop(s);
+    arch::irq_restore(irq);
+}
+
+/// M2 T3b(D19):查询线程是否已阻塞(SCHED 锁内读 state)。
+///
+/// 测试专用:smp_sched_test 用它等副核线程**真正**进入 Blocked 后再
+/// `wake` —— 保证 wake 必走 `Blocked → enqueue + IPI` 路径,确定性覆盖
+/// 跨核 IPI 唤醒链路(若只等"将阻塞"标志,wake 可能先于 block_current
+/// 到达而走 woken 标志路径,绕过 IPI —— T3b 首轮实测定时不定)。
+pub fn is_blocked(id: usize) -> bool {
+    let irq = arch::irq_save();
+    let b = {
+        let s = SCHED.lock();
+        id < s.threads.len() && s.threads[id].state == ThreadState::Blocked
+    };
+    arch::irq_restore(irq);
+    b
+}
+
+/// M2 T3b(D19):副核调度入口(idle 循环,永不返回)。
+///
+/// 由 `secondary_main` 在 `enable_timer`+`irq_enable` 后调用。循环:
+/// 取本核就绪线程 → `do_switch` 运行;无就绪则 `wfi`(定时器或 IPI
+/// 唤醒后重查)。**idle 不入就绪队列**(与 boot hart 的 yield 式 idle
+/// 不同):`pick_next` 只会选真实就绪线程,回退恒为 `idle[hart]`,因此
+/// `current[hart]` 在每次进入本循环时 == `idle[hart]`(仅当被选回时)。
+pub fn secondary_idle(hart: usize) -> ! {
+    loop {
+        let target = {
+            let mut s = SCHED.lock();
+            let cur = s.current[hart];
+            debug_assert!(
+                cur == s.idle[hart],
+                "secondary idle: current {cur} != idle {}",
+                s.idle[hart]
+            );
+            s.ticks_run[hart] = 0;
+            let next = s.pick_next(hart, true);
+            if next == cur {
+                // 无其他就绪线程:保持 idle,回 wfi(不切换)。
+                drop(s);
+                None
+            } else {
+                s.current[hart] = next;
+                Some(switch_target(&mut s, cur, next))
+            }
+        };
+        if let Some(t) = target {
+            // 锁外切换(中断关闭保证原子性)。切到真实线程;当该线程
+            // yield/block/exit 且本核无其他就绪时,pick 回退选回 idle,
+            // context_switch 恢复此处 → 继续循环。
+            do_switch(&t);
+        }
+        arch::wait_for_interrupt();
+    }
 }
 
 /// 调度器自检(须在 irq_enable 前或测试专用线程中运行)。

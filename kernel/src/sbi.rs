@@ -21,7 +21,6 @@ const SBI_EXT_TIME: usize = 0x5449_4D45;
 /// T3a 实测:**IPI 不是副核唤醒的可靠手段**(副核停 OpenSBI HSM 时收不到,
 /// 见 T3a 报告;唤醒改用 SBI HSM `hart_start`)。保留 `send_ipi` 供 T3b
 /// 跨核调度唤醒使用(T3b 报告需重新验证其在新机制的可用性)。
-#[allow(dead_code)]
 const SBI_EXT_IPI: usize = 0x0073_5049;
 /// SBI HSM(Hart State Management)扩展号(ASCII "HSM")。
 const SBI_EXT_HSM: usize = 0x0048_534D;
@@ -73,7 +72,6 @@ pub fn set_timer(stime_value: usize) -> usize {
 /// 寄存器被覆写。与 `set_timer` 同一约定。
 ///
 /// T3b:跨核调度唤醒用(见 `SBI_EXT_IPI` 注释);T3a 当前未使用。
-#[allow(dead_code)]
 #[inline]
 pub fn send_ipi(hart_mask: u64, hart_mask_base: u64) -> usize {
     let mut error: usize;

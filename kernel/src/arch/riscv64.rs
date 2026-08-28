@@ -385,6 +385,10 @@ pub fn enable_timer() {
         // 屏障语义同 irq_*(无 nomem):中断源切换必须作为编译器
         // 内存屏障,防止与后续 ecall 重排。
         asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nostack));
+        // sie.SSIP = bit 1(D19:跨核调度唤醒 —— SBI IPI 送达 S 模式
+        // 软中断;须在每核开中断前使能,否则 IPI 无法唤醒 wfi 中的
+        // idle,target 核的唤醒只能等下一个定时器 tick)。
+        asm!("csrs sie, {ssip}", ssip = in(reg) 2usize, options(nostack));
     }
     let deadline = get_time().wrapping_add(timer_interval());
     // D7:按当前 hart(sscratch = T_h,自推导可靠)索引 per-hart 槽。
@@ -431,6 +435,10 @@ const INTERRUPT_BIT: usize = 1 << (usize::BITS - 1);
 
 /// 超级定时器中断 cause 编号(RISC-V 特权规范)。
 const CAUSE_SUPERVISOR_TIMER: usize = 5;
+/// D19:超级软中断 cause 编号(SBI IPI → S 模式软中断,跨核调度唤醒)。
+/// RISC-V 特权规范:中断 cause **1** = S 模式软中断(cause 3 是 M 模式
+/// 软中断,误写 3 会让 SSIP 落入 unhandled 分支直接停机 —— T3b 实测修复)。
+const CAUSE_SUPERVISOR_SOFTWARE: usize = 1;
 /// 用户态环境调用(ecall / M2 T1 系统调用入口)。
 const CAUSE_ECALL_FROM_U: usize = 8;
 
@@ -519,8 +527,19 @@ pub unsafe extern "C" fn trap_handler(
                 arm_timer(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程
                 // 的帧指针,汇编恢复路径据此 sret 进入新线程
-                // (全寄存器恢复,含 t/a)。
-                unsafe { crate::sched::on_tick(frame) }
+                // (全寄存器恢复,含 t/a)。D19:按当前核(本函数早前已
+                // 经 sscratch 推导 h)做 per-CPU 抢占。
+                unsafe { crate::sched::on_tick(frame, h) }
+            }
+            CAUSE_SUPERVISOR_SOFTWARE => {
+                // D19:跨核调度唤醒 —— wake() 对 idle 目标核发 SBI IPI,
+                // 本核从 wfi 醒来收到 S 软中断。仅清挂起位后返回原帧
+                // (wfi 被唤醒,idle 循环会重查本核就绪队列);不在此调度。
+                // 必须清 sip.SSIP,否则挂起位使下次 wfi 立即返回(忙转)。
+                unsafe {
+                    asm!("csrc sip, {}", in(reg) 2usize, options(nostack));
+                }
+                frame
             }
             other => {
                 // 未处理的中断:输出诊断并停机。

@@ -186,6 +186,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     let interval_us =
         (arch::timer_interval() as u64 * 1_000_000) / crate::board::timer_freq() as u64;
     info!("M1: timer enabled ({interval_us}us interval), interrupts on");
+    // M2 T3b:多核调度冒烟(boot hart、irq_enable 后调用 —— 副核已上线并
+    // 进入各自 idle 循环,可接收按亲和性分配的线程)。定义见 tests.rs。
+    tests::smp_sched_test();
     // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
     // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。
     // LOW-3(审计 17 轮):idle 无 yield 路径,退出线程的栈在此回收
@@ -272,10 +275,9 @@ fn wake_secondaries(boot_hartid: usize) {
 
 /// D8:副核主入口(entry.S `boot_done` 以 C ABI 调用,a0 = hartid)。
 ///
-/// T3a 副核**无定时器、无调度器**:共享调度器的 `on_tick` 会把自身帧
-/// 写进 `s.current`(boot hart 的线程)TCB,破坏调度状态,故副核绝不
-/// `enable_timer`、绝不进入共享调度器路径。只做最小初始化进 idle 停等
-/// (T3b 加每核 timer + per-CPU 调度)。
+/// T3b(D19)起副核进入 **per-CPU 调度器**:每核定时器 + `secondary_idle`
+/// idle 循环(pick 本核就绪线程运行,无就绪则 wfi,定时器/IPI 唤醒)。
+/// `sched::init` 已为每核建好 idle TCB,`current[hart]`/`idle[hart]` 已就位。
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_main(hartid: usize) -> ! {
     arch::irq_disable();
@@ -288,8 +290,9 @@ pub extern "C" fn secondary_main(hartid: usize) -> ! {
     // 上线信号,只有全部副核打印完并归 idle 后,boot hart 才打印
     // T3a banner(独占输出 → banner 行原子,test-smp 断言可靠)。
     mark_online();
-    // idle 停等:SIE 保持关闭、无定时器 → wfi 永不被唤醒,等效停等。
-    loop {
-        arch::wait_for_interrupt();
-    }
+    // T3b:先布中断源(定时器 + SSIP)再开全局中断,与 boot hart 一致;
+    // 随后进入本核调度器 idle 循环(永不返回)。
+    arch::enable_timer();
+    arch::irq_enable();
+    crate::sched::secondary_idle(hartid)
 }
