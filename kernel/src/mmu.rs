@@ -10,11 +10,16 @@
 //!
 //! # 公开接口
 //! - `init` / `self_test` —— 初始化与验证
+//! - `kernel_root` —— 内核页表根目录物理地址(init 后有效)
 //! - `satp` / `tlb_flush` —— 页表基址与 TLB 操作(arch 层契约)
 //! - `unmap_4k` —— 取消单页映射(内含 TLB 刷新)
 //! - `map_user_page` —— **M2 用户映射**:拒绝覆盖已有 PTE、路径置 U 位
+//! - `create_user_root` / `switch_root` / `is_mapped` —— **M2 T1.5 每进程
+//!   地址空间**:建用户根表(复制内核区)/ 切换 satp(相同则 no-op)/
+//!   只读检查映射
 //!
-//! `map_4k`/`map_region_4k`/`map_super` 为私有,供 init 期建映射。
+//! `map_4k`/`map_region_4k`/`map_super`/`map_kernel_region` 为私有,
+//! 供 init 期与每进程根表建立内核区映射。
 //!
 //! # 架构隔离
 //! 本模块是 RISC-V Sv39 的具体实现;x86_64 移植时在 arch 层提供
@@ -31,8 +36,7 @@ const PTE_V: u64 = 1 << 0; // 有效
 const PTE_R: u64 = 1 << 1; // 可读
 const PTE_W: u64 = 1 << 2; // 可写
 const PTE_X: u64 = 1 << 3; // 可执行
-#[allow(dead_code)] // M2 用户映射启用
-const PTE_U: u64 = 1 << 4; // 用户可访问(M2 用户映射用)
+const PTE_U: u64 = 1 << 4; // 用户可访问(M2 用户映射:叶子 PTE 置 U 位)
 const PTE_A: u64 = 1 << 6; // 已访问
 const PTE_D: u64 = 1 << 7; // 已脏
 const PTE_PPN_SHIFT: u64 = 10;
@@ -130,7 +134,6 @@ fn map_4k(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()>
 ///
 /// # Safety
 /// 同 `ensure_table`:parent 必须是有效页表地址。
-#[allow(dead_code)] // M2 用户映射启用
 unsafe fn ensure_table_user(parent: *const u64, idx: usize) -> Result<*const u64, ()> {
     let entry = pte_read(parent, idx);
     if entry & PTE_V != 0 {
@@ -156,7 +159,8 @@ unsafe fn ensure_table_user(parent: *const u64, idx: usize) -> Result<*const u64
 /// - 调用方须保证 vaddr 在用户地址空间范围,且 paddr 已用
 ///   `mem::alloc_pages_zeroed`(或确认无需清零);
 /// - 映射后立即冲刷 TLB(首次访问前无陈旧项,保险起见统一刷)。
-#[allow(dead_code)] // 二进制 crate 中 M2 API 未调用
+///
+/// M2 T1/T1.5 调用方:boot 冒烟测试(tests.rs)与未来用户地址空间建立。
 pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
     // 自审(挑剔视角):Sv39 用户地址空间上限 2^38。越界 vaddr 的
     // L2/L1/L0 索引会错位(高位省略),映射到错误区域 —— 必须拒绝。
@@ -444,8 +448,12 @@ pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
     Ok(())
 }
 
-/// 冲刷 TLB(全部)。M2 用户态映射时使用。
-#[allow(dead_code)]
+/// 冲刷 TLB(全部)。
+///
+/// arch 层契约接口(DESIGN.md arch_mmu_*):当前未在热路径使用
+/// (`map_user_page`/`unmap_4k` 用单地址 sfence,`switch_root` 切换时
+/// 全量 sfence),保留供 T2 页回收/批量解除映射使用。
+#[allow(dead_code)] // arch 契约 API;当前无调用方
 pub fn tlb_flush() {
     unsafe {
         asm!("sfence.vma zero, zero", options(nostack));

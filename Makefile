@@ -44,6 +44,7 @@ gdb: build
 #   1) 出现 "M0: boot ok"(成功启动)
 #   2) 出现 "buddy allocator selftest ok"(物理内存分配器自检通过)
 #   2b)出现 "Sv39 paging ok"(页表 + 身份映射 + satp 切换成功)
+#   2c)出现 M2 里程碑 banner(M2 T1 用户态 ecall / M2 每进程地址空间)
 #   3) 出现 **至少 2 条** "uptime:"(定时器中断 + sret 恢复链路持续
 #      存活;单条可能是"第一跳后定时器死亡"的假阳性,pro 审计 #6)
 #   4) 未出现 "KERNEL PANIC" 或 "TRAP:"(启动后无故障)
@@ -57,6 +58,7 @@ test: build
 		&& grep -q "kernel heap selftest ok" /tmp/ignium-test.log \
 		&& grep -q "scheduler selftest ok" /tmp/ignium-test.log \
 		&& grep -q "sync primitives selftest ok" /tmp/ignium-test.log \
+		&& grep -q "M2 T1: user-mode thread ecall ok" /tmp/ignium-test.log \
 		&& grep -q "M2: per-process address space ok" /tmp/ignium-test.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-test.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
@@ -89,6 +91,7 @@ test-rva23: build-rva23
 		&& grep -q "kernel heap selftest ok" /tmp/ignium-rva23.log \
 		&& grep -q "scheduler selftest ok" /tmp/ignium-rva23.log \
 		&& grep -q "sync primitives selftest ok" /tmp/ignium-rva23.log \
+		&& grep -q "M2 T1: user-mode thread ecall ok" /tmp/ignium-rva23.log \
 		&& grep -q "M2: per-process address space ok" /tmp/ignium-rva23.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log \

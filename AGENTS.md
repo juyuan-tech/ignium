@@ -12,14 +12,19 @@
 ## 构建与验证(每次改动后必跑)
 
 ```bash
-make clippy    # cargo clippy --release -- -D warnings(零警告)
-make fmt       # cargo fmt --check
-make test      # QEMU 启动冒烟(默认 CPU)
+make clippy     # cargo clippy --release -- -D warnings(零警告)
+make fmt        # cargo fmt --check
+make test       # QEMU 启动冒烟(默认 CPU)
+make test-smp   # 多核引导仲裁冒烟(-smp 4,断言恰好 1 条 M0)
 make test-rva23 # RVA23 P1:Zba/Zbb/Zbs+Zicond 扩展 + -cpu max 冒烟
 ```
 
-三条全绿才能提交。dev 与 release 双 profile 都要能编译:
+五条全绿才能提交。dev 与 release 双 profile 都要能编译:
 `cargo build` 与 `cargo build --release`。
+
+> 门禁三处 grep 同步纪律:新增里程碑 banner(如 `M2 ... ok`)时,必须
+> 同步更新 `Makefile` 的 `test`/`test-rva23` 与 `.github/workflows/ci.yml`
+> 的 build/rva23 两处 job 的 `grep -q` 断言,否则本地过、CI 挂。
 
 ## 红线(不可违反)
 
@@ -47,6 +52,7 @@ make test-rva23 # RVA23 P1:Zba/Zbb/Zbs+Zicond 扩展 + -cpu max 冒烟
 - `kernel/` — 内核 crate(唯一特权层);arch 隔离层在 kernel/src/arch/;
   关键模块:board.rs(板级参数,运行时 FDT 推导)、fdt.rs(FDT 解析器)、
   mem.rs(buddy)、mmu.rs(Sv39 页表)、heap.rs(内核堆)、sched.rs(线程调度)、
+  process.rs(M2:进程与每进程独立地址空间)、tests.rs(M2 引导期冒烟测试)、
   sync.rs(同步原语)、sbi.rs(SBI 调用)、logger/panic/uart
 - `scripts/ai_audit.py` — 外部 AI 审计(密钥走环境变量,见 scripts/README.md)
 - `docs/` — DESIGN.md(架构铁律)、M2-DESIGN.md(M2 设计,U/S 切换/IPC/能力)、

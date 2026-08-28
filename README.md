@@ -90,6 +90,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程 + 每进程 satp 切换)
 │   │   ├── syscall.rs      # 用户态系统调用分发(M2 T1:a7 传号、a0 返回,GET_TICKS/EXIT)
 │   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
+│   │   ├── tests.rs        # M2 引导期冒烟测试(用户线程 ecall + 每进程地址空间隔离)
 │   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret/context_switch)
 │   ├── build.rs            # 链接脚本绝对路径传递(CARGO_MANIFEST_DIR)
 │   ├── Cargo.toml

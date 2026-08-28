@@ -36,6 +36,7 @@ jobs:
           grep -q "kernel heap selftest ok" /tmp/ignium-ci.log
           grep -q "scheduler selftest ok" /tmp/ignium-ci.log
           grep -q "sync primitives selftest ok" /tmp/ignium-ci.log
+          grep -q "M2 T1: user-mode thread ecall ok" /tmp/ignium-ci.log
           grep -q "M2: per-process address space ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
@@ -60,7 +61,8 @@ jobs:
       - name: Build with RVA23 extensions
         run: CARGO_TARGET_DIR=target-rva23 cargo rustc -p ignium-kernel --release -- -C target-feature=+zba,+zbb,+zbs,+zicond
       # V3 审计 #11:RVA23 构建同样通过 clippy/fmt 门禁。
-      - run: cargo clippy -- -D warnings
+      # 与 Makefile/M1.5 job 对齐:clippy 用 --release(与 clippy 门禁目标一致)。
+      - run: cargo clippy --release -- -D warnings
       - run: cargo fmt --check
       - name: Boot test in QEMU (-cpu max)
         run: |
@@ -72,5 +74,7 @@ jobs:
           grep -q "kernel heap selftest ok" /tmp/ignium-rva23.log
           grep -q "scheduler selftest ok" /tmp/ignium-rva23.log
           grep -q "sync primitives selftest ok" /tmp/ignium-rva23.log
+          grep -q "M2 T1: user-mode thread ecall ok" /tmp/ignium-rva23.log
+          grep -q "M2: per-process address space ok" /tmp/ignium-rva23.log
           test "$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log
