@@ -9,6 +9,12 @@
 //!   线程就绪(MED-2),且存在**帧有效**的线程,把被中断线程的
 //!   **全量陷阱帧**复制进其 TCB,返回下一线程的帧指针 —— 汇编
 //!   恢复路径据此 sret 进入下一线程(全寄存器恢复,t/a 也不丢)。
+//! - **D22(M2 T2a)woken 抢占**:抢占路径的候选从「仅帧有效」放宽为
+//!   「帧有效 **或** 被唤醒的 ctx 线程」。被 `wake()` 唤醒(经
+//!   `block_current` 阻塞,`ctx_valid` 有效)的线程此前不可被抢占,
+//!   可被同/更高优先级忙循环饿死;现把其 ctx 展开为 S 模式陷阱帧
+//!   (sepc=ctx.ra, SPP=1)再 frame_restore sret 恢复(见
+//!   `expand_ctx_to_frame`)。这是优先级继承(PIP,T2b)的抢占基础。
 //! - **恢复机制协议**(审计 17 轮收严):线程的恢复数据恰有一个有效
 //!   (新线程除外,二者皆有效)——
 //!   `ctx_valid`(协作切换保存点新鲜)/ `frame_valid`(抢占捕获帧新鲜)
@@ -98,7 +104,7 @@ struct Thread {
     /// 消费;覆盖"唤醒早于阻塞"的窗口,防丢失唤醒。
     woken: bool,
     /// M2 T1.5:所属进程(None = 内核线程,运行于内核根表)。
-    #[allow(dead_code)] // M2 T2 能力表/每进程生命周期(销毁)使用
+    /// M2 T2a:IPC 能力查表经 `current_proc()` 读取。
     proc: Option<usize>,
     /// M2 T1.5:本线程应运行的 satp 根表(内核线程 = kernel_root,
     /// 用户线程 = 所属进程根表)。**缓存到 Thread**(非切换时查进程表),
@@ -183,8 +189,9 @@ impl Scheduler {
     /// 接受 ctx_valid **或** frame_valid 候选 —— 仅帧有效的线程
     /// (被抢占后未再 yield)必须可被协作恢复,否则会在
     /// "唯一可运行线程被抢占后他人退出"时永久滞留。
-    /// = false 表示抢占路径(on_tick):只选 frame_valid 的线程
-    /// (帧恢复是被抢占线程的唯一合法恢复方式)。
+    /// = false 表示抢占路径(on_tick):选 frame_valid 的线程,或
+    /// **被唤醒的 ctx 线程**(D22:`ctx_valid && woken`,on_tick 会把它
+    /// 展开为帧再恢复) —— 帧恢复是被抢占线程的唯一合法恢复方式。
     /// 无分配:仅 VecDeque 出/入队(轮转),不满足条件的候选回队尾。
     fn pick_next(&mut self, need_ctx: bool) -> usize {
         for level in 0..PRIO_LEVELS {
@@ -205,7 +212,11 @@ impl Scheduler {
                 let ok = if need_ctx {
                     self.threads[id].ctx_valid || self.threads[id].frame_valid
                 } else {
+                    // M2 T2a(D22):抢占路径额外接受「被唤醒且协作上下文
+                    // 有效」的线程(woken 标志由 wake 置位)。on_tick 选中
+                    // 后会经 expand_ctx_to_frame 把 ctx 展开为 S 模式帧。
                     self.threads[id].frame_valid
+                        || (self.threads[id].ctx_valid && self.threads[id].woken)
                 };
                 if ok {
                     self.threads[id].state = ThreadState::Running;
@@ -256,16 +267,27 @@ impl Scheduler {
         }
     }
 
+    /// M2 T2a(D22):抢占候选谓词 —— `frame_valid`(被抢占捕获帧)或
+    /// 「被唤醒的 ctx 线程」(woken 标志由 wake 置位,协作保存点新鲜,
+    /// 可展开为帧)。仅 on_tick / pick_next(false) 使用;不改变协作
+    /// 路径语义。ISR 内纯只读、零分配。
+    fn preemptable(&self, id: usize) -> bool {
+        self.threads[id].state == ThreadState::Ready
+            && (self.threads[id].frame_valid
+                || (self.threads[id].ctx_valid && self.threads[id].woken))
+    }
+
     /// 抢占决策(定时器 ISR 内,中断关闭,不可阻塞):
     /// 时间片到期**或更高优先级线程就绪**(MED-2/审计 17 轮:
-    /// 优先级抢占应即时,不等时间片)且存在**帧有效**的其他就绪
-    /// 线程 → 复制当前帧、返回下一线程帧。否则返回原帧。
+    /// 优先级抢占应即时,不等时间片)且存在可抢占的其他就绪线程
+    /// (D22:帧有效或被唤醒的 ctx 线程)→ 复制当前帧、返回下一线程帧。
+    /// 否则返回原帧。
     fn on_tick(&mut self, frame: *mut usize) -> *mut usize {
         // INFO-2(审计 17 轮):wrapping —— overflow-checks 开启下
         // 2^64 tick 后 ISR 内 panic(工程上不可达,与工程约定一致)。
         self.ticks_run = self.ticks_run.wrapping_add(1);
         if self.ticks_run < SLICE_TICKS {
-            // 时间片未到:仅当更高优先级就绪(帧有效)才抢占。
+            // 时间片未到:仅当更高优先级就绪(可抢占)才抢占。
             let cur_prio = self.threads[self.current].prio as usize;
             // P2(本轮性能):当前线程已是最高优先级(0)时,更高优先级
             // 扫描范围 `0..cur_prio` 必然为空 → higher 恒 false ——
@@ -275,24 +297,20 @@ impl Scheduler {
                 return frame;
             }
             let higher = (0..cur_prio).any(|l| {
-                self.ready[l].iter().any(|&id| {
-                    id != self.current
-                        && self.threads[id].state == ThreadState::Ready
-                        && self.threads[id].frame_valid
-                })
+                self.ready[l]
+                    .iter()
+                    .any(|&id| id != self.current && self.preemptable(id))
             });
             if !higher {
                 return frame;
             }
         }
         self.ticks_run = 0;
-        // 是否存在可抢占的就绪线程(非自身、帧有效)。
+        // 是否存在可抢占的就绪线程(非自身)。
         let has_other = (0..PRIO_LEVELS).any(|l| {
-            self.ready[l].iter().any(|&id| {
-                id != self.current
-                    && self.threads[id].state == ThreadState::Ready
-                    && self.threads[id].frame_valid
-            })
+            self.ready[l]
+                .iter()
+                .any(|&id| id != self.current && self.preemptable(id))
         });
         if !has_other {
             return frame;
@@ -324,6 +342,13 @@ impl Scheduler {
             return frame;
         }
         self.current = next;
+        // M2 T2a(D22):选中者可能是「被唤醒的 ctx 线程」(仅 ctx_valid)——
+        // 帧恢复是其唯一合法恢复方式,先把 ctx 展开为 S 模式陷阱帧
+        // (expand_ctx_to_frame 置 frame_valid=true、清 woken)。帧有效者
+        // 直接使用既有捕获帧。
+        if !self.threads[next].frame_valid {
+            self.expand_ctx_to_frame(next);
+        }
         // M2 T1.5:抢占切换到 next 线程的 satp 根表(相同则 no-op)。
         // 必须在返回帧指针、汇编 sret 之前完成 —— 恢复路径汇编不碰
         // satp;此处仅 CSR 读写 + sfence,ISR 内零分配、零日志。
@@ -334,6 +359,34 @@ impl Scheduler {
         // yield/block/exit 会重新保存 ctx。
         // 返回下一线程的帧指针,汇编据此 sret 全量恢复。
         self.threads[next].frame.as_mut_ptr()
+    }
+
+    /// M2 T2a(D22):把线程的协作上下文(ctx)展开为 S 模式陷阱帧。
+    ///
+    /// 用途:抢占路径(on_tick)选中「被唤醒且仅 ctx_valid」的线程时,
+    /// frame_restore(sret)是唯一合法恢复机制 —— 该线程此前在协作点
+    /// (如 `block_current`)经 context_switch 切走,进度在 ctx。展开后
+    /// sepc=ctx.ra(内核恢复点)、sstatus=SPIE|SPP=1(S 模式 sret)、
+    /// sp/gp/s0-s11 来自 ctx;frame_restore 会把 sscratch 恒置陷阱栈顶,
+    /// 无嵌套误判。展开同时**消费 woken 标志**(本次唤醒已兑现)。
+    ///
+    /// 调用点要求:已持有 SCHED 锁;ISR 内零分配(栈上数组)。
+    fn expand_ctx_to_frame(&mut self, id: usize) {
+        let ctx = self.threads[id].ctx;
+        let mut frame = [0usize; FRAME_WORDS];
+        frame[FRAME_SEPC] = ctx.ra;
+        frame[FRAME_SSTATUS] = (1 << 5) | (1 << 8); // SPIE | SPP=1
+        frame[crate::arch::gpr::X_SP] = ctx.sp;
+        frame[crate::arch::gpr::X_GP] = __global_pointer();
+        // s0-s11 → 帧槽 X_S0(7)/X_S1(8)/X_S2..X_S11(17..26)。
+        frame[crate::arch::gpr::X_S0] = ctx.s[0];
+        frame[crate::arch::gpr::X_S1] = ctx.s[1];
+        frame[crate::arch::gpr::X_S2..crate::arch::gpr::X_S2 + 10].copy_from_slice(&ctx.s[2..12]);
+        let t = &mut self.threads[id];
+        t.frame = frame;
+        t.frame_valid = true;
+        t.ctx_valid = false;
+        t.woken = false;
     }
 
     /// 新建线程:分配栈 + 构造初始帧(sepc=thread_entry,sp=栈顶)。
@@ -689,6 +742,36 @@ pub fn wake(id: usize) {
     arch::irq_restore(irq);
 }
 
+/// M2 T2a:唤醒阻塞中的 IPC 线程并写入结果到其 TCB 帧。
+///
+/// `msg` = Some(m) 写 a1..a5(前 `m.len()` 字,≤ MSG_WORDS);None 仅写状态。
+/// 统一写 `a0=0`(成功)并把 `sepc+4`(跳过 ecall)。**不置 woken**:配对
+/// 由 IPC pending 队列保证(配对方经 `block_user_from_trap` 已阻塞),避免
+/// 陈旧唤醒标志干扰后续 `block_current` 的消费时序。
+///
+/// 锁序:调用方须已持有 IPC 锁(IPC → SCHED);本函数内再取 SCHED。
+pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
+    let irq = arch::irq_save();
+    let mut s = SCHED.lock();
+    {
+        let t = &mut s.threads[tid];
+        debug_assert!(
+            t.state == ThreadState::Blocked,
+            "ipc_wake_with_msg: tid {tid} not blocked"
+        );
+        t.frame[crate::arch::gpr::X_A0] = 0;
+        if let Some(m) = msg {
+            for (i, w) in m.iter().enumerate() {
+                t.frame[crate::arch::gpr::X_A1 + i] = *w;
+            }
+        }
+        t.frame[FRAME_SEPC] += 4;
+    }
+    s.enqueue(tid);
+    drop(s);
+    arch::irq_restore(irq);
+}
+
 /// 当前线程 id。
 pub fn current_id() -> usize {
     let irq = arch::irq_save();
@@ -697,6 +780,20 @@ pub fn current_id() -> usize {
     drop(s);
     arch::irq_restore(irq);
     id
+}
+
+/// M2 T2a:当前线程所属进程 id(IPC 能力查表用)。
+///
+/// 仅在用户线程的 syscall/trap 上下文调用(经 CAUSE_ECALL_FROM_U 到达),
+/// 当前必为用户线程;误调(内核线程) → panic(fail-loudly)。
+pub fn current_proc() -> usize {
+    let irq = arch::irq_save();
+    let p = {
+        let s = SCHED.lock();
+        s.threads[s.current].proc
+    };
+    arch::irq_restore(irq);
+    p.expect("current_proc: current thread is not a user thread")
 }
 
 /// 回收已退出线程的栈(LOW-3/审计 17 轮):idle 循环调用,配合
@@ -794,6 +891,48 @@ pub fn exit_from_trap() -> ! {
     // 锁外切换(context_switch:目标线程的协作上下文恢复)。
     do_switch(&target);
     // 切换成功后不会返回此处;防御性停机。
+    arch::irq_restore(irq);
+    arch::halt()
+}
+
+/// M2 T2a:从 trap 上下文阻塞当前**用户**线程(如 IPC 等待配对),永不返回。
+///
+/// 与 `exit_from_trap` 同源(CPU 在陷阱栈上、sscratch 指向本帧底),不同点:
+/// 线程置 `Blocked` 而非退出 —— 当前帧**复制进 TCB**(配对方经
+/// `ipc_wake_with_msg` 写入结果、以及抢占恢复都依赖它),随后切走。醒来时
+/// 经 frame_restore sret 直接回用户态(结果已写在帧里,sepc 已前移)。
+///
+/// # Safety
+/// `frame` 必须指向当前有效用户陷阱帧(trap_handler 传入、scause=8);
+/// 仅在用户线程的 syscall 上下文调用。
+pub unsafe fn block_user_from_trap(frame: *mut usize) -> ! {
+    let irq = arch::irq_save();
+    let target = {
+        let mut s = SCHED.lock();
+        let cur = s.current;
+        // 当前帧复制进 TCB(与 on_tick 捕获同款)供恢复与配对写结果。
+        s.threads[cur]
+            .frame
+            .copy_from_slice(unsafe { core::slice::from_raw_parts(frame, FRAME_WORDS) });
+        s.threads[cur].frame_valid = true;
+        // 进度在帧里,协作 ctx 失效(双机制互斥协议)。
+        s.threads[cur].ctx_valid = false;
+        // 无条件阻塞:消费陈旧唤醒标志(本次阻塞由 IPC pending 队列
+        // 保证配对,不依赖 wake 的 woken 协议)。
+        s.threads[cur].woken = false;
+        s.threads[cur].state = ThreadState::Blocked;
+        s.ticks_run = 0;
+        let next = s.pick_next(true);
+        s.current = next;
+        // 与 exit_from_trap 同理:切换前重置 sscratch,防目标线程下次
+        // trap 的嵌套检测(H2,riscv64.S label 4)误判为第二层而停机
+        // (本帧已入 TCB,陷阱栈可复用)。
+        crate::arch::set_sscratch_trap_top();
+        switch_target(&mut s, cur, next)
+    };
+    // 锁外切换(中断关闭保证原子性)。
+    do_switch(&target);
+    // 醒来经 frame_restore sret 回用户态,不会到达这里;防御性停机。
     arch::irq_restore(irq);
     arch::halt()
 }
@@ -936,6 +1075,54 @@ pub fn self_test() -> Result<(), &'static str> {
     if TEST_STRESS_DONE.load(Ordering::Relaxed) != 16 * 1000 {
         return Err("scheduler stress test timeout");
     }
+
+    // 6) M2 T2a(D22)回归:被唤醒的 HIGH 线程抢占忙循环的 LOW 线程。
+    // 场景:LOW 忙循环不 yield、第 3 tick 起 wake(HIGH 线程 H;H 先前
+    // block_current 阻塞,ctx_valid 有效、frame_valid 失效)。D22 生效时
+    // on_tick 把 H 的 ctx 展开为帧抢占运行 —— H 的记录 tick < L 的完成
+    // tick;否则 H 只可达于协作路径,断言失败。
+    // 关键:阶段 2 的等待必须**纯自旋不 yield** —— 若 main 协作 yield,
+    // 就绪队列中的 H(仅 ctx_valid)可被协作切换选中提前运行,掩盖 D22
+    // 缺陷(假阳性);自旋下 H 只能经 on_tick 抢占路径被选中。
+    D22_H_BLOCKED.store(false, Ordering::Relaxed);
+    D22_H_RAN.store(false, Ordering::Relaxed);
+    D22_LOW_DONE.store(false, Ordering::Relaxed);
+    let h_id = spawn(test_d22_high, PRIO_HIGH);
+    D22_H_ID.store(h_id, Ordering::Relaxed);
+    // 阶段 1:等 H 阻塞。可 yield —— H 尚为 Blocked,协作切换不会误选它。
+    guard = 0;
+    while !D22_H_BLOCKED.load(Ordering::Relaxed) && guard < 200_000 {
+        yield_();
+        guard += 1;
+    }
+    if !D22_H_BLOCKED.load(Ordering::Relaxed) {
+        return Err("D22: high thread did not block");
+    }
+    spawn(test_d22_low, PRIO_LOW);
+    // 阶段 2:纯自旋不 yield。**先显式开中断**:本上下文(idle)在自检期
+    // SIE 恒为 0(每次 yield 恢复到引导期保存值)—— 不开中断则定时器
+    // 永不触发,main 自旋独占 CPU,L 无法运行,死等超时。开中断后:
+    // 定时器抢占 main → LOW 运行 → 第 3 tick wake(H)→ 下一 tick
+    // on_tick 抢占到 H(expand_ctx_to_frame)。main 全程不 yield,排除
+    // 协作路径选中 H 的假阳性(见第 6 项头注释)。
+    crate::arch::irq_enable();
+    let t6 = crate::logger::tick();
+    while (!D22_H_RAN.load(Ordering::Relaxed) || !D22_LOW_DONE.load(Ordering::Relaxed))
+        && crate::logger::tick().wrapping_sub(t6) < 100
+    {
+        core::hint::spin_loop();
+    }
+    if !D22_H_RAN.load(Ordering::Relaxed) || !D22_LOW_DONE.load(Ordering::Relaxed) {
+        return Err("D22: woken thread stranded (no preemption path)");
+    }
+    // H 的恢复 tick 必须早于 L 的完成 tick(经 on_tick 抢占运行,非协作)。
+    let h_start = D22_H_TICK.load(Ordering::Relaxed);
+    let l_done = D22_LOW_DONE_TICK.load(Ordering::Relaxed);
+    if h_start >= l_done {
+        return Err("D22: woken thread did not preempt busy loop");
+    }
+    info!("M2 T2a: woken-thread preemption ok (D22)");
+
     Ok(())
 }
 
@@ -1000,6 +1187,35 @@ fn test_stress() {
     }
 }
 
+/// M2 T2a(D22)回归:被唤醒的 HIGH 线程。
+/// 记录阻塞标记后立即 `block_current`(ctx_valid 保持、frame_valid 失效)。
+/// 被 LOW 唤醒后仅当 on_tick 选中它(expand_ctx_to_frame 展开 ctx → sret)
+/// 才会运行;恢复点在 block_current 之后,此刻记录恢复 tick 并置 RAN。
+fn test_d22_high() {
+    D22_H_BLOCKED.store(true, Ordering::Relaxed);
+    block_current();
+    D22_H_TICK.store(crate::logger::tick() as usize, Ordering::Relaxed);
+    D22_H_RAN.store(true, Ordering::Relaxed);
+}
+
+/// M2 T2a(D22)回归:LOW 忙循环线程。
+/// 忙循环 D22_LOW_TICKS 个 tick(不 yield),第 D22_WAKE_AT 个 tick 起
+/// wake(HIGH 线程 H)。完成时记录完成 tick。若 D22 生效,H 在 L 忙循环
+/// 期间经 on_tick 抢占运行(H 恢复 tick < L 完成 tick)。
+fn test_d22_low() {
+    let s0 = crate::logger::tick();
+    let mut woke = false;
+    while crate::logger::tick().wrapping_sub(s0) < D22_LOW_TICKS {
+        if !woke && crate::logger::tick().wrapping_sub(s0) >= D22_WAKE_AT {
+            wake(D22_H_ID.load(Ordering::Relaxed));
+            woke = true;
+        }
+        D22_LOW.fetch_add(1, Ordering::Relaxed); // 忙循环计数(防优化掉循环体)
+    }
+    D22_LOW_DONE_TICK.store(crate::logger::tick() as usize, Ordering::Relaxed);
+    D22_LOW_DONE.store(true, Ordering::Relaxed);
+}
+
 static TEST_CTR: AtomicUsize = AtomicUsize::new(0);
 static TEST_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_BUSY: AtomicUsize = AtomicUsize::new(0);
@@ -1011,6 +1227,21 @@ static TEST_PRIO_HIGH_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_PRIO_LOW_START: AtomicUsize = AtomicUsize::new(0);
 static TEST_PRIO_HIGH_START: AtomicUsize = AtomicUsize::new(0);
 static TEST_STRESS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+// ===== M2 T2a(D22)回归参数与标志 =====
+
+/// LOW 忙循环时长(tick)。
+const D22_LOW_TICKS: u64 = 20;
+/// LOW 启动后第几个 tick 起唤醒 HIGH。
+const D22_WAKE_AT: u64 = 3;
+/// 忙循环计数(观察量,防循环体被优化掉)。
+static D22_LOW: AtomicUsize = AtomicUsize::new(0);
+static D22_H_ID: AtomicUsize = AtomicUsize::new(0);
+static D22_H_BLOCKED: AtomicBool = AtomicBool::new(false);
+static D22_H_RAN: AtomicBool = AtomicBool::new(false);
+static D22_H_TICK: AtomicUsize = AtomicUsize::new(0);
+static D22_LOW_DONE: AtomicBool = AtomicBool::new(false);
+static D22_LOW_DONE_TICK: AtomicUsize = AtomicUsize::new(0);
 
 // ===== 性能基线(上下文切换) =====
 

@@ -16,7 +16,11 @@ global_asm!(include_str!("riscv64.S"));
 ///
 /// **ABI 常量契约**:汇编保存顺序与这里的索引必须同步修改,
 /// 否则诊断 dump 会把寄存器标签全部错位(pro 审计 #1)。
-mod gpr {
+///
+/// **`pub`(M2 T2a)**:sched.rs 向阻塞线程 TCB 帧写入 IPC 结果
+/// (a0/a1-a5)、D22 展开 ctx 到帧时按这些索引填槽 —— gpr 索引是
+/// ABI 单一来源,跨模块复用同一常量,禁止在 sched/syscall 手写魔数。
+pub mod gpr {
     pub const X_RA: usize = 0; // x1
     pub const X_SP: usize = 1; // x2
     pub const X_GP: usize = 2; // x3

@@ -20,6 +20,7 @@ mod board;
 mod cpu;
 mod fdt;
 mod heap;
+mod ipc;
 mod logger;
 mod mem;
 mod mmu;

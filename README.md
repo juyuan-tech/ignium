@@ -81,16 +81,17 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── entry.S         # _start:SIE 清零/gp 初始化/副核停车/清 BSS/设栈/早期 trap stub
 │   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)
 │   │   ├── panic.rs        # panic:位置/消息/CPU dump/栈水位/双 panic 保护
-│   │   ├── process.rs      # 进程与每进程独立地址空间(M2 T1.5:id → satp 根表,create/root)
+│   │   ├── process.rs      # 进程与每进程独立地址空间(M2 T1.5:id → satp 根表)+ 简化能力表(T2a:grant_cap/cap_target)
+│   │   ├── ipc.rs          # 同步 IPC(M2 T2a:寄存器消息 5 字 + 阻塞配对 + 能力授权,未授权 → -errno)
 │   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
 │   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ M2 用户映射 + 每进程根表(create_user_root/switch_root/is_mapped)
 │   │   ├── heap.rs         # 内核堆(slab 16B..2KB + buddy 页路径,#[global_allocator])
 │   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程 + 每进程 satp 切换)
-│   │   ├── syscall.rs      # 用户态系统调用分发(M2 T1:a7 传号、a0 返回,GET_TICKS/EXIT)
+│   │   ├── syscall.rs      # 用户态系统调用分发(M2 T1/T2a:a7 传号、a0 返回,GET_TICKS/EXIT/SEND/RECV)
 │   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
-│   │   ├── tests.rs        # M2 引导期冒烟测试(用户线程 ecall + 每进程地址空间隔离)
+│   │   ├── tests.rs        # M2 引导期冒烟测试(用户线程 ecall + 地址空间隔离 + 同步 IPC 往返/未授权拒绝)
 │   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret/context_switch)
 │   ├── build.rs            # 链接脚本绝对路径传递(CARGO_MANIFEST_DIR)
 │   ├── Cargo.toml
@@ -120,7 +121,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 
 ## 路线
 
-见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓ / M2 T1 ✓**(用户态线程 + ecall 系统调用 + 进程退出),下一步 **M2 T2(IPC)**。
+见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓ / M2 T1 ✓ / M2 T2a ✓**(同步 IPC 核心:寄存器消息 + 阻塞配对 + 简化能力表 + D22 woken 抢占),下一步 **M2 T2b(优先级继承/压力测试)**。
 
 ## 里程碑
 
@@ -129,7 +130,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 | M0 ✓ | QEMU 启动 + UART 打印 |
 | M1 ✓ | trap/定时器/内存管理/分页/内核堆/调度/同步原语 |
 | M1.5 ✓ | FDT 解析/页权限拆分/栈守护页/RVA23 P1/压力自检/页表接口补全 |
-| M2 | 用户进程 + IPC + 能力(T1 ✓:用户态线程 + ecall 系统调用) |
+| M2 | 用户进程 + IPC + 能力(T1 ✓:用户态线程 + ecall;T2a ✓:同步 IPC 核心 + 能力表 + D22 抢占) |
 | M3 | 用户态服务 + shell |
 | M4 | 健壮性/测试 + OpenHarmony 组件移植 |
 | M5 | x86_64 移植 |

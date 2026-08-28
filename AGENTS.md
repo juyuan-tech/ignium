@@ -52,8 +52,9 @@ make test-rva23 # RVA23 P1:Zba/Zbb/Zbs+Zicond 扩展 + -cpu max 冒烟
 - `kernel/` — 内核 crate(唯一特权层);arch 隔离层在 kernel/src/arch/;
   关键模块:board.rs(板级参数,运行时 FDT 推导)、fdt.rs(FDT 解析器)、
   mem.rs(buddy)、mmu.rs(Sv39 页表)、heap.rs(内核堆)、sched.rs(线程调度)、
-  process.rs(M2:进程与每进程独立地址空间)、tests.rs(M2 引导期冒烟测试)、
-  sync.rs(同步原语)、sbi.rs(SBI 调用)、logger/panic/uart
+  process.rs(M2:进程/每进程独立地址空间/能力表)、ipc.rs(M2 T2a:同步 IPC,
+  寄存器消息 + 阻塞配对)、tests.rs(M2 引导期冒烟测试)、sync.rs(同步原语)、
+  sbi.rs(SBI 调用)、logger/panic/uart
 - `scripts/ai_audit.py` — 外部 AI 审计(密钥走环境变量,见 scripts/README.md)
 - `docs/` — DESIGN.md(架构铁律)、M2-DESIGN.md(M2 设计,U/S 切换/IPC/能力)、
   DEFERRED.md(延迟项注册表)、reports/(详尽报告)、audit-reports/(外部审计留档)

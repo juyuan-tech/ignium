@@ -1,10 +1,11 @@
-//! 引导期冒烟测试(M2 T1 / T1.5)。
+//! 引导期冒烟测试(M2 T1 / T1.5 / T2a)。
 //!
 //! # 定位
-//! 集中放置启动自检(用户态线程 + 每进程地址空间),使 `main.rs` 聚焦
-//! 于初始化顺序本身,不被测试逻辑淹没。测试在 `kernel_main` 的 init
-//! 顺序末尾、`irq_enable` **之前**执行(隔离定时器中断干扰,保证
-//! 确定性)。
+//! 集中放置启动自检(用户态线程 + 每进程地址空间 + 同步 IPC/能力表),
+//! 使 `main.rs` 聚焦于初始化顺序本身,不被测试逻辑淹没。测试在
+//! `kernel_main` 的 init 顺序末尾、`irq_enable` **之前**执行(隔离定时器
+//! 中断干扰,保证确定性)。IPC 测试依赖 syscall 分发与调度器阻塞/唤醒
+//! 原语,均已在 init 中就绪。
 //!
 //! # 约束
 //! - 零依赖顺序(各测试彼此独立、只依赖 init 已完成);
@@ -25,6 +26,7 @@ use crate::info;
 pub fn boot_tests() {
     boot_user_thread_test();
     boot_process_addrspace_test();
+    boot_ipc_test();
 }
 
 /// M2 T1:用户态线程 + ecall 冒烟。
@@ -211,6 +213,130 @@ fn boot_process_addrspace_test() {
         "user pages must not leak into kernel root"
     );
     info!("M2: per-process address space ok (2 proc @ same VA, satp switch, guard page)");
+}
+
+/// M2 T2a:同步 IPC(寄存器消息)+ 简化能力表(未授权拒绝)冒烟。
+///
+/// 场景(recv 先到、send 后到,验证阻塞配对与唤醒投递):
+/// 1. 建进程 S/R,授权 `cap(S,0,R)`、`cap(R,0,S)`;S 的槽 2 保持**未授权**。
+/// 2. 先 spawn R:R 写 ready 标记 0x51 → `recv(0)`(无 send 配对 → 阻塞);
+/// 3. 主上下文看到 0x51 后 spawn S:S 先 `send(2, …)`(未授权,须**不阻塞**
+///    返回 `-EACCES` 并存储),再 `send(0, [0x111,0x222,0x333,0x444,0x555])`
+///    —— 与 R 的 pending recv 配对,唤醒 R 并投递消息 → S 存储状态后退出;
+/// 4. R 被唤醒,`recv` 返回 status=0 + 5 字消息,存储后退出。
+///
+/// 断言:R status==0、R 收到 5 个 msg 字、S 未授权槽结果 == `-EACCES`、
+/// S 授权 send status==0、双 done 标记到齐。
+fn boot_ipc_test() {
+    // 1) 建进程 S/R + 能力授权(S 槽 2 留空 = 未授权)。
+    let s_pid = crate::process::create().expect("create S");
+    let r_pid = crate::process::create().expect("create R");
+    let root_s = crate::process::root(s_pid);
+    let root_r = crate::process::root(r_pid);
+    assert!(
+        crate::process::grant_cap(s_pid, 0, r_pid).is_ok(),
+        "grant cap(S,0,R)"
+    );
+    assert!(
+        crate::process::grant_cap(r_pid, 0, s_pid).is_ok(),
+        "grant cap(R,0,S)"
+    );
+    // 2) 用户程序(编码经逐条核对 S 型/I 型立即数;R 先注册 pending recv)。
+    let prog_r: [u32; 16] = [
+        0x4000_12b7, // lui   t0, 0x40001   (t0 = shared)
+        0x0510_0313, // addi  t1, x0, 0x51  (ready marker)
+        0x0062_a023, // sw    t1, 0(t0)     (shared[0] = 0x51)
+        0x0000_0513, // addi  a0, x0, 0     (recv cap slot 0)
+        0x0040_0893, // addi  a7, x0, 4     (SYSCALL_IPC_RECV)
+        0x0000_0073, // ecall
+        0x00a2_a223, // sw    a0, 4(t0)     (shared[1] = status)
+        0x00b2_a423, // sw    a1, 8(t0)     (shared[2] = msg[0])
+        0x00c2_a623, // sw    a2, 12(t0)    (shared[3] = msg[1])
+        0x00d2_a823, // sw    a3, 16(t0)    (shared[4] = msg[2])
+        0x00e2_aa23, // sw    a4, 20(t0)    (shared[5] = msg[3])
+        0x00f2_ac23, // sw    a5, 24(t0)    (shared[6] = msg[4])
+        0x0e50_0313, // addi  t1, x0, 0xE5  (done marker)
+        0x0062_ae23, // sw    t1, 28(t0)    (shared[7] = 0xE5)
+        0x0010_0893, // addi  a7, x0, 1     (SYSCALL_EXIT)
+        0x0000_0073, // ecall
+    ];
+    let prog_s: [u32; 23] = [
+        0x4000_12b7, // lui   t0, 0x40001   (t0 = shared)
+        0x0020_0513, // addi  a0, x0, 2     (send cap slot 2 = 未授权)
+        0x1110_0593, // addi  a1, x0, 0x111
+        0x2220_0613, // addi  a2, x0, 0x222
+        0x3330_0693, // addi  a3, x0, 0x333
+        0x4440_0713, // addi  a4, x0, 0x444
+        0x5550_0793, // addi  a5, x0, 0x555
+        0x0030_0893, // addi  a7, x0, 3     (SYSCALL_IPC_SEND)
+        0x0000_0073, // ecall
+        0x00a2_a023, // sw    a0, 0(t0)     (shared[0] = -EACCES)
+        0x0000_0513, // addi  a0, x0, 0     (send cap slot 0 = 授权)
+        0x1110_0593, // addi  a1, x0, 0x111
+        0x2220_0613, // addi  a2, x0, 0x222
+        0x3330_0693, // addi  a3, x0, 0x333
+        0x4440_0713, // addi  a4, x0, 0x444
+        0x5550_0793, // addi  a5, x0, 0x555
+        0x0030_0893, // addi  a7, x0, 3     (SYSCALL_IPC_SEND)
+        0x0000_0073, // ecall
+        0x00a2_a223, // sw    a0, 4(t0)     (shared[1] = send status)
+        0x7770_0313, // addi  t1, x0, 0x777 (done marker, 12-bit 正立即数)
+        0x0062_a423, // sw    t1, 8(t0)     (shared[2] = 0x777)
+        0x0010_0893, // addi  a7, x0, 1     (SYSCALL_EXIT)
+        0x0000_0073, // ecall
+    ];
+    let (_, r_shared_pa) = map_iso_proc(root_r, &prog_r);
+    let (_, s_shared_pa) = map_iso_proc(root_s, &prog_s);
+    let r_shared = r_shared_pa as *const u32;
+    let s_shared = s_shared_pa as *const u32;
+    // 3) 先 spawn R(prio HIGH):主上下文 yield 轮询,直至 R 写 ready 标记
+    //    (R 随即 recv 阻塞)。R 阻塞后主上下文恢复,才 spawn S。
+    crate::sched::spawn_user(r_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    let mut guard = 0;
+    while unsafe { core::ptr::read_volatile(r_shared) } != 0x51 {
+        assert!(guard < 200_000, "R did not become ready (recv pending)");
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 4) spawn S:未授权 send 立即返回 -EACCES,授权 send 与 R 配对。
+    crate::sched::spawn_user(s_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    // 5) 轮询双方 done 标记(R shared[7]=0xE5, S shared[2]=0x777)。
+    let mut guard = 0;
+    loop {
+        let r_done = unsafe { core::ptr::read_volatile(r_shared.add(7)) };
+        let s_done = unsafe { core::ptr::read_volatile(s_shared.add(2)) };
+        if r_done == 0xE5 && s_done == 0x777 {
+            break;
+        }
+        assert!(
+            guard < 200_000,
+            "IPC roundtrip timeout: r_done={r_done:#x} s_done={s_done:#x}"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 6) 断言:R 收到 status=0 + 5 字消息;S 未授权结果 == -EACCES。
+    let r_status = unsafe { core::ptr::read_volatile(r_shared.add(1)) };
+    let r_msg = [
+        unsafe { core::ptr::read_volatile(r_shared.add(2)) },
+        unsafe { core::ptr::read_volatile(r_shared.add(3)) },
+        unsafe { core::ptr::read_volatile(r_shared.add(4)) },
+        unsafe { core::ptr::read_volatile(r_shared.add(5)) },
+        unsafe { core::ptr::read_volatile(r_shared.add(6)) },
+    ];
+    let s_unauth = unsafe { core::ptr::read_volatile(s_shared) };
+    let s_status = unsafe { core::ptr::read_volatile(s_shared.add(1)) };
+    assert!(
+        s_unauth == crate::ipc::IPC_ERR_EACCES as u32,
+        "unauthorized send must reject -EACCES (got {s_unauth:#x})"
+    );
+    assert!(s_status == 0, "authorized send must succeed");
+    assert!(r_status == 0, "recv must succeed");
+    assert!(
+        r_msg == [0x111, 0x222, 0x333, 0x444, 0x555],
+        "msg roundtrip mismatch: {r_msg:?}"
+    );
+    info!("M2 T2a: sync IPC ok (reg-msg roundtrip, cap -EACCES reject)");
 }
 
 /// 为一个进程映射隔离测试所需的用户页并写入程序(进程根表)。

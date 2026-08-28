@@ -61,7 +61,7 @@
 
 ## 4. 系统调用 ABI(L1,对齐 LiteOS-A 风格)
 
-### 4.1 寄存器约定(暂定)
+### 4.1 寄存器约定(暂定,L1 IPC ABI 已落地 T2a)
 
 ```
 a7  = syscall 号(与 LiteOS-A 对齐表,先占 sys_read=.../write/open)
@@ -69,6 +69,19 @@ a0-a5 = 参数
 返回值: a0 = 结果, a1 = 附加
 错误: 负数(类似 -errno)
 ```
+
+**已落地的 L1 IPC ABI(T2a)**:
+
+| syscall | 号 | 入参 | 返回 |
+|---|---|---|---|
+| `sys_exit` | 1 | — | 不返回(线程退出) |
+| `sys_get_ticks` | 2 | — | a0 = 当前 tick |
+| `ipc_send` | 3 | a0 = 目标进程 cap 槽;a1-a5 = 消息 5 字 | 成功 a0=0;配对前阻塞 |
+| `ipc_recv` | 4 | a0 = 源进程 cap 槽 | 成功 a0=0、a1-a5 = 消息;配对前阻塞 |
+
+- 错误以负 errno 返回(不阻塞):`-EINVAL`(槽越界)、`-EACCES`(未授权/空槽)。
+- 无配对时发送/接收方阻塞;配对后经 sched 唤醒,`sepc+4` 由配对方前移。
+- 帧 GPR 索引单一来源:`arch::gpr`(与 riscv64.S 保存顺序一致)。
 
 ### 4.2 内核态服务分层
 
@@ -87,6 +100,13 @@ a0-a5 = 参数
   抢占)落地:on_tick 需能切到 ctx-valid 的高优线程。
 - 基于现有 block/wake:`sched::block_current` / `wake`,但唤醒后
   **立即抢占**(M2 调度器增强)。
+
+**T2a 已落地**:同步 IPC 核心 —— 寄存器消息(5 字,a1-a5)+ 阻塞配对
+(`PendingSend`/`PendingRecv` FIFO 队列,先到先配)+ 简化能力表授权
+(未授权 cap → `-errno` 不阻塞)+ **D22 woken 抢占**(ctx 展开为陷阱帧,
+on_tick 候选谓词放宽)。实现见 `ipc.rs`(锁序 TABLE → IPC → SCHED,见模块头)。
+
+**T2b 待办**:优先级继承(PIP,依赖 D22 已就绪)、压力测试、进程销毁/页回收。
 
 ### 5.2 共享内存大消息
 
@@ -130,6 +150,9 @@ a0-a5 = 参数
    D22 woken 抢占、线程 TCB/ID 复用。
 2. **T1 U/S**:每进程地址空间 + ecall 入口 + syscall 分发 + spawn/exit/wait。
 3. **T2 IPC**:同步 IPC + 消息寄存器 + 能力表 + 优先级继承(压力测试)。
+   - **T2a ✓(已落地)**:同步 IPC 核心(寄存器消息 + 阻塞配对)+ 简化
+     能力表(未授权拒绝)+ D22 woken 抢占。
+   - **T2b(待办)**:优先级继承(PIP)、IPC 压力测试。
 4. **T3 完善**:共享内存大消息、revoke、多核前置的并行开展。
 
 ## 10. 风险与对策
