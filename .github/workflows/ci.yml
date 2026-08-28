@@ -42,14 +42,19 @@ jobs:
           grep -q "M2 T2a: woken-thread preemption ok" /tmp/ignium-ci.log
           grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-ci.log
           grep -q "M2 T2b: IPC stress ok" /tmp/ignium-ci.log
+          grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
       # V3 审计 #11:多核引导仲裁回归测试纳入 CI。
+      # T3a:3 个副核各打印一行 "hart N online" + T3a banner(boot hart
+      # 等到 N=4 核全部上线后才打;locked_line 保证行不交错)。
       - name: SMP boot test (multi-hart arbitration)
         run: |
           timeout 10 qemu-system-riscv64 -M virt -m 128M -nographic -bios default -smp 4 \
           -kernel target/riscv64gc-unknown-none-elf/release/ignium-kernel > /tmp/ignium-smp.log 2>&1 || true
           test "$(grep -c 'M0: boot ok' /tmp/ignium-smp.log)" -eq 1
+          test "$(grep -c 'hart [0-9] online' /tmp/ignium-smp.log)" -eq 3
+          grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-smp.log
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log
 
   rva23:
@@ -84,5 +89,6 @@ jobs:
           grep -q "M2 T2a: woken-thread preemption ok" /tmp/ignium-rva23.log
           grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-rva23.log
           grep -q "M2 T2b: IPC stress ok" /tmp/ignium-rva23.log
+          grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-rva23.log
           test "$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log

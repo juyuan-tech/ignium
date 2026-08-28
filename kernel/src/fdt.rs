@@ -29,6 +29,8 @@ pub struct BoardParams {
     pub uart_base: usize,
     /// ISA 字符串(由 riscv,isa 属性解析,如 "rv64imafdch")。
     pub isa_string: &'static str,
+    /// D8:CPU 节点数(cpu@* 数 = 在线 hart 数;无则 0,调用方回退 1)。
+    pub cpu_count: usize,
     /// 保留区列表(最多 8 项,栈分配)。
     pub reserved: [(usize, usize); 8],
     pub reserved_count: usize,
@@ -42,6 +44,7 @@ impl BoardParams {
             timebase_freq: 0,
             uart_base: 0,
             isa_string: "",
+            cpu_count: 0,
             reserved: [(0, 0); 8],
             reserved_count: 0,
         }
@@ -367,7 +370,13 @@ impl Fdt {
                     }
                 }
             }
-            "riscv,isa" if node.starts_with(b"cpu@") && params.isa_string.is_empty() => {
+            "riscv,isa" if node.starts_with(b"cpu@") => {
+                // D8:每个 cpu@* 节点恰好带一个 riscv,isa 属性 → 此处即
+                // CPU 计数点(hart 数 = cpu@* 节点数)。
+                params.cpu_count = params.cpu_count.saturating_add(1);
+                if !params.isa_string.is_empty() {
+                    return;
+                }
                 if prop_len > 0 && prop_len < 128 {
                     let ptr = unsafe { struct_ptr.add(val_start) };
                     let len = {

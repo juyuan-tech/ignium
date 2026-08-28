@@ -57,6 +57,26 @@ impl<T> SpinLock<T> {
             saved_irq: saved,
         }
     }
+
+    /// 尝试获取锁(不等待)。已被持有 → 返回 None;成功 → 返回守卫。
+    ///
+    /// # 并发约束
+    /// IRQ 语义与 `lock` 一致:尝试期间保存 SIE 并关中断,失败时
+    /// 恢复中断;成功由守卫 Drop 恢复。用于**不可自旋**的路径
+    /// (如 D9 控制台输出:panic 可能打断持锁主上下文,必须放弃锁
+    /// 直接裸写,而非自旋等待造成死锁)。
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        let saved = arch::irq_save();
+        if self.locked.swap(true, Ordering::Acquire) {
+            arch::irq_restore(saved);
+            None
+        } else {
+            Some(SpinLockGuard {
+                lock: self,
+                saved_irq: saved,
+            })
+        }
+    }
 }
 
 /// 锁守卫:释放时恢复中断并解锁。

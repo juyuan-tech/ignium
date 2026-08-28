@@ -101,10 +101,19 @@ unsafe extern "C" {
     pub unsafe fn frame_restore(frame: *mut usize, old_ctx: *mut Context);
     // trap_vector 的符号地址(riscv64.S 中定义,16 字节对齐)。
     static trap_vector: u8;
-    // 陷阱栈边界(linker.ld 定义):异常处理器的专用栈,帧压在其上。
-    static _trap_stack_bottom: u8;
-    static _trap_stack_top: u8;
+    // per-hart 陷阱栈数组基址(D7,linker.ld 定义)。
+    // 数组基址 32K 对齐;sscratch 恒在数组内(槽顶 T_h 或帧基址),
+    // hartid = (sscratch - _trap_stack_base) >> 15。
+    static _trap_stack_base: u8;
 }
+
+/// 陷阱槽常量(D7 per-hart)。与 linker.ld 的 TRAP_STRIDE/MAX_HARTS 必须一致。
+/// 每槽 stride 32K = 16K 守护 + 16K 栈(stride 为 2 的幂 → 移位可寻址)。
+pub const TRAP_STRIDE: usize = 32 * 1024;
+/// 每槽守护区大小(MMU 不映射)。
+pub const TRAP_GUARD: usize = 16 * 1024;
+/// 最大 hart 数(QEMU -smp 4;超限 hart 在 entry.S 停 park)。
+pub const MAX_HARTS: usize = 4;
 
 /// 协作线程上下文:仅调用者保存寄存器(ra/sp/s0-s11)。
 /// `#[repr(C)]` 与 context_switch 汇编的偏移一致。
@@ -116,21 +125,60 @@ pub struct Context {
     pub s: [usize; 12],
 }
 
-/// 安装陷阱向量并初始化陷阱栈指针。
+/// 陷阱栈数组基址(linker.ld;取地址仅为算术,不解引用)。
+#[inline]
+fn trap_stack_base() -> usize {
+    (&raw const _trap_stack_base).addr()
+}
+
+/// 本 hart 陷阱槽顶 `T_h` = base + (hartid+1)*32K。
+#[inline]
+fn hart_trap_top(h: usize) -> usize {
+    trap_stack_base() + (h + 1) * TRAP_STRIDE
+}
+
+/// 读取 sscratch(陷阱期间 = 本 hart 帧基址;陷阱外 = 本 hart 槽顶 T_h)。
+#[inline]
+pub fn read_sscratch() -> usize {
+    let v: usize;
+    unsafe {
+        asm!("csrr {}, sscratch", out(reg) v, options(nomem, nostack));
+    }
+    v
+}
+
+/// 当前 hartid(D7):sscratch 恒在本 hart 陷阱槽内(槽顶 T_h 或首层帧底),
+/// 两者偏移 >> 15 均给出本槽序号 —— 仅"恰在槽顶"(偏移 mod 32K == 0,
+/// 即 T_h = base+(h+1)*32K)需减 1。陷阱处理中(帧基址)与内核上下文
+/// (T_h)都可靠,**不依赖 tp**(用户线程会改 tp)。
+#[inline]
+pub fn hartid() -> usize {
+    let off = read_sscratch().wrapping_sub(trap_stack_base());
+    let h = off >> 15;
+    if off & 0x7FFF == 0 {
+        h.wrapping_sub(1)
+    } else {
+        h
+    }
+}
+
+/// 安装陷阱向量并初始化本 hart 的陷阱栈指针。
+///
+/// # 参数
+/// `hartid`:当前 hart 编号(kernel_main / secondary_main 传入;调用
+/// 时 sscratch 尚未初始化,无法自推导)。
 ///
 /// # Safety 说明(调用顺序要求)
 /// 必须在 `uart::init` **之后**调用:stvec 装好后发生的 trap 会进入
 /// `trap_handler` 输出日志,若串口尚未初始化,诊断输出将不可见。
 /// 也必须在一切可能触发异常的用户代码之前调用(否则异常跳地址 0)。
-pub fn init_traps() {
+pub fn init_traps(hartid: usize) {
     unsafe {
-        // sscratch = 陷阱栈顶;trap_vector 入口用它换出 t6 并在
-        // 栈上压帧(多 hart 时改为 per-hart 栈,此处为单 hart 静态栈)。
+        // sscratch = 本 hart 槽顶 T_h;trap_vector 入口用它换出 t6 并在
+        // 本槽栈上压帧(D7 per-hart 数组)。
         asm!(
-            "la {tmp}, {top}",
-            "csrw sscratch, {tmp}",
-            tmp = out(reg) _,
-            top = sym _trap_stack_top,
+            "csrw sscratch, {top}",
+            top = in(reg) hart_trap_top(hartid),
             options(nostack)
         );
         // stvec 直接模式:低 2 位必须为 0,指向 4 字节对齐的入口
@@ -143,16 +191,16 @@ pub fn init_traps() {
     }
 }
 
-/// 重置 sscratch 为陷阱栈顶(用于从 trap 上下文 exit 前确保
-/// 切换后的目标线程下次 trap 的嵌套检测不会误判)。
+/// 重置 sscratch 为**当前 hart** 的陷阱槽顶(用于从 trap 上下文 exit 前
+/// 确保切换后的目标线程下次 trap 的嵌套检测不会误判)。当前 hart 由
+/// sscratch 自身推导(陷阱期间 = 帧基址,内核上下文 = T_h,均可靠)。
 #[inline]
 pub fn set_sscratch_trap_top() {
+    let top = hart_trap_top(hartid());
     unsafe {
         asm!(
-            "la {tmp}, {top}",
-            "csrw sscratch, {tmp}",
-            tmp = out(reg) _,
-            top = sym _trap_stack_top,
+            "csrw sscratch, {top}",
+            top = in(reg) top,
             options(nostack)
         );
     }
@@ -252,7 +300,9 @@ pub fn timer_interval() -> usize {
 /// 处理延迟(自截止到 handler 执行的时差)每个周期都累加进下次
 /// 截止,产生持续漂移;前者只加固定间隔,节拍无累积误差。
 /// 仅定时器 ISR 写入(fetch_add),启动时初始化一次。
-static TIMER_DEADLINE: AtomicUsize = AtomicUsize::new(0);
+/// D7:per-hart —— 每核独立节拍(索引 = 当前 hart,见 `enable_timer`
+/// 与 ISR 路径)。
+static TIMER_DEADLINE: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
 
 /// D17(自审推进):是否使用 SSTC(stimecmp)直写定时器。
 /// - `enable_timer` 首次用 SBI(通用,无非法指令风险);
@@ -337,7 +387,8 @@ pub fn enable_timer() {
         asm!("csrs sie, {stie}", stie = in(reg) 0x20usize, options(nostack));
     }
     let deadline = get_time().wrapping_add(timer_interval());
-    TIMER_DEADLINE.store(deadline, Ordering::Relaxed);
+    // D7:按当前 hart(sscratch = T_h,自推导可靠)索引 per-hart 槽。
+    TIMER_DEADLINE[hartid()].store(deadline, Ordering::Relaxed);
     // 首次:USE_SSTC 尚为 false,走 SBI(通用)。
     let rc = crate::sbi::set_timer(deadline);
     // V4(外部审计 MED):首次编程失败 → 定时器永不触发,明确 panic
@@ -413,10 +464,15 @@ pub unsafe extern "C" fn trap_handler(
     // 帧指针完整性校验(L2):用减法避免 `f + 帧长` 在损坏指针上
     // 溢出回绕(旧写法 f+288 可回绕越过 top,导致 OOB 解引用)。
     // 必须:帧在陷阱栈内、容纳整个帧、16 字节对齐。
+    // D7:帧界检查改 per-hart 槽 —— 当前 hart 由 sscratch 推导
+    // (陷阱期间 sscratch = 帧基址,可靠);槽 = [base + h*32K,
+    // base + (h+1)*32K),栈区在其后 16K,帧贴槽顶,界内检查成立。
     let f = frame as usize;
-    let bottom = (&raw const _trap_stack_bottom).addr();
-    let top = (&raw const _trap_stack_top).addr();
     let frame_bytes = TRAP_FRAME_WORDS * 8;
+    let h = hartid();
+    let base = trap_stack_base();
+    let bottom = base + h * TRAP_STRIDE;
+    let top = bottom + TRAP_STRIDE;
     if top < bottom
         || top - bottom < frame_bytes
         || f < bottom
@@ -425,7 +481,7 @@ pub unsafe extern "C" fn trap_handler(
     {
         // 帧指针非法(栈被破坏或入口异常):不再解引用,直接停机。
         error!(
-            "FATAL: invalid trap frame {:#x} (trap stack [{:#x}, {:#x}))",
+            "FATAL: invalid trap frame {:#x} (hart {h} trap slot [{:#x}, {:#x}))",
             f, bottom, top
         );
         halt()
@@ -443,8 +499,11 @@ pub unsafe extern "C" fn trap_handler(
                 // 落后,用 max(now + interval) 防止 tick 风暴。
                 crate::logger::tick_up();
                 // 自审:interval 每 tick 单独读一次(原 3 次原子读)。
+                // D7:按当前 hart(陷阱期间 sscratch = 帧基址,自推导可靠)
+                // 索引 per-hart deadline 槽。
                 let interval = timer_interval();
-                let ideal = TIMER_DEADLINE
+                let h = hartid();
+                let ideal = TIMER_DEADLINE[h]
                     .fetch_add(interval, Ordering::Relaxed)
                     .wrapping_add(interval);
                 let now = get_time();
@@ -455,7 +514,7 @@ pub unsafe extern "C" fn trap_handler(
                 } else {
                     ideal
                 };
-                TIMER_DEADLINE.store(next, Ordering::Relaxed);
+                TIMER_DEADLINE[h].store(next, Ordering::Relaxed);
                 // D17:按能力选 stimecmp 或 SBI 重排下一次中断。
                 arm_timer(next);
                 // 抢占决策:时间片到期且存在就绪线程时,返回下一线程

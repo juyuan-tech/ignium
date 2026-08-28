@@ -64,15 +64,21 @@ test: build
 		&& grep -q "M2 T2a: woken-thread preemption ok" /tmp/ignium-test.log \
 		&& grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-test.log \
 		&& grep -q "M2 T2b: IPC stress ok" /tmp/ignium-test.log \
+		&& grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-test.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-test.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
 		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)
 
 # 多核冒烟:boot hart 不一定是 hart 0(实测 -smp 4 时为 hart 3),
 # 断言恰好 1 条 M0(引导权仲裁正确,无重复引导/无全员停车)。
+# T3a:3 个副核各打印一行 "hart N online"(locked_line 整行原子,boot
+# hart 等全部副核 mark_online 后才打 banner → 行不交错,断言可靠),
+# 且出现 T3a banner(证明 boot hart 等到 N=4 个核全部上线)。
 test-smp:
 	@timeout 10 $(QEMU) $(QEMUARGS) -smp 4 -kernel $(KERNEL_ELF) > /tmp/ignium-smp.log 2>&1 || true
 	@test "$$(grep -c 'M0: boot ok' /tmp/ignium-smp.log)" -eq 1 \
+		&& test "$$(grep -c 'hart [0-9] online' /tmp/ignium-smp.log)" -eq 3 \
+		&& grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-smp.log \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log \
 		&& echo "SMP TEST PASS" || (echo "SMP TEST FAIL"; cat /tmp/ignium-smp.log; exit 1)
 
@@ -101,6 +107,7 @@ test-rva23: build-rva23
 		&& grep -q "M2 T2a: woken-thread preemption ok" /tmp/ignium-rva23.log \
 		&& grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-rva23.log \
 		&& grep -q "M2 T2b: IPC stress ok" /tmp/ignium-rva23.log \
+		&& grep -q "M2 T3a: multi-core boot ok" /tmp/ignium-rva23.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log \
 		&& echo "RVA23 TEST PASS" || (echo "RVA23 TEST FAIL"; cat /tmp/ignium-rva23.log; exit 1)

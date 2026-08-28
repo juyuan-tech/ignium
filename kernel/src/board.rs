@@ -25,6 +25,8 @@ static BOARD_RAM_START: AtomicUsize = AtomicUsize::new(0);
 static BOARD_RAM_SIZE: AtomicUsize = AtomicUsize::new(0);
 static BOARD_UART_BASE: AtomicUsize = AtomicUsize::new(0);
 static BOARD_TIMER_FREQ: AtomicUsize = AtomicUsize::new(0);
+/// D8:在线核数(FDT cpu@* 节点数;0 = 未解析,调用方回退 1)。
+static BOARD_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// 2MB 超页对齐(用于 RAM 超页映射)。
 const SUPER_PAGE: usize = 2 * 1024 * 1024;
@@ -106,10 +108,36 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     } else {
         DEFAULT_TIMER_FREQ
     };
+    // D8:CPU 数(FDT cpu@* 节点数)。0(无 FDT/未解析)回退 1;超上限的
+    // 部分在 wake_secondaries 用 min(MAX_HARTS) 截断(超限 hart 仍停 park)。
+    let cpu_count = if params.cpu_count >= 1 {
+        params.cpu_count
+    } else {
+        1
+    };
     BOARD_RAM_START.store(ram_start, Ordering::Relaxed);
     BOARD_RAM_SIZE.store(ram_size, Ordering::Relaxed);
     BOARD_UART_BASE.store(uart_base, Ordering::Relaxed);
     BOARD_TIMER_FREQ.store(timer_freq, Ordering::Relaxed);
+    BOARD_CPU_COUNT.store(cpu_count, Ordering::Relaxed);
+}
+
+/// 内核入口地址(`_start` @ KERNEL_LINK_BASE)。D8:作为 SBI HSM
+/// `hart_start` 的启动跳转目标(副核被启动后从该地址进入 S 模式执行)。
+#[inline]
+pub fn kernel_start_addr() -> usize {
+    (&raw const _kernel_start).addr()
+}
+
+/// 在线核数(FDT cpu@* 节点数;未解析时回退 1 = 单核)。
+#[inline]
+pub fn cpu_count() -> usize {
+    let v = BOARD_CPU_COUNT.load(Ordering::Relaxed);
+    if v != 0 {
+        v
+    } else {
+        1
+    }
 }
 
 /// 物理内存起始地址。

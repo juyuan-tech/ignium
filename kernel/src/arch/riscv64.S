@@ -7,12 +7,12 @@
 # trap_vector:异常/中断统一入口(stvec 指向此处)。
 #
 # 设计(基于 pro 审计 #2/#3 的重构):
-#   - **陷阱栈**:sscratch(每 hart 一个 CSR,但当前存的是**全局**
-#     单栈顶值)保存陷阱栈顶;入口用 `csrrw` 换出 t6 取得栈顶,
-#     在陷阱栈上压入陷阱帧 —— 处理器绝不在被中断者的 sp 上运行
-#     (栈溢出/用户态 sp 均无法危害内核)。
-#     多核注意:多 hart 唤醒前必须把单栈换成 per-hart 栈数组
-#     (H1,审计 11 轮),否则两个 hart 会在同一地址压帧互相覆盖。
+#   - **陷阱栈(D7 per-hart)**:sscratch 恒在本 hart 陷阱槽内 ——
+#     陷阱外 = 本槽顶 T_h,陷阱期间 = 帧基址(每级更新)。入口用
+#     `csrrw` 换出 t6 取得栈顶,在陷阱栈上压入陷阱帧 —— 处理器绝不
+#     在被中断者的 sp 上运行(栈溢出/用户态 sp 均无法危害内核)。
+#     hartid = (sscratch - _trap_stack_base) >> 15 任意时刻可靠,
+#     不依赖 tp(用户线程会改 tp),也无需 per-hart stvec stub。
 #   - **嵌套语义(L2)**:handler 活跃期间的第二次 trap(嵌套)一律
 #     直接停机 —— 当前不提供可恢复嵌套。帧基于陷阱栈压入是为未来
 #     per-hart 应急栈预留的形态,不是已实现的嵌套能力。
@@ -36,6 +36,12 @@
 # 共用本常量,消除"两个魔法数漂移"风险(pro 审计 #2)。
 .equ TRAP_FRAME_SIZE, 288
 
+# per-hart 槽跨度(D7,与 linker.ld 的 TRAP_STRIDE 一致)。
+.equ TRAP_STRIDE, 32768
+# 首层帧底偏移 mod TRAP_STRIDE:帧底 = T_h - 帧长 = 槽顶 - 帧长,
+# 低 15 位唯一区分首层(TRAP_FIRST_OFF)与更深层。
+.equ TRAP_FIRST_OFF, TRAP_STRIDE - TRAP_FRAME_SIZE
+
 .section .text
 .align 4                    # stvec 要求 4 字节对齐(直接模式下低 2 位必须为 0)
 .globl trap_vector
@@ -44,29 +50,12 @@ trap_vector:
     csrrw t6, sscratch, t6
     # 在陷阱栈上预留帧(t6 = 帧基址)。
     addi t6, t6, -TRAP_FRAME_SIZE
-    # V3 审计 #3(known limitation):前两次 sd 在嵌套检测之前写入帧。
-    # 原因:csrrw 单寄存器交换(sscratch)只能保留一个值,校验需要
-    # 第二个临时寄存器,会破坏原 t0(无法同时保存 t0 与校验)。
-    # M1.5 单核 S 模式 + 内核可控 sscratch(fit init_traps/frame_restore
-    # 均写 _trap_stack_top),此路径不可被外部触发;M2 用户态引入
-    # 受控 t6 前须重构为双 scratch CSR 或固定控制块方案。
     # 先保存原始 t0(t0 即将被用作临时寄存器;顺序至关重要,
     # 任何"先 clobber 后保存"都会使 dump 显示假值)。
     sd t0, 4*8(t6)
     # 取出被中断的 t6(暂存在 sscratch)并写入帧槽 30。
     csrr t0, sscratch
     sd t0, 30*8(t6)
-    # 嵌套检测(H2):第一层陷阱的帧底 == 陷阱栈顶 - 帧长。
-    # 若不等 → handler 已活跃(第二层 trap)→ 停机。此时帧写入
-    # 位置在外层 handler 活跃栈上方,无重叠;外层将停机,无害。
-    # 只用已入帧的 t0(不能再用其他未保存寄存器)。
-    # norelax(LOW#6):此 la 若被松弛成 gp 相对寻址,会用到尚未
-    # 重载的(可能被中断上下文污染的)gp。
-    .option norelax
-    la t0, _trap_stack_top
-    .option relax
-    addi t0, t0, -TRAP_FRAME_SIZE
-    bne t6, t0, 4f
     # 保存被中断的 gp,然后重载内核 gp(H1):此后任何可被松弛成
     # gp 相对的访存与 trap_handler 的全局访问都落在内核 gp 上;
     # 恢复路径会把被中断的 gp 还给原上下文。norelax 防自松弛。
@@ -74,8 +63,10 @@ trap_vector:
     .option norelax
     la gp, __global_pointer$
     .option relax
-    # 更新陷阱栈顶 = 本帧底(供下一层嵌套检测使用)。
-    csrw sscratch, t6
+    # 完整保存其余 GPR。嵌套检测(D7)放在本循环**之后**:检测用
+    # t0/t1/t2 作暂存,必须先让它们的原值入帧(否则帧里存的是被
+    # 污染值)。注:原始实现在嵌套检测前只入帧 t0,检测只许用 t0;
+    # 本实现放宽为"全部 GPR 入帧后再检测",语义等价。
     sd ra, 0*8(t6)
     sd sp, 1*8(t6)
     sd tp, 3*8(t6)
@@ -104,6 +95,22 @@ trap_vector:
     sd t3, 27*8(t6)
     sd t4, 28*8(t6)
     sd t5, 29*8(t6)
+    # 嵌套检测(H2,D7 per-hart):第一层陷阱帧底相对数组基址的偏移
+    # mod 32K == TRAP_FIRST_OFF(32K-288)。所有 hart 的帧底
+    # = base + h*32K + (32K - 288k),低 15 位唯一区分首层(32K-288)
+    # 与更深层(k≥2)—— 无全局栈顶、无需 hartid。若不等 → handler
+    # 已活跃(第二层 trap)→ 停机。帧写入在外层活跃栈上方,外层将
+    # 停机,无害。norelax(LOW#6):la 防被松弛成 gp 相对寻址。
+    .option norelax
+    la t0, _trap_stack_base
+    .option relax
+    sub t0, t6, t0
+    li t1, 0x7FFF
+    and t0, t0, t1
+    li t1, TRAP_FIRST_OFF
+    bne t0, t1, 4f
+    # 更新陷阱栈顶 = 本帧底(供下一层嵌套检测使用)。
+    csrw sscratch, t6
     # 保存关键 CSR:硬件在异常/中断入口已更新这些值,是定位故障的核心。
     csrr t0, sstatus
     sd t0, 32*8(t6)
@@ -120,10 +127,12 @@ trap_vector:
     mv a3, t6
     # 处理器自身栈:帧下方预留 8KB(HIGH-3:实测 error! 输出链 < 1KB,
     # 但 Rust 格式化栈用随参数/优化浮动,2KB 不足以保证)。**强制校验
-    # 余量在陷阱栈内**:若 sp 计算值越过陷阱栈底,说明栈已近耗尽
-    # (嵌套过深),此时调用 handler 会把数据写进引导栈顶 —— 改为
-    # 安全停机(pro 审计 max #2)。
-    la t0, _trap_stack_bottom
+    # 余量在本 hart 槽内**(D7 per-hart):槽栈区底 = 槽顶 T_h - 16K
+    # = (帧基址 + 288) - 16K —— 纯相对计算,无需 hartid。若 sp 计算值
+    # 越过栈区底,说明栈已近耗尽(嵌套过深)→ 安全停机(pro 审计 max #2)。
+    addi t0, t6, TRAP_FRAME_SIZE   # t0 = 槽顶 T_h
+    li t1, TRAP_STRIDE / 2         # 16K(槽内栈区上缘)
+    sub t0, t0, t1                 # t0 = 本槽栈区底
     # -8192 超出 addi 立即数范围,用 li+add 组合。
     li t1, -8192
     add t1, t1, t6
@@ -137,12 +146,12 @@ trap_vector:
     # ===== 恢复路径 =====
     mv t6, a0
     # CRITICAL-3(审计 16 轮)+ CRITICAL-1(审计 17 轮):sscratch
-    # **恒置为陷阱栈顶** —— 无论帧在陷阱栈还是线程 TCB:
-    # - 陷阱栈帧:复位防栈顶漂移;
-    # - TCB 帧(抢占切换):上次修复"仅陷阱栈帧复位"导致被抢占
-    #   线程恢复后 sscratch 停在旧帧底,下次 trap 嵌套检测误判
-    #   "第一层"而把栈顶向下漂移 288,逐次累积耗尽陷阱栈。
-    la t0, _trap_stack_top
+    # **置回本 hart 槽顶** —— 无论帧在陷阱栈还是线程 TCB。
+    # D7 per-hart:当前 trap 必为首层(嵌套已停机),陷阱期间
+    # sscratch = 帧基址 → +288 = 本槽顶 T_h,无需全局栈顶/hartid。
+    # (抢占切换到 TCB 帧时 sscratch 仍是当前 trap 帧基址,同样成立。)
+    csrr t0, sscratch
+    addi t0, t0, TRAP_FRAME_SIZE
     csrw sscratch, t0
     # 恢复 sstatus:清掉 SIE 位再写回 —— sret 时硬件用 SPIE(硬件在
     # trap 入口置 1)恢复 SIE,从而"原子地"重新使能中断,避免在
@@ -279,12 +288,23 @@ frame_restore:
     mv t6, a0
     # 关中断保护恢复过程;SIE 由帧 sstatus 经 sret 原子恢复。
     csrci sstatus, 2
-    # CRITICAL-1(审计 17 轮):sscratch 恒置陷阱栈顶 —— 与 trap_vector
-    # 恢复路径一致。若沿用被恢复线程上次 trap 的帧底,下次 trap 的
-    # 嵌套检测会把本帧当作"第二层"而停机。
+    # CRITICAL-1(审计 17 轮)+ D7 per-hart:sscratch 置回**本 hart**
+    # 槽顶,与 trap_vector 恢复路径一致。若沿用陈旧帧底,下次 trap
+    # 的嵌套检测会误判"第二层"而停机。
+    # sscratch 此时可能为:槽顶 T_h(协作路径,内核上下文)或首层帧底
+    # (ISR 抢占路径,陷阱期间)。统一:若偏移 mod 32K == TRAP_FIRST_OFF
+    # (帧底)→ +288 得槽顶;否则(已是槽顶)原样写回。无需 hartid。
+    csrr t0, sscratch
     .option norelax
-    la t0, _trap_stack_top
+    la t1, _trap_stack_base
     .option relax
+    sub t1, t0, t1
+    li t2, 0x7FFF
+    and t1, t1, t2
+    li t2, TRAP_FIRST_OFF
+    bne t1, t2, 3f
+    addi t0, t0, TRAP_FRAME_SIZE
+3:
     csrw sscratch, t0
     ld t0, 32*8(t6)
     andi t0, t0, -3

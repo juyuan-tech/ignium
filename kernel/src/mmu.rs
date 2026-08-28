@@ -253,9 +253,11 @@ extern "C" {
     static _stack_guard: u8;
     static _stack_bottom: u8;
     static _stack_top: u8;
-    static _trap_stack_guard: u8;
-    static _trap_stack_bottom: u8;
+    // D7 per-hart 数组边界(陷阱栈 / idle 栈;基址 32K 对齐)。
+    static _trap_stack_base: u8;
     static _trap_stack_top: u8;
+    static _idle_stack_base: u8;
+    static _idle_stack_top: u8;
 }
 
 /// 内核页表根目录物理地址(M2 T1:用户映射/进程表用它作参照)。
@@ -338,8 +340,9 @@ fn map_kernel_region(root: usize) {
     }
 
     // 5) 栈守护页:unmap 4KB 页,使栈溢出触发页故障(而非静默损坏)。
+    //    引导栈守护页单页;陷阱/idle 数组(D7)每槽前 16K 守护区
+    //    逐 4KB 页 unmap(stride 32K,守护跨 4 页)。
     let stack_guard = (&raw const _stack_guard).addr();
-    let trap_stack_guard = (&raw const _trap_stack_guard).addr();
     // H1(审计 18 轮外部):断言 unmap 成功,若栈跨越 2MB 边界导致
     // ensure_table 下沉超页失败,则 panic 而非静默忽略。
     assert!(
@@ -347,15 +350,44 @@ fn map_kernel_region(root: usize) {
         "failed to unmap stack guard page at {:#x} (crosses 2MB boundary?)",
         stack_guard
     );
-    assert!(
-        unmap_4k(root, trap_stack_guard).is_ok(),
-        "failed to unmap trap stack guard page at {:#x} (crosses 2MB boundary?)",
-        trap_stack_guard
-    );
+    // D7:per-hart 数组守护区。守卫区位于 [kernel_end, kernel_super_end)
+    // 的 4KB 映射尾区内(arrays 先于 _alloc_start,紧随 kernel_end),
+    // 逐页 ensure_table 不会命中超页叶子。
+    let trap_base = (&raw const _trap_stack_base).addr();
+    let trap_top = (&raw const _trap_stack_top).addr();
+    unmap_guard_pages(root, "trap stack", trap_base, trap_top);
+    let idle_base = (&raw const _idle_stack_base).addr();
+    let idle_top = (&raw const _idle_stack_top).addr();
+    unmap_guard_pages(root, "idle stack", idle_base, idle_top);
 
     // UART MMIO:4KB RW + A/D(无 X)。
     let uart_base = crate::board::uart_base();
     map_4k(root, uart_base, uart_base, PTE_LEAF_RW).expect("UART MMIO mapping failed");
+}
+
+/// D7:unmap per-hart 数组每槽前 16K 守护区(每槽 4 个 4KB 页)。
+///
+/// 槽布局(linker.ld):`[槽底, 槽底+16K)` = 守护页(MMU 不映射,越界触发
+/// 页故障),`[槽底+16K, 槽底+32K)` = 栈区。仅 unmap 守护区,栈区保留。
+/// 调用方保证 `[base, top)` 位于 [kernel_end, kernel_super_end) 的 4KB
+/// 尾区(数组先于 _alloc_start,紧随 kernel_end)—— 逐页 ensure_table
+/// 不会命中超页叶子;任一页 unmap 失败即 panic(H1:结构性错误 fail-loudly)。
+fn unmap_guard_pages(root: usize, name: &str, base: usize, top: usize) {
+    const PAGE_SIZE: usize = 4 * 1024;
+    let stride = crate::arch::TRAP_STRIDE;
+    let guard = crate::arch::TRAP_GUARD;
+    let mut slot = base;
+    while slot < top {
+        let mut page = slot;
+        while page < slot + guard {
+            assert!(
+                unmap_4k(root, page).is_ok(),
+                "failed to unmap {name} guard page at {page:#x} (crosses 2MB boundary?)"
+            );
+            page += PAGE_SIZE;
+        }
+        slot += stride;
+    }
 }
 
 /// 创建**用户进程**的独立地址空间根表(M2 T1.5)。

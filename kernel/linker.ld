@@ -12,7 +12,11 @@ ENTRY(_start)
 
 BASE_ADDRESS = 0x80200000;      /* QEMU virt 上 OpenSBI 跳转内核的地址 */
 STACK_SIZE = 64K;               /* 引导栈大小;M1 引入守护页后缩小 */
-TRAP_STACK_SIZE = 16K;          /* 陷阱栈大小(异常处理器专用) */
+TRAP_STACK_SIZE = 16K;          /* 每 hart 槽内的栈大小(陷阱/异常处理器专用) */
+TRAP_STRIDE = 32K;              /* per-hart 槽跨度 = 16K 守护 + 16K 栈;
+                                   2 的幂 → 按 hartid 移位可寻址 */
+MAX_HARTS = 4;                  /* 与 arch/riscv64.rs 的 MAX_HARTS、QEMU -smp 4 一致;
+                                   超限 hart 停 park(不进入本数组) */
 
 SECTIONS
 {
@@ -85,17 +89,26 @@ SECTIONS
         _stack_top = .;
     }
 
-    /* 陷阱栈:异常处理器专用栈(trap_vector 在其上压帧)。
-     * 与引导栈分离:处理器绝不在被中断者的 sp 上运行,
-     * 也避免 handler 深度使用引导栈(pro 审计 #2)。
-     * 多核:唤醒副核前必须改为 per-hart 陷阱栈数组
-     * (按 hartid/tp 索引),本单栈仅适用于单核阶段。 */
-    .trap_stack (NOLOAD) : ALIGN(4K) {
-        _trap_stack_guard = .;
-        . += 4K;                /* 守护页:MMU 不映射 */
-        _trap_stack_bottom = .;
-        . += TRAP_STACK_SIZE;
+    /* 陷阱栈:per-hart 数组(D7 多核)。每槽 stride 32K = 16K 守护 + 16K 栈,
+     * 数组基址 32K 对齐(槽偏移 = hartid*32K,移位可寻址)。
+     * sscratch 恒在本 hart 槽内:陷阱外 = 槽顶 T_h,陷阱期间 = 帧基址;
+     * hartid = (sscratch - _trap_stack_base) >> 15,不依赖 tp。
+     * 与引导栈分离:处理器绝不在被中断者的 sp 上运行。 */
+    .trap_stack (NOLOAD) : ALIGN(32K) {
+        _trap_stack_base = .;
+        _trap_stack_bottom = .;  /* 兼容符号 = 数组起点(首槽守护页下缘) */
+        _trap_stack_guard = .;   /* 兼容符号 = 数组起点(首槽守护页) */
+        . += TRAP_STRIDE * MAX_HARTS;
         _trap_stack_top = .;
+    }
+
+    /* per-hart idle 栈数组(D7/D8):副核 idle 上下文用栈,每槽同 stride。
+     * hart0 用 _stack(引导栈),不占本数组。守护页在 mmu 映射中 unmap。 */
+    .idle_stack (NOLOAD) : ALIGN(32K) {
+        _idle_stack_base = .;
+        _idle_stack_guard = .;
+        . += TRAP_STRIDE * MAX_HARTS;
+        _idle_stack_top = .;
     }
 
     /* M1 物理分配器的起点:栈区/陷阱栈区属于保留区,

@@ -33,11 +33,30 @@
 //! 输出,或 panic 路径使用独立的紧急输出通道。
 
 use core::fmt;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+use crate::sync::SpinLock;
 
 /// 缓存 UART 基址(避免每次 putc 调用 board::uart_base 的跨模块开销)。
 /// 初始化后写入,此后只读(Relaxed 足够,因 init 与 putc 有 happens-before)。
 static UART_REG_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// 控制台输出锁(D9 多核):write_str 输出先 try_lock;失败(panic 重入 /
+/// 他核持有)回退无锁裸写。
+///
+/// # 锁序契约
+/// 输出函数**永不持有 SCHED 等其它锁**;ISR 仍零日志(红线 5)。
+static CONSOLE_LOCK: SpinLock<()> = SpinLock::new(());
+
+/// panic 输出模式:置位后 write_str 不再取锁,直接裸写。
+/// panic 时中断已关,且可能打断正持 CONSOLE_LOCK 的主上下文 ——
+/// 若仍走取锁路径必然死锁。此标志由 panic 处理器置位,不可逆。
+static PANIC_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+/// 进入 panic 输出模式(panic 处理器调用;此后所有输出不加锁)。
+pub fn set_panic_output() {
+    PANIC_OUTPUT.store(true, Ordering::Relaxed);
+}
 
 #[inline]
 fn uart_base() -> usize {
@@ -200,7 +219,54 @@ pub fn putc(c: u8) {
 }
 
 /// 输出字符串;`\n` 自动补 `\r\n`(终端换行兼容)。
+///
+/// # 多核语义(D9)
+/// 正常路径先 `try_lock` CONSOLE_LOCK(跨核互斥,防止字符交错);
+/// 失败(panic 输出模式 / 他核正持有且本核在不可自旋上下文)直接
+/// 无锁裸写 —— best-effort,宁可字符错位也不死锁。
+///
+/// **注意**:多核并发输出时 try_lock 在争用下立即回退 → 可能逐字符
+/// 交错(非确定性)。需要**整行原子**的 boot 期输出请用 `locked_line`
+/// (T3a 实测:副核上线与 banner 同时打印,QEMU -nographic 串口慢写
+/// 放大窗口;见 `locked_line` 说明)。
 pub fn write_str(s: &str) {
+    if PANIC_OUTPUT.load(Ordering::Relaxed) {
+        write_str_raw(s);
+        return;
+    }
+    let _guard = CONSOLE_LOCK.try_lock();
+    write_str_raw(s);
+}
+
+/// T3a:多核 boot 期**整行原子**控制台输出(阻塞拿锁后执行 `f`)。
+///
+/// 背景:三个副核上线(`hart N online`)与 boot hart 的 T3a banner
+/// 在同一时刻打印,`write_str` 的 D9 try_lock 在争用下立即回退裸写
+/// → 逐字符交错(QEMU -nographic 串口逐字符慢写放大窗口;test-smp
+/// "3 条 online" 断言曾偶发失配)。本函数**阻塞自旋**拿 CONSOLE_LOCK,
+/// 保证整行原子。
+///
+/// # 为什么阻塞锁在此安全(D9 拒绝全局阻塞锁的原因不适用)
+/// - 调用方限定 **boot 期各核 SIE 全关**:无定时器 ISR,持锁者不会被
+///   抢占打断、无重入(否则阻塞锁在自身重入时死锁)。
+/// - 写入者**有界**:每个副核只打印一行、boot hart 只打印一行;持锁者
+///   必然在有限时间内释放 → 等待者必然拿到锁。
+/// - panic 短接:已置 PANIC_OUTPUT 时直接执行 `f` 不取锁(与 D9 同一
+///   契约,panic=abort 下守卫不会 Drop,阻塞锁会让等待核挂死 —— 故
+///   本函数绝不能用于 panic 之后的通用输出)。
+///
+/// 通用多核日志仍走 `write_str` 的 D9 best-effort 语义(交错可接受)。
+pub fn locked_line(f: impl FnOnce()) {
+    if PANIC_OUTPUT.load(Ordering::Relaxed) {
+        f();
+        return;
+    }
+    let _guard = CONSOLE_LOCK.lock();
+    f();
+}
+
+/// 无锁裸写(底层出口)。调用方负责互斥(PANIC_OUTPUT / CONSOLE_LOCK)。
+fn write_str_raw(s: &str) {
     for &b in s.as_bytes() {
         if b == b'\n' {
             putc(b'\r');

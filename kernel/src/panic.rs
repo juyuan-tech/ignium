@@ -18,11 +18,15 @@ use crate::error;
 // 说明:extern 声明**仅用于取符号地址**((&raw const X).addr(),
 // 不形成引用),从不解引用该 extern 本身;后续的扫描用裸指针
 // volatile 逐字节读,无类型化读的 provenance 问题(pro 审计 max #5)。
+// D7:陷阱/idle 栈为 per-hart 数组(每槽 stride 32K = 16K 守护 + 16K 栈),
+// 只登记数组边界;槽界由 stride 计算(见 current_stack_bounds)。
 extern "C" {
     static _stack_bottom: u8;
     static _stack_top: u8;
-    static _trap_stack_bottom: u8;
+    static _trap_stack_base: u8;
     static _trap_stack_top: u8;
+    static _idle_stack_base: u8;
+    static _idle_stack_top: u8;
 }
 
 /// 双 panic 保护:第一次进入置位;第二次(panic 中再 panic)直接停机。
@@ -41,6 +45,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         arch::halt()
     }
     arch::irq_disable();
+    // D9:进入 panic 输出模式 —— 之后 uart::write_str 放弃 CONSOLE_LOCK
+    // 直接裸写(panic 可能打断正持锁的主上下文,取锁必然死锁)。
+    crate::uart::set_panic_output();
     error!("KERNEL PANIC");
     match info.location() {
         Some(l) => error!("location: {}:{}:{}", l.file(), l.line(), l.column()),
@@ -54,21 +61,44 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// 返回栈区物理边界 `(bottom, top)`;sp 不在任何已知栈时返回 None
 /// (LOW-2:不默认回退 boot 栈,水位标记 unknown,防误导诊断)。
 ///
-/// panic 可能发生在两个栈上:主上下文(引导栈)或 trap_handler
-/// (陷阱栈)。水位扫描必须针对**当前栈**,否则会得到误导性结果
-/// (pro 审计 max #6:旧实现只扫引导栈,陷阱栈 panic 时报 0 已用)。
+/// panic 可能发生在三类栈上:主上下文(引导栈)、trap_handler(陷阱栈
+/// per-hart 数组)或副核 idle 上下文(idle 栈 per-hart 数组)。水位扫描
+/// 必须针对**当前栈**,否则会得到误导性结果(pro 审计 max #6)。
+///
+/// D7 多核:陷阱/idle 均为 per-hart 数组(linker.ld),每槽 stride 32K =
+/// 16K 守护 + 16K 栈,栈区 = `[槽底+16K, 槽底+32K)`。**守护页部分不扫**
+/// (未映射,panic 期间读它自己会触发故障)。
 fn current_stack_bounds(sp: usize) -> Option<(usize, usize)> {
     let boot_bottom = (&raw const _stack_bottom).addr();
     let boot_top = (&raw const _stack_top).addr();
-    let trap_bottom = (&raw const _trap_stack_bottom).addr();
-    let trap_top = (&raw const _trap_stack_top).addr();
-    if sp >= trap_bottom && sp < trap_top {
-        Some((trap_bottom, trap_top))
-    } else if sp >= boot_bottom && sp < boot_top {
-        Some((boot_bottom, boot_top))
-    } else {
-        None
+    if sp >= boot_bottom && sp < boot_top {
+        return Some((boot_bottom, boot_top));
     }
+    let stride = crate::arch::TRAP_STRIDE;
+    let guard = crate::arch::TRAP_GUARD;
+    // per-hart 数组:sp 落在任一槽的**栈区**即命中(只扫栈区,不扫守护)。
+    let arrays = [
+        (
+            (&raw const _trap_stack_base).addr(),
+            (&raw const _trap_stack_top).addr(),
+        ),
+        (
+            (&raw const _idle_stack_base).addr(),
+            (&raw const _idle_stack_top).addr(),
+        ),
+    ];
+    for (base, top) in arrays {
+        let mut slot = base;
+        while slot < top {
+            let stack_bottom = slot + guard;
+            let stack_top = slot + stride;
+            if sp >= stack_bottom && sp < stack_top {
+                return Some((stack_bottom, stack_top));
+            }
+            slot += stride;
+        }
+    }
+    None
 }
 
 /// 计算栈水位 = 栈顶到"最深被使用字节"的距离(字节)。

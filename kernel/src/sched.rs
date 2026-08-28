@@ -1053,8 +1053,9 @@ pub fn exit() -> ! {
 /// uptime/抢占全停,系统停在 label `4` 的 wfi 死循环)。
 ///
 /// 正确做法:把 target(当前 `ctx_valid`)的协作上下文**展开为陷阱帧**,
-/// 返回帧指针交给 trap/恢复路径 `sret`(恢复路径执行
-/// `csrw sscratch, _trap_stack_top` 重置),等价完成切换且不留残留。
+/// 返回帧指针交给 trap/恢复路径 `sret`(恢复路径 D7 起按 sscratch 回读
+/// 帧基址 +TRAP_FRAME_SIZE 重置回**当前 hart 槽顶**,见 riscv64.S),
+/// 等价完成切换且不留残留。
 ///
 /// # 线程语义
 /// - 当前线程(cur)标记 `Exited`、槽位入 `free_slots`、栈移交 reaper;

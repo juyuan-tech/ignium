@@ -15,6 +15,8 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 mod arch;
 mod board;
 mod cpu;
@@ -46,6 +48,41 @@ global_asm!(include_str!("entry.S"));
 #[unsafe(link_section = ".data")]
 pub static mut BOOT_LOCK: u32 = 0;
 
+/// D8:boot hart 发布的 satp 值(副核从 Bare 切换进同一 Sv39 身份映射)。
+/// **必须放 .data**:副核在 BSS 清零之后才读它,但保持与 BOOT_RELEASE
+/// 同区域(镜像加载即就绪)以统一发布语义。
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".data")]
+pub static mut BOOT_SATP: u64 = 0;
+
+/// D8:副核唤醒发布标志(1 = satp 已发布,可引导)。**必须放 .data**:
+/// 副核 park 循环在 BSS 未清时就开始轮询本标志,若落 .bss 会读到
+/// 垃圾值误引导(CRITICAL,同 BOOT_LOCK 语义)。
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".data")]
+pub static mut BOOT_RELEASE: u32 = 0;
+
+/// D8:已进入 `secondary_main` 的副核数(不含 boot hart)。
+static HARTS_ONLINE: AtomicUsize = AtomicUsize::new(0);
+
+/// 副核进入 idle 后调用(`secondary_main` 内;Relaxed 足够,仅计数)。
+fn mark_online() {
+    HARTS_ONLINE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 已上线副核数(不含 boot hart)。
+fn harts_online() -> usize {
+    HARTS_ONLINE.load(Ordering::Relaxed)
+}
+
+/// 发布序屏障(boot hart 发布 BOOT_SATP/BOOT_RELEASE 时使用)。
+#[inline]
+fn fence_rw() {
+    unsafe {
+        core::arch::asm!("fence rw, rw", options(nostack));
+    }
+}
+
 /// 内核主入口,由 `_start`(src/entry.S)以 C ABI 调用,永不返回。
 ///
 /// # 参数
@@ -75,7 +112,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     arch::irq_disable();
     arch::sanitize_csr();
     uart::init();
-    arch::init_traps();
+    // D7:per-hart 陷阱栈 —— 传当前 hartid(boot hart 由 OpenSBI a0 传入)。
+    arch::init_traps(hartid);
     arch::enable_timer();
     crate::logger::set_level(crate::logger::Level::Info);
     info!("Ignium 炬元微内核 v{} booting", env!("CARGO_PKG_VERSION"));
@@ -137,6 +175,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     // M2 引导期冒烟测试(T1 用户态 + T1.5 每进程地址空间,定义与说明
     // 见 tests.rs)。置于 irq_enable 之前,隔离定时器中断干扰。
     tests::boot_tests();
+    // D8:唤醒副核。放 boot_tests 之后(单核确定性不受扰)与
+    // irq_enable 之前(副核上线即 idle 停等,不开中断不影响其引导)。
+    wake_secondaries(hartid);
     // 性能基线(启动时打印,供后续优化对比)。
     heap::bench();
     sched::bench();
@@ -162,5 +203,93 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
             // (u64 千年量级)也不会触发 panic(pro 审计 max #10)。
             info!("uptime: {} ticks ({} ms)", t, t.saturating_mul(10));
         }
+    }
+}
+
+/// D8:唤醒副核(boot_tests 之后、irq_enable 之前调用)。
+///
+/// 发布顺序(副核 park 循环依赖,见 entry.S):
+///   写 BOOT_SATP → fence rw,rw → 写 BOOT_RELEASE=1 → fence rw,rw
+///   → 对每个副核 `sbi_hsm_hart_start(h, _start, S, h)`。
+///
+/// **启动机制**:QEMU + OpenSBI 下副核 warm boot 后停在其 HSM 状态机的
+/// `sbi_hsm_hart_wait`(STOPPED → 等 START_PENDING = 2 的 wfi 循环),**不会**
+/// 自动进入内核 `_start`。载荷必须用 SBI HSM `hart_start` 显式启动每个副核
+/// (与 Linux 多核引导协议一致)。副核被启动后从 Bare 进入 `_start`,输掉
+/// BOOT_LOCK 仲裁后 park 轮询 BOOT_RELEASE;发布标志就绪后载入 satp 进入
+/// 同一 Sv39 身份映射,设 per-hart idle 栈/陷阱栈,进入 secondary_main 并
+/// mark_online。boot hart 有界自旋等全部副核上线,再打 T3a banner。
+///
+/// 在线核数 = FDT cpu@* 节点数(board::cpu_count)∩ MAX_HARTS。
+/// SBI HSM 不可用/出错时回退:副核 park 循环仍会轮询 BOOT_RELEASE(若
+/// OpenSBI 自行释放则仍可达标;实测 QEMU 上必须 HSM 显式启动)。
+fn wake_secondaries(boot_hartid: usize) {
+    let expected = board::cpu_count().min(arch::MAX_HARTS);
+    if expected <= 1 {
+        info!("M2 T3a: multi-core boot ok ({} harts online)", 1);
+        return;
+    }
+    unsafe {
+        // 发布 satp(mmu::init 已把本核切到 Sv39 身份映射;副核从
+        // Bare 载入同一值 + sfence.vma 进入同一地址空间)。
+        BOOT_SATP = mmu::satp() as u64;
+    }
+    fence_rw();
+    unsafe {
+        BOOT_RELEASE = 1;
+    }
+    fence_rw();
+    // 逐个显式启动副核(HSM 状态机:STOPPED → START_PENDING → 唤醒跳转
+    // _start,a0 = hartid)。**跳过 boot hart 自身**(已在运行,启动会报
+    // SBI_ERR_INVALID_STATE);其余核含 hart 0(实测 boot hart 不一定是 0)。
+    // 失败仅告警:副核仍轮询 BOOT_RELEASE。
+    let start_addr = board::kernel_start_addr();
+    for h in 0..expected {
+        if h == boot_hartid {
+            continue;
+        }
+        let rc = crate::sbi::hsm_hart_start(h, start_addr, 0, h);
+        if rc != 0 {
+            warn!("SBI hsm_hart_start(hart {h}) failed (rc=0x{rc:x}); it polls BOOT_RELEASE");
+        }
+    }
+    // 有界自旋等全部副核上线(mark_online;无定时器,纯轮询)。
+    let mut spins = 0u64;
+    while harts_online() + 1 < expected {
+        spins += 1;
+        if spins > 50_000_000 {
+            panic!(
+                "M2 T3a: timed out waiting for {expected} harts online (got {})",
+                harts_online() + 1
+            );
+        }
+    }
+    info!(
+        "M2 T3a: multi-core boot ok ({} harts online)",
+        harts_online() + 1
+    );
+}
+
+/// D8:副核主入口(entry.S `boot_done` 以 C ABI 调用,a0 = hartid)。
+///
+/// T3a 副核**无定时器、无调度器**:共享调度器的 `on_tick` 会把自身帧
+/// 写进 `s.current`(boot hart 的线程)TCB,破坏调度状态,故副核绝不
+/// `enable_timer`、绝不进入共享调度器路径。只做最小初始化进 idle 停等
+/// (T3b 加每核 timer + per-CPU 调度)。
+#[unsafe(no_mangle)]
+pub extern "C" fn secondary_main(hartid: usize) -> ! {
+    arch::irq_disable();
+    arch::sanitize_csr();
+    arch::init_traps(hartid);
+    // "hart N online" 用 locked_line 整行原子打印(三个副核同时上线,
+    // D9 try_lock 在争用下会字符交错;boot 期 SIE 全关,阻塞锁安全)。
+    crate::uart::locked_line(|| info!("hart {hartid} online"));
+    // mark_online **在打印之后**:boot hart 的等待循环以本计数为
+    // 上线信号,只有全部副核打印完并归 idle 后,boot hart 才打印
+    // T3a banner(独占输出 → banner 行原子,test-smp 断言可靠)。
+    mark_online();
+    // idle 停等:SIE 保持关闭、无定时器 → wfi 永不被唤醒,等效停等。
+    loop {
+        arch::wait_for_interrupt();
     }
 }
