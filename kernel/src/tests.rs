@@ -1,11 +1,11 @@
-//! 引导期冒烟测试(M2 T1 / T1.5 / T2a)。
+//! 引导期冒烟测试(M2 T1 / T1.5 / T2a / T2b)。
 //!
 //! # 定位
-//! 集中放置启动自检(用户态线程 + 每进程地址空间 + 同步 IPC/能力表),
-//! 使 `main.rs` 聚焦于初始化顺序本身,不被测试逻辑淹没。测试在
-//! `kernel_main` 的 init 顺序末尾、`irq_enable` **之前**执行(隔离定时器
-//! 中断干扰,保证确定性)。IPC 测试依赖 syscall 分发与调度器阻塞/唤醒
-//! 原语,均已在 init 中就绪。
+//! 集中放置启动自检(用户态线程 + 每进程地址空间 + 同步 IPC/能力表 +
+//! IPC 压力),使 `main.rs` 聚焦于初始化顺序本身,不被测试逻辑淹没。
+//! 测试在 `kernel_main` 的 init 顺序末尾、`irq_enable` **之前**执行
+//! (隔离定时器中断干扰,保证确定性)。IPC 测试依赖 syscall 分发与
+//! 调度器阻塞/唤醒原语,均已在 init 中就绪。
 //!
 //! # 约束
 //! - 零依赖顺序(各测试彼此独立、只依赖 init 已完成);
@@ -17,6 +17,8 @@
 //! `.github/workflows/ci.yml` 用 `grep -q` 断言其存在 —— 新增测试必须
 //! **同步**三处 grep 列表,否则本地过、CI 挂。
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use crate::info;
 
 /// 运行全部引导期冒烟测试(M2)。
@@ -27,6 +29,7 @@ pub fn boot_tests() {
     boot_user_thread_test();
     boot_process_addrspace_test();
     boot_ipc_test();
+    boot_ipc_stress_test();
 }
 
 /// M2 T1:用户态线程 + ecall 冒烟。
@@ -368,3 +371,112 @@ fn map_iso_proc(root: usize, prog: &[u32]) -> (usize, usize) {
     }
     (code_pa, shared_pa)
 }
+
+/// M2 T2b:IPC 压力测试 —— `STRESS_R` 次 send/recv 配对(内核线程环)。
+///
+/// 两个**内核**线程(`spawn_owned` 挂到进程 pa/pb)交替 send/recv,每次
+/// NoPeer 路径登记捐赠、配对完成撤销捐赠 —— 捐赠机制随配对一并受压。
+/// 场景:
+/// - sender(send `[BASE+i,0,0,0,0]`,NoPeer → block_current);
+/// - recver(recv,Done 直取或 NoPeer → block → `take_ipc_msg` 取消息),
+///   校验 `m[0]==BASE+i` 并累加和。
+///
+/// 用内核线程而非手工汇编用户程序:避免 T2a 的编码错误风险,且覆盖
+/// `Thread.ipc_msg`/`take_ipc_msg`(内核线程收消息路径)。断言:配对数
+/// 到齐、消息和 == 等差数列和(无丢失无损坏;顺序由 pending FIFO 保证)、
+/// 捐赠表配对后清空。
+fn boot_ipc_stress_test() {
+    let pa = crate::process::create().expect("stress: create pa");
+    let pb = crate::process::create().expect("stress: create pb");
+    assert!(
+        crate::process::grant_cap(pa, 0, pb).is_ok(),
+        "stress: grant cap(pa,0,pb)"
+    );
+    assert!(
+        crate::process::grant_cap(pb, 0, pa).is_ok(),
+        "stress: grant cap(pb,0,pa)"
+    );
+    STRESS_PA.store(pa, Ordering::Relaxed);
+    STRESS_PB.store(pb, Ordering::Relaxed);
+    STRESS_RECV_COUNT.store(0, Ordering::Relaxed);
+    STRESS_RECV_SUM.store(0, Ordering::Relaxed);
+    STRESS_SENDER_DONE.store(false, Ordering::Relaxed);
+    STRESS_RECVER_DONE.store(false, Ordering::Relaxed);
+    crate::sched::spawn_owned(stress_sender, crate::sched::PRIO_HIGH, pa);
+    crate::sched::spawn_owned(stress_recver, crate::sched::PRIO_HIGH, pb);
+    // 协作轮询直至双方完成(超时守卫;boot 期 SIE=0,无抢占)。
+    let mut guard = 0;
+    while (!STRESS_SENDER_DONE.load(Ordering::Relaxed)
+        || !STRESS_RECVER_DONE.load(Ordering::Relaxed))
+        && guard < 2_000_000
+    {
+        crate::sched::yield_();
+        guard += 1;
+    }
+    if !STRESS_SENDER_DONE.load(Ordering::Relaxed) || !STRESS_RECVER_DONE.load(Ordering::Relaxed) {
+        panic!(
+            "IPC stress timeout: count={} sum={:#x}",
+            STRESS_RECV_COUNT.load(Ordering::Relaxed),
+            STRESS_RECV_SUM.load(Ordering::Relaxed)
+        );
+    }
+    let count = STRESS_RECV_COUNT.load(Ordering::Relaxed);
+    let sum = STRESS_RECV_SUM.load(Ordering::Relaxed);
+    let expect_sum = STRESS_R * STRESS_BASE + STRESS_R * (STRESS_R - 1) / 2;
+    assert!(count == STRESS_R, "IPC stress: count {count} != {STRESS_R}");
+    assert!(
+        sum == expect_sum,
+        "IPC stress: sum {sum:#x} != {expect_sum:#x}"
+    );
+    assert!(
+        crate::sched::donation_count() == 0,
+        "IPC stress: donations not drained after pairing"
+    );
+    info!("M2 T2b: IPC stress ok ({STRESS_R} pairings, sum ok)");
+}
+
+/// M2 T2b:压力发送线程 —— 顺序发 `[BASE+i,0,0,0,0]`;NoPeer → 阻塞。
+fn stress_sender() {
+    let pa = STRESS_PA.load(Ordering::Relaxed);
+    for i in 0..STRESS_R {
+        match crate::ipc::send(pa, 0, [STRESS_BASE + i, 0, 0, 0, 0]) {
+            Ok(crate::ipc::SendBlock::Done) => {}
+            Ok(crate::ipc::SendBlock::NoPeer) => crate::sched::block_current(),
+            Err(e) => panic!("stress sender: send {i} err {e:#x}"),
+        }
+    }
+    STRESS_SENDER_DONE.store(true, Ordering::Relaxed);
+}
+
+/// M2 T2b:压力接收线程 —— 顺序 recv;Done 直取,NoPeer → 阻塞后经
+/// `take_ipc_msg` 取内核线程消息;校验消息号并累加和。
+fn stress_recver() {
+    let pb = STRESS_PB.load(Ordering::Relaxed);
+    for i in 0..STRESS_R {
+        let m = match crate::ipc::recv(pb, 0) {
+            Ok(crate::ipc::RecvBlock::Done(m)) => m,
+            Ok(crate::ipc::RecvBlock::NoPeer) => {
+                crate::sched::block_current();
+                crate::sched::take_ipc_msg().expect("stress recver: no msg")
+            }
+            Err(e) => panic!("stress recver: recv {i} err {e:#x}"),
+        };
+        if m[0] != STRESS_BASE + i {
+            panic!("stress recver: msg {i} corrupt {:#x}", m[0]);
+        }
+        STRESS_RECV_COUNT.fetch_add(1, Ordering::Relaxed);
+        STRESS_RECV_SUM.fetch_add(m[0], Ordering::Relaxed);
+    }
+    STRESS_RECVER_DONE.store(true, Ordering::Relaxed);
+}
+
+/// 压力测试配对次数。
+const STRESS_R: usize = 1000;
+/// 消息序列基数(消息 0 号 = STRESS_BASE)。
+const STRESS_BASE: usize = 0x1000;
+static STRESS_PA: AtomicUsize = AtomicUsize::new(0);
+static STRESS_PB: AtomicUsize = AtomicUsize::new(0);
+static STRESS_RECV_COUNT: AtomicUsize = AtomicUsize::new(0);
+static STRESS_RECV_SUM: AtomicUsize = AtomicUsize::new(0);
+static STRESS_SENDER_DONE: AtomicBool = AtomicBool::new(false);
+static STRESS_RECVER_DONE: AtomicBool = AtomicBool::new(false);

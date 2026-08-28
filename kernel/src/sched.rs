@@ -52,11 +52,13 @@ const SLICE_TICKS: u64 = 10;
 /// 死锁;容量在 init 一次性预留)。
 const MAX_THREADS: usize = 64;
 /// 优先级级数。
-const PRIO_LEVELS: usize = 2;
+const PRIO_LEVELS: usize = 3;
 /// 高优先级。
 pub const PRIO_HIGH: u8 = 0;
+/// 中优先级(M2 T2b:构造确定性优先级反转测试 —— HIGH 阻塞 / MED 饿死 LOW)。
+pub const PRIO_MED: u8 = 1;
 /// 低优先级。
-pub const PRIO_LOW: u8 = 1;
+pub const PRIO_LOW: u8 = 2;
 
 /// 陷阱帧槽位(与 riscv64.S/riscv64.rs 一致)。
 /// CRITICAL-1:必须等于 arch::TRAP_FRAME_WORDS(36)= 31 GPR + 4 CSR
@@ -103,6 +105,11 @@ struct Thread {
     /// C5(审计 15 轮):唤醒标志 —— wake 无条件置位,block_current
     /// 消费;覆盖"唤醒早于阻塞"的窗口,防丢失唤醒。
     woken: bool,
+    /// M2 T2b:IPC 唤醒时投递的消息(内核线程路径)。
+    /// 用户线程经 frame_restore 读 TCB 帧取消息;内核线程经
+    /// `block_current` 恢复(ctx,读不到帧)—— 由本字段中转,
+    /// `take_ipc_msg()` 读取即清。None = 无待取消息。
+    ipc_msg: Option<[usize; crate::ipc::MSG_WORDS]>,
     /// M2 T1.5:所属进程(None = 内核线程,运行于内核根表)。
     /// M2 T2a:IPC 能力查表经 `current_proc()` 读取。
     proc: Option<usize>,
@@ -117,11 +124,31 @@ struct Thread {
     stack: Option<KernelStack>,
 }
 
+/// M2 T2b(PIP):优先级捐赠 —— donor 阻塞在 IPC 时,把其**有效优先级**
+/// 捐赠给期望的对方进程 `peer_proc` 的所有线程;配对完成(wake)时撤销。
+///
+/// 语义(经典 PIP):持资源的 LOW 进程线程临时继承等待方(HIGH)优先级,
+/// 从而能抢占中间优先级的忙循环、完成配对、唤醒等待方 —— 否则等待方
+/// 被中间优先级饿死(优先级反转)。`prio` 存 donor 的有效优先级(可能
+/// 已被其他捐赠抬升 → 自然支持近似链式)。每线程至多一处 IPC 阻塞,
+/// 故表上限 = 线程上限。
+struct Donation {
+    donor_tid: usize,
+    peer_proc: usize,
+    prio: u8,
+}
+
+/// 捐赠表容量上限(与线程上限一致;每线程至多一处 IPC 阻塞)。
+const MAX_DONATIONS: usize = MAX_THREADS;
+
 /// 调度器。
 struct Scheduler {
     threads: Vec<Thread>,
-    /// 就绪队列(按优先级)。
+    /// 就绪队列(按**有效**优先级 —— 捐赠经 `enqueue` 的 eff_prio 生效)。
     ready: [VecDeque<usize>; PRIO_LEVELS],
+    /// M2 T2b(PIP):优先级捐赠表(见 `Donation`)。ISR(on_tick)只读扫描,
+    /// 变更仅在外路径(阻塞/唤醒);容量 init 预留,零分配。
+    donations: Vec<Donation>,
     /// 当前线程 id。
     current: usize,
     /// idle 线程 id(最低优先级,永不阻塞)。
@@ -250,11 +277,108 @@ impl Scheduler {
         }
     }
 
-    /// 把线程加入就绪队列。
+    /// 把线程加入就绪队列。按**有效优先级**选队:捐赠(见 `Donation`)
+    /// 可临时抬升所属进程线程的优先级,spawn/spawn_user/requeue 一律
+    /// 经本函数 → 捐赠对"晚 spawn 的接收方"也自动生效。
     fn enqueue(&mut self, id: usize) {
-        let prio = self.threads[id].prio as usize;
+        let prio = self.eff_prio(id) as usize;
         self.ready[prio].push_back(id);
         self.threads[id].state = ThreadState::Ready;
+    }
+
+    /// M2 T2b(PIP):线程 `id` 的**有效优先级** = 自然优先级与所有指向其
+    /// 所属进程的捐赠取最小(数值小 = 优先级高)。捐赠表为固定小表
+    /// (≤ MAX_THREADS),ISR(on_tick)可只读线性扫描,零分配。
+    fn eff_prio(&self, id: usize) -> u8 {
+        let mut p = self.threads[id].prio;
+        if let Some(proc) = self.threads[id].proc {
+            for d in &self.donations {
+                if d.peer_proc == proc && d.prio < p {
+                    p = d.prio;
+                }
+            }
+        }
+        p
+    }
+
+    /// M2 T2b(PIP):把进程 `proc` 的所有**就绪**线程按有效优先级重排
+    /// 队列。捐赠注册(抬升)或撤销(回落)后调用,使队列反映新优先级。
+    ///
+    /// 不触碰 `woken`:抬升线程的抢占资格由其恢复机制决定(新线程
+    /// frame_valid、IPC 配对唤醒的 ctx 线程经协作路径选中),若在此置
+    /// woken 会造成**陈旧 woken** —— IPC 的 recv/send 在 `block_current`
+    /// 之前已登记 pending,block_current 一旦消费陈旧 woken 而跳过阻塞,
+    /// 该 pending 即成孤儿(M6「良性虚假继续」仅适用于互斥/条件循环的
+    /// 重查重等,不适用于 IPC 的原子"登记+阻塞")。
+    fn requeue_proc_threads(&mut self, proc: usize) {
+        // 栈数组收集:本函数只在外路径调用(非 ISR),容量固定,零堆分配。
+        // 从**任意**就绪队列移除该进程全部就绪线程(可能散布于不同
+        // 优先队列),再逐个按有效优先级 enqueue 重排 —— 抬升(注册)
+        // 与回落(撤销)都正确。
+        let mut buf = [0usize; MAX_THREADS];
+        let mut n = 0usize;
+        for q in self.ready.iter_mut() {
+            q.retain(|&id| {
+                if self.threads[id].proc == Some(proc) {
+                    if n < MAX_THREADS {
+                        buf[n] = id;
+                        n += 1;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for &id in buf.iter().take(n) {
+            self.enqueue(id);
+        }
+    }
+
+    /// M2 T2b(PIP):注册捐赠 —— donor(阻塞于 IPC,有效优先级 `prio`)把
+    /// 其优先级捐赠给期望对方进程 `peer_proc` 的所有线程。同 donor
+    /// 去重(每线程至多一处 IPC 阻塞)。随后把 peer 进程就绪线程按新
+    /// 有效优先级重排。
+    fn register_donation(&mut self, donor_tid: usize, peer_proc: usize) {
+        let prio = self.eff_prio(donor_tid);
+        let mut exists = false;
+        for d in self.donations.iter_mut() {
+            if d.donor_tid == donor_tid {
+                d.peer_proc = peer_proc;
+                d.prio = prio;
+                exists = true;
+                break;
+            }
+        }
+        if !exists && self.donations.len() < MAX_DONATIONS {
+            self.donations.push(Donation {
+                donor_tid,
+                peer_proc,
+                prio,
+            });
+        }
+        self.requeue_proc_threads(peer_proc);
+    }
+
+    /// M2 T2b(PIP):撤销 donor 的全部捐赠(配对完成 wake 时调用)。受影响
+    /// 的 peer 进程按自然优先级回落重排。
+    fn revoke_donations(&mut self, donor_tid: usize) {
+        let mut affected = [0usize; MAX_THREADS];
+        let mut n = 0usize;
+        self.donations.retain(|d| {
+            if d.donor_tid == donor_tid {
+                if n < MAX_THREADS && !affected[..n].contains(&d.peer_proc) {
+                    affected[n] = d.peer_proc;
+                    n += 1;
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for &proc in affected.iter().take(n) {
+            self.requeue_proc_threads(proc);
+        }
     }
 
     /// 从就绪队列撤销一个线程(block_current 的"已唤醒则继续"路径)。
@@ -288,7 +412,10 @@ impl Scheduler {
         self.ticks_run = self.ticks_run.wrapping_add(1);
         if self.ticks_run < SLICE_TICKS {
             // 时间片未到:仅当更高优先级就绪(可抢占)才抢占。
-            let cur_prio = self.threads[self.current].prio as usize;
+            // M2 T2b(PIP):用**有效**优先级判断当前线程 —— 被捐赠抬升的
+            // 线程(如持资源的 LOW 进程线程)在继承 HIGH 期间,中间优先级
+            // 不得抢占它(否则 PIP 失效:抬升了还是被 MED 打断)。
+            let cur_prio = self.eff_prio(self.current) as usize;
             // P2(本轮性能):当前线程已是最高优先级(0)时,更高优先级
             // 扫描范围 `0..cur_prio` 必然为空 → higher 恒 false ——
             // 直接早退,省掉最常见的无抢占路径(tick 内)的就绪队列
@@ -445,6 +572,7 @@ impl Scheduler {
             root: crate::mmu::kernel_root(),
             entry,
             stack: Some(stack),
+            ipc_msg: None,
         };
         if id < self.threads.len() {
             // 复用已退出线程的槽
@@ -514,6 +642,7 @@ impl Scheduler {
             entry: user_entry_stub,
             // 用户线程无内核栈(其 trap 用全局陷阱栈)。
             stack: None,
+            ipc_msg: None,
         };
         if id < self.threads.len() {
             self.threads[id] = t;
@@ -528,7 +657,8 @@ impl Scheduler {
 /// 调度器单例(SpinLock:主上下文/ISR 均不可重入)。
 static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     threads: Vec::new(),
-    ready: [VecDeque::new(), VecDeque::new()],
+    ready: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+    donations: Vec::new(),
     current: 0,
     idle: 0,
     ticks_run: 0,
@@ -584,12 +714,13 @@ pub fn init() {
     s.reaper.reserve(MAX_THREADS);
     s.threads.reserve(MAX_THREADS);
     s.free_slots.reserve(MAX_THREADS); // M2 T0:退出槽复用
-                                       // idle 线程:id=0,最低优先级,永不阻塞。
-                                       // V4(外部审计 LOW,文档说明):idle 实际运行在**引导栈**
-                                       // (kernel_main 的 idle 循环),此处分配的 16 KiB 线程栈与
-                                       // `ctx.ra=idle_entry` 仅为 M3 回退占位 —— 一旦 idle 首次参与
-                                       // 协作切换,其 ctx 会被真实引导栈上下文覆盖,idle_entry 永不可达。
-                                       // 该占位栈在内核生命周期内不回收(微小浪费,换取结构统一)。
+    s.donations.reserve(MAX_DONATIONS); // M2 T2b(PIP):捐赠表
+                                        // idle 线程:id=0,最低优先级,永不阻塞。
+                                        // V4(外部审计 LOW,文档说明):idle 实际运行在**引导栈**
+                                        // (kernel_main 的 idle 循环),此处分配的 16 KiB 线程栈与
+                                        // `ctx.ra=idle_entry` 仅为 M3 回退占位 —— 一旦 idle 首次参与
+                                        // 协作切换,其 ctx 会被真实引导栈上下文覆盖,idle_entry 永不可达。
+                                        // 该占位栈在内核生命周期内不回收(微小浪费,换取结构统一)。
     let idle_id = 0;
     let stack = alloc_free_stack();
     let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
@@ -615,6 +746,7 @@ pub fn init() {
         root: crate::mmu::kernel_root(),
         entry: idle_entry,
         stack: Some(stack),
+        ipc_msg: None,
     });
     s.current = idle_id;
     s.idle = idle_id;
@@ -642,6 +774,63 @@ pub fn spawn_user(proc_id: usize, entry_pc: usize, stack_top: usize, prio: u8) -
     };
     arch::irq_restore(irq);
     id
+}
+
+/// M2 T2b(PIP):新建**内核线程但挂到进程 `proc_id`**(proc=Some,root=
+/// kernel_root)。供捐赠目标/PIP 与 IPC 压力测试使用;进程的**用户**
+/// 线程仍须经 `spawn_user` 才有用户根表。
+pub fn spawn_owned(entry: fn(), prio: u8, proc_id: usize) -> usize {
+    let irq = arch::irq_save();
+    let id = {
+        let mut s = SCHED.lock();
+        // 复用 spawn 内核线程路径,随后把所属进程改写为 proc_id。
+        let id = s.spawn(entry, prio);
+        s.threads[id].proc = Some(proc_id);
+        // spawn-later 命中:若已有指向该进程的活跃捐赠,按有效优先级
+        // 重排队列(新线程在 s.spawn 内已按自然优先级入队)。
+        if s.donations.iter().any(|d| d.peer_proc == proc_id) {
+            s.requeue_proc_threads(proc_id);
+        }
+        id
+    };
+    arch::irq_restore(irq);
+    id
+}
+
+/// M2 T2b(PIP):阻塞前登记捐赠 —— donor(阻塞于 IPC,`peer_proc` 为期望
+/// 对方进程)把其有效优先级捐赠给对方进程线程。调用点:ipc.rs 的 send/
+/// recv NoPeer 分支(IPC 锁已释放后、block 前,无调度点)。
+pub fn donate_on_block(donor_tid: usize, peer_proc: usize) {
+    let irq = arch::irq_save();
+    {
+        let mut s = SCHED.lock();
+        s.register_donation(donor_tid, peer_proc);
+    }
+    arch::irq_restore(irq);
+}
+
+/// M2 T2b:当前(内核)线程读取 IPC 唤醒时投递的消息,读取即清。
+/// 用户线程经 frame_restore 读 TCB 帧取消息,不走本函数。
+pub fn take_ipc_msg() -> Option<[usize; crate::ipc::MSG_WORDS]> {
+    let irq = arch::irq_save();
+    let msg = {
+        let mut s = SCHED.lock();
+        let id = s.current;
+        s.threads[id].ipc_msg.take()
+    };
+    arch::irq_restore(irq);
+    msg
+}
+
+/// M2 T2b(PIP):当前活跃捐赠数(测试断言用:配对完成应全部撤销)。
+pub fn donation_count() -> usize {
+    let irq = arch::irq_save();
+    let n = {
+        let s = SCHED.lock();
+        s.donations.len()
+    };
+    arch::irq_restore(irq);
+    n
 }
 
 /// 协作让出 CPU。
@@ -766,8 +955,19 @@ pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
             }
         }
         t.frame[FRAME_SEPC] += 4;
+        // M2 T2b:内核线程读不到帧 → 消息经 ipc_msg 中转(take_ipc_msg)。
+        t.ipc_msg = msg.map(|m| {
+            let mut buf = [0usize; crate::ipc::MSG_WORDS];
+            let n = m.len().min(crate::ipc::MSG_WORDS);
+            for (i, w) in m.iter().take(n).enumerate() {
+                buf[i] = *w;
+            }
+            buf
+        });
     }
     s.enqueue(tid);
+    // M2 T2b(PIP):配对完成,撤销本线程此前登记的全部捐赠(peer 回落)。
+    s.revoke_donations(tid);
     drop(s);
     arch::irq_restore(irq);
 }
@@ -1123,6 +1323,67 @@ pub fn self_test() -> Result<(), &'static str> {
     }
     info!("M2 T2a: woken-thread preemption ok (D22)");
 
+    // 7) M2 T2b(PIP)回归:优先级继承。场景(确定性反转):
+    // - H(spawn_owned→H_proc,HIGH):recv → NoPeer(捐赠 H→L_proc 注册)→
+    //   block_current;被 L 唤醒后 take_ipc_msg 校验消息。
+    // - L(spawn_owned→L_proc,LOW):忙循环 3 tick 后 send → 配对 H。
+    // - M(spawn,MED):忙循环 50 tick —— 制造中间优先级,饿死未抬升的 LOW。
+    // PIP 生效:L 的线程临时继承 H 的优先级(HIGH)先于 M 运行,完成配对、
+    // 唤醒 H(H 完成 tick < M 完成 tick);否则 L 滞留 LOW 被 M 饿死,H 永不
+    // 完成 → 超时失败。阶段 2 纯自旋不 yield(同第 6 项:排除协作路径假阳性)。
+    let h_proc = crate::process::create().expect("PIP: create H proc");
+    let l_proc = crate::process::create().expect("PIP: create L proc");
+    crate::process::grant_cap(h_proc, 0, l_proc).expect("PIP: H cap");
+    crate::process::grant_cap(l_proc, 0, h_proc).expect("PIP: L cap");
+    PIP_H_PROC.store(h_proc, Ordering::Relaxed);
+    PIP_L_PROC.store(l_proc, Ordering::Relaxed);
+    PIP_H_BLOCKED.store(false, Ordering::Relaxed);
+    PIP_H_MSG_OK.store(false, Ordering::Relaxed);
+    PIP_H_DONE.store(false, Ordering::Relaxed);
+    PIP_L_DONE.store(false, Ordering::Relaxed);
+    PIP_M_DONE.store(false, Ordering::Relaxed);
+    spawn_owned(test_pip_high, PRIO_HIGH, h_proc);
+    // 阶段 1:等 H 阻塞(捐赠已注册,但 L/M 尚未 spawn)。
+    guard = 0;
+    while !PIP_H_BLOCKED.load(Ordering::Relaxed) && guard < 200_000 {
+        yield_();
+        guard += 1;
+    }
+    if !PIP_H_BLOCKED.load(Ordering::Relaxed) {
+        return Err("PIP: high thread did not block");
+    }
+    spawn_owned(test_pip_low, PRIO_LOW, l_proc);
+    spawn(test_pip_med, PRIO_MED);
+    // 阶段 2:纯自旋不 yield(机制同第 6 项;本上下文 idle 在自检期 SIE=0,
+    // 须显式开中断让定时器推进,否则自旋独占 CPU,L/M 永不运行)。
+    crate::arch::irq_enable();
+    let t7 = crate::logger::tick();
+    while (!PIP_H_DONE.load(Ordering::Relaxed)
+        || !PIP_L_DONE.load(Ordering::Relaxed)
+        || !PIP_M_DONE.load(Ordering::Relaxed))
+        && crate::logger::tick().wrapping_sub(t7) < PIP_TIMEOUT_TICKS
+    {
+        core::hint::spin_loop();
+    }
+    if !PIP_H_DONE.load(Ordering::Relaxed)
+        || !PIP_L_DONE.load(Ordering::Relaxed)
+        || !PIP_M_DONE.load(Ordering::Relaxed)
+    {
+        return Err("PIP: timeout (priority inversion?)");
+    }
+    if !PIP_H_MSG_OK.load(Ordering::Relaxed) {
+        return Err("PIP: message integrity");
+    }
+    let pip_h_tick = PIP_H_TICK.load(Ordering::Relaxed);
+    let pip_m_done = PIP_M_DONE_TICK.load(Ordering::Relaxed);
+    if pip_h_tick >= pip_m_done {
+        return Err("PIP: low holder did not run before med (no inheritance)");
+    }
+    if donation_count() != 0 {
+        return Err("PIP: donations not drained after pairing");
+    }
+    info!("M2 T2b: priority inheritance ok (PIP)");
+
     Ok(())
 }
 
@@ -1216,6 +1477,54 @@ fn test_d22_low() {
     D22_LOW_DONE.store(true, Ordering::Relaxed);
 }
 
+/// M2 T2b(PIP)回归:HIGH 接收方线程。
+/// 先 recv → NoPeer(登记捐赠 H→L_proc)→ 置已阻塞标志 → block_current。
+/// 被 L 唤醒后经 `take_ipc_msg` 取消息(内核线程路径,读帧不可见)、校验,
+/// 记录完成 tick 与完整性标志。
+fn test_pip_high() {
+    let pid = PIP_H_PROC.load(Ordering::Relaxed);
+    match crate::ipc::recv(pid, 0) {
+        Ok(crate::ipc::RecvBlock::NoPeer) => {}
+        other => panic!("PIP: H recv unexpected {other:?}"),
+    }
+    PIP_H_BLOCKED.store(true, Ordering::Relaxed);
+    block_current();
+    let m = take_ipc_msg().expect("PIP: H no ipc_msg");
+    if m[0] == PIP_MAGIC {
+        PIP_H_MSG_OK.store(true, Ordering::Relaxed);
+    }
+    PIP_H_TICK.store(crate::logger::tick() as usize, Ordering::Relaxed);
+    PIP_H_DONE.store(true, Ordering::Relaxed);
+}
+
+/// M2 T2b(PIP)回归:LOW 持资源方线程(被捐赠抬升到 HIGH)。
+/// 忙循环 3 tick(制造被 M 饿死的时间窗)后 send → 配对 H 的 pending
+/// recv → Done。send 完即完成(配对即唤醒 H,捐赠在唤醒时撤销)。
+fn test_pip_low() {
+    let pid = PIP_L_PROC.load(Ordering::Relaxed);
+    let s0 = crate::logger::tick();
+    while crate::logger::tick().wrapping_sub(s0) < PIP_L_BUSY_TICKS {
+        PIP_L_BUSY.fetch_add(1, Ordering::Relaxed); // 忙循环(防优化掉)
+    }
+    match crate::ipc::send(pid, 0, [PIP_MAGIC, 0, 0, 0, 0]) {
+        Ok(crate::ipc::SendBlock::Done) => {}
+        other => panic!("PIP: L send unexpected {other:?}"),
+    }
+    PIP_L_DONE.store(true, Ordering::Relaxed);
+}
+
+/// M2 T2b(PIP)回归:MED 忙循环线程 —— 制造优先级反转场景(无 PIP 时
+/// 饿死 LOW 持资源方)。运行 PIP_M_TICKS 个 tick 后记录完成 tick。
+fn test_pip_med() {
+    let s0 = crate::logger::tick();
+    PIP_M_START.store(s0 as usize, Ordering::Relaxed);
+    while crate::logger::tick().wrapping_sub(s0) < PIP_M_TICKS {
+        PIP_M_BUSY.fetch_add(1, Ordering::Relaxed); // 忙循环(防优化掉)
+    }
+    PIP_M_DONE_TICK.store(crate::logger::tick() as usize, Ordering::Relaxed);
+    PIP_M_DONE.store(true, Ordering::Relaxed);
+}
+
 static TEST_CTR: AtomicUsize = AtomicUsize::new(0);
 static TEST_DONE: AtomicBool = AtomicBool::new(false);
 static TEST_BUSY: AtomicUsize = AtomicUsize::new(0);
@@ -1242,6 +1551,29 @@ static D22_H_RAN: AtomicBool = AtomicBool::new(false);
 static D22_H_TICK: AtomicUsize = AtomicUsize::new(0);
 static D22_LOW_DONE: AtomicBool = AtomicBool::new(false);
 static D22_LOW_DONE_TICK: AtomicUsize = AtomicUsize::new(0);
+
+// ===== M2 T2b(PIP)回归参数与标志 =====
+
+/// 消息魔数(H 校验收到的消息)。
+const PIP_MAGIC: usize = 0x5050_494d; // "PIPM"
+/// LOW 持资源方忙循环时长(tick),之后 send 配对。
+const PIP_L_BUSY_TICKS: u64 = 3;
+/// MED 忙循环时长(tick) —— 制造中间优先级饿死 LOW 的时间窗。
+const PIP_M_TICKS: u64 = 50;
+/// 阶段 2 纯自旋等待超时(tick;M 跑满 50 + L 3 + H 1 + 调度开销)。
+const PIP_TIMEOUT_TICKS: u64 = 300;
+static PIP_H_PROC: AtomicUsize = AtomicUsize::new(0);
+static PIP_L_PROC: AtomicUsize = AtomicUsize::new(0);
+static PIP_H_BLOCKED: AtomicBool = AtomicBool::new(false);
+static PIP_H_MSG_OK: AtomicBool = AtomicBool::new(false);
+static PIP_H_DONE: AtomicBool = AtomicBool::new(false);
+static PIP_H_TICK: AtomicUsize = AtomicUsize::new(0);
+static PIP_L_BUSY: AtomicUsize = AtomicUsize::new(0);
+static PIP_L_DONE: AtomicBool = AtomicBool::new(false);
+static PIP_M_START: AtomicUsize = AtomicUsize::new(0);
+static PIP_M_BUSY: AtomicUsize = AtomicUsize::new(0);
+static PIP_M_DONE: AtomicBool = AtomicBool::new(false);
+static PIP_M_DONE_TICK: AtomicUsize = AtomicUsize::new(0);
 
 // ===== 性能基线(上下文切换) =====
 

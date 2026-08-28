@@ -82,7 +82,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)
 │   │   ├── panic.rs        # panic:位置/消息/CPU dump/栈水位/双 panic 保护
 │   │   ├── process.rs      # 进程与每进程独立地址空间(M2 T1.5:id → satp 根表)+ 简化能力表(T2a:grant_cap/cap_target)
-│   │   ├── ipc.rs          # 同步 IPC(M2 T2a:寄存器消息 5 字 + 阻塞配对 + 能力授权,未授权 → -errno)
+│   │   ├── ipc.rs          # 同步 IPC(M2 T2a/T2b:寄存器消息 5 字 + 阻塞配对 + 能力授权,未授权 → -errno;NoPeer 阻塞前登记 PIP 捐赠)
 │   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
@@ -121,7 +121,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 
 ## 路线
 
-见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓ / M2 T1 ✓ / M2 T2a ✓**(同步 IPC 核心:寄存器消息 + 阻塞配对 + 简化能力表 + D22 woken 抢占),下一步 **M2 T2b(优先级继承/压力测试)**。
+见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓ / M2 T1 ✓ / M2 T2a ✓ / M2 T2b ✓**(同步 IPC 核心 + 简化能力表 + D22 woken 抢占 + **优先级继承 PIP + IPC 压力测试**),下一步 **M2 T3(共享内存大消息/revoke)**。
 
 ## 里程碑
 
@@ -130,7 +130,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 | M0 ✓ | QEMU 启动 + UART 打印 |
 | M1 ✓ | trap/定时器/内存管理/分页/内核堆/调度/同步原语 |
 | M1.5 ✓ | FDT 解析/页权限拆分/栈守护页/RVA23 P1/压力自检/页表接口补全 |
-| M2 | 用户进程 + IPC + 能力(T1 ✓:用户态线程 + ecall;T2a ✓:同步 IPC 核心 + 能力表 + D22 抢占) |
+| M2 | 用户进程 + IPC + 能力(T1 ✓:用户态线程 + ecall;T2a ✓:同步 IPC 核心 + 能力表 + D22 抢占;T2b ✓:优先级继承 PIP + IPC 压力测试) |
 | M3 | 用户态服务 + shell |
 | M4 | 健壮性/测试 + OpenHarmony 组件移植 |
 | M5 | x86_64 移植 |

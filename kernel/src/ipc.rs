@@ -1,4 +1,5 @@
-//! 同步 IPC(M2 T2a):寄存器消息 + 阻塞配对 + 简化能力表授权。
+//! 同步 IPC(M2 T2a/T2b):寄存器消息 + 阻塞配对 + 简化能力表授权 +
+//! 优先级继承(PIP)。
 //!
 //! # ABI(M2-DESIGN §4.1 / L1)
 //! - `syscall 3 = ipc_send(a0=cap slot, a1..a5=消息 5 字)`;成功返回 a0=0;
@@ -26,6 +27,12 @@
 //! 返回 `NoPeer`(已登记 pending)与调用方(`syscall::handle`)经
 //! `block_user_from_trap` 阻塞之间**无调度点**:单核、trap 上下文中断关闭,
 //! 期间无其他线程运行,登记不丢、配对不丢。
+//!
+//! # 优先级继承(PIP,M2 T2b)
+//! NoPeer 分支阻塞前经 `sched::donate_on_block` 登记捐赠:发送方把期望
+//! 的接收方进程抬到自身有效优先级(接收方对称)。被捐赠进程的线程得以
+//! 抢占中间优先级忙循环、完成配对;配对完成(wake)时 `ipc_wake_with_msg`
+//! 撤销捐赠。锁序不变:捐赠注册在 IPC 锁释放后、阻塞前(无调度点)。
 
 use alloc::collections::VecDeque;
 
@@ -133,6 +140,11 @@ pub fn send(pid: usize, slot: usize, msg: [usize; MSG_WORDS]) -> Result<SendBloc
         msg,
     });
     drop(ipc);
+    // M2 T2b(PIP):阻塞前登记捐赠 —— 把期望的接收方进程 `dst` 的所有
+    // 线程抬到本发送方有效优先级,使其能抢占中间优先级忙循环来 recv
+    // 配对(否则低优先接收方被饿死 → 本发送方永久阻塞,优先级反转)。
+    // 在 IPC 锁释放后、调用方阻塞前调用:无调度点,原子性保持。
+    crate::sched::donate_on_block(tid, dst);
     Ok(SendBlock::NoPeer)
 }
 
@@ -168,5 +180,8 @@ pub fn recv(pid: usize, slot: usize) -> Result<RecvBlock, usize> {
         src_pid: src,
     });
     drop(ipc);
+    // M2 T2b(PIP):对称捐赠 —— 把期望的发送方进程 `src` 的线程抬到本
+    // 接收方有效优先级,使其能抢占中间优先级忙循环来 send 配对。
+    crate::sched::donate_on_block(tid, src);
     Ok(RecvBlock::NoPeer)
 }

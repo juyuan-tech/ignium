@@ -40,6 +40,8 @@ jobs:
           grep -q "M2: per-process address space ok" /tmp/ignium-ci.log
           grep -q "M2 T2a: sync IPC ok" /tmp/ignium-ci.log
           grep -q "M2 T2a: woken-thread preemption ok" /tmp/ignium-ci.log
+          grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-ci.log
+          grep -q "M2 T2b: IPC stress ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
       # V3 审计 #11:多核引导仲裁回归测试纳入 CI。
@@ -80,5 +82,7 @@ jobs:
           grep -q "M2: per-process address space ok" /tmp/ignium-rva23.log
           grep -q "M2 T2a: sync IPC ok" /tmp/ignium-rva23.log
           grep -q "M2 T2a: woken-thread preemption ok" /tmp/ignium-rva23.log
+          grep -q "M2 T2b: priority inheritance ok" /tmp/ignium-rva23.log
+          grep -q "M2 T2b: IPC stress ok" /tmp/ignium-rva23.log
           test "$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log
