@@ -21,6 +21,11 @@
 //! - **同步**:调度器自身在 IRQ 安全 SpinLock(MED-3)保护下运行;
 //!   ISR 路径(on_tick)零分配(容量预留)、零日志,只做帧复制与
 //!   就绪队列出/入队(抢占决定在 `on_tick` 中完成)。
+//! - **每进程地址空间(M2 T1.5)**:Thread 携带 `root`(本线程应运行的
+//!   satp 根表:内核线程 = 内核根表,用户线程 = 所属进程根表)。
+//!   `do_switch`/`on_tick` 在切换前经 `mmu::switch_root` 切换 satp
+//!   (与当前相同则 no-op);用户线程恒走 frame_restore(sret),切换点
+//!   在 Rust 侧(汇编恢复路径不碰 satp,见 riscv64.S)。
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -92,6 +97,13 @@ struct Thread {
     /// C5(审计 15 轮):唤醒标志 —— wake 无条件置位,block_current
     /// 消费;覆盖"唤醒早于阻塞"的窗口,防丢失唤醒。
     woken: bool,
+    /// M2 T1.5:所属进程(None = 内核线程,运行于内核根表)。
+    #[allow(dead_code)] // M2 T2 能力表/每进程生命周期(销毁)使用
+    proc: Option<usize>,
+    /// M2 T1.5:本线程应运行的 satp 根表(内核线程 = kernel_root,
+    /// 用户线程 = 所属进程根表)。**缓存到 Thread**(非切换时查进程表),
+    /// 使 ISR 路径(on_tick)零分配读根表。
+    root: usize,
     /// 线程入口(thread_entry 经 id 查表调用)。
     entry: fn(),
     /// 线程栈(Box:栈内存来自内核堆)。
@@ -312,6 +324,10 @@ impl Scheduler {
             return frame;
         }
         self.current = next;
+        // M2 T1.5:抢占切换到 next 线程的 satp 根表(相同则 no-op)。
+        // 必须在返回帧指针、汇编 sret 之前完成 —— 恢复路径汇编不碰
+        // satp;此处仅 CSR 读写 + sfence,ISR 内零分配、零日志。
+        crate::mmu::switch_root(self.threads[next].root);
         // 注意:恢复目标 next 不置 ctx_valid —— 其 ctx 陈旧(自上次
         // yield 后未更新;审计 17 轮自审发现:置有效会让协作路径用
         // 陈旧 ctx 切换它,复现旧程序点)。它经帧恢复后,下次
@@ -371,6 +387,9 @@ impl Scheduler {
             // 初始 ctx 有效(thread_entry 首启),可被协作切换选中。
             ctx_valid: true,
             woken: false,
+            // 内核线程:不属任何进程,运行于内核根表。
+            proc: None,
+            root: crate::mmu::kernel_root(),
             entry,
             stack: Some(stack),
         };
@@ -387,10 +406,11 @@ impl Scheduler {
 
     /// M2 T1:新建**用户态**线程(执行 U 模式代码,经 ecall 进内核)。
     ///
-    /// `entry_pc` 必须指向用户可执行(U 位)的虚拟地址;`stack_top` 为
-    /// 用户栈顶(用户可访问)。该线程**始终经 frame_restore(sret)恢复**:
+    /// `proc_id` 为该线程所属进程(决定其地址空间根表);`entry_pc` 必须
+    /// 指向该进程根表内用户可执行(U 位)的虚拟地址;`stack_top` 为用户
+    /// 栈顶(用户可访问)。该线程**始终经 frame_restore(sret)恢复**:
     /// ctx_valid 恒 false,因此协作选中也走帧恢复 → U 模式保持。
-    fn spawn_user(&mut self, entry_pc: usize, stack_top: usize, prio: u8) -> usize {
+    fn spawn_user(&mut self, proc_id: usize, entry_pc: usize, stack_top: usize, prio: u8) -> usize {
         // M2 T0:同 spawn,优先复用已退出线程的 TCB 槽。
         let reuse = self.free_slots.pop_front();
         let id = match reuse {
@@ -405,6 +425,10 @@ impl Scheduler {
         };
         // MED-10(审计 15 轮):优先级越界钳制,防就绪队列越界 panic。
         let prio = prio.min(PRIO_LEVELS as u8 - 1);
+        // M2 T1.5:取所属进程的地址空间根表(缓存进 Thread,供
+        // do_switch/on_tick 切换 satp 用)。无效 pid 由 process::root
+        // panic(fail-loudly)。
+        let root = crate::process::root(proc_id);
         // 初始帧:sepc = 用户代码入口;SPIE=1(进 U 后开中断)、
         // **SPP=0 → sret 进入 U 模式**(与内核线程 S 模式不同);
         // sp = 用户栈顶;gp = 0(用户程序不用内核 gp)。
@@ -431,6 +455,8 @@ impl Scheduler {
             // 用户线程只经帧恢复(U 模式),协作选中亦走 frame_restore。
             ctx_valid: false,
             woken: false,
+            proc: Some(proc_id),
+            root,
             // 占位:用户不经过 thread_entry(S 模式包装);进入即错误。
             entry: user_entry_stub,
             // 用户线程无内核栈(其 trap 用全局陷阱栈)。
@@ -531,6 +557,9 @@ pub fn init() {
         frame_valid: false,
         ctx_valid: true,
         woken: false,
+        // idle 为内核线程:运行于内核根表。
+        proc: None,
+        root: crate::mmu::kernel_root(),
         entry: idle_entry,
         stack: Some(stack),
     });
@@ -550,13 +579,13 @@ pub fn spawn(entry: fn(), prio: u8) -> usize {
     id
 }
 
-/// M2 T1:新建用户态线程(`entry_pc` 为用户可执行虚拟地址,`stack_top`
-/// 为用户栈顶;二者须已按 U 权限映射到当前内核页表)。
-pub fn spawn_user(entry_pc: usize, stack_top: usize, prio: u8) -> usize {
+/// M2 T1:新建用户态线程(`proc_id` 为所属进程,`entry_pc`/`stack_top`
+/// 为用户可执行虚拟地址/用户栈顶;二者须已按 U 权限映射到该进程根表)。
+pub fn spawn_user(proc_id: usize, entry_pc: usize, stack_top: usize, prio: u8) -> usize {
     let irq = arch::irq_save();
     let id = {
         let mut s = SCHED.lock();
-        s.spawn_user(entry_pc, stack_top, prio)
+        s.spawn_user(proc_id, entry_pc, stack_top, prio)
     };
     arch::irq_restore(irq);
     id
@@ -782,6 +811,8 @@ struct SwitchTarget {
     new_ctx: *const Context,
     new_frame: *mut usize,
     use_frame: bool,
+    /// M2 T1.5:目标线程应运行的 satp 根表(do_switch 切换前启用)。
+    next_root: usize,
 }
 
 /// 锁内构造切换目标(审计 17 轮):恢复机制按选中者的有效数据选择
@@ -798,11 +829,17 @@ fn switch_target(s: &mut Scheduler, cur: usize, next: usize) -> SwitchTarget {
         new_ctx,
         new_frame,
         use_frame,
+        // M2 T1.5:目标线程的 satp 根表(切换前启用)。
+        next_root: s.threads[next].root,
     }
 }
 
 /// 锁外切换(中断关闭保证原子性)。
 fn do_switch(t: &SwitchTarget) {
+    // M2 T1.5:切到目标线程的 satp 根表(与当前相同则 no-op)。
+    // frame_restore/context_switch 汇编均不碰 satp,必须在此 Rust 侧
+    // 切换 —— switch_root 仅 CSR 读写 + sfence,ISR 内零分配。
+    crate::mmu::switch_root(t.next_root);
     if t.use_frame {
         // C2:frame_restore 内部先保存 old_ctx 再帧恢复,防上下文丢失。
         unsafe { arch::frame_restore(t.new_frame, t.old_ctx) }

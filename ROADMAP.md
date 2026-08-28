@@ -54,14 +54,14 @@ VisionFive 2)→ 烧录 → 串口/调试器 bring-up → 按 board.rs 抽象换
 
 ## 阶段 2:微内核骨架(M2)★ 最难阶段 —— 进行中
 
-> **当前进度:T0 ✓ / T1 ✓ → 下一步 T2(IPC)**;实现顺序见
-> `docs/M2-DESIGN.md` §9(T0 地基 → T1 U/S → T2 IPC → T3 完善)。
+> **当前进度:T0 ✓ / T1 ✓(含每进程地址空间与 D20)→ 下一步 T2(IPC)**;
+> 实现顺序见 `docs/M2-DESIGN.md` §9(T0 地基 → T1 U/S → T2 IPC → T3 完善)。
 > 设计先行,已落地前置:用户页清零 D10、页表用户映射契约、
 > 线程 TCB 槽复用;D22 woken 抢占随 M2 调度器落地。
 
 | 任务 | 产出/验收 |
 |---|---|---|
-| U/S 特权级 + 每进程地址空间 | 🔶 **部分完成**:U/S 特权级 ✓(T1:用户线程 U 模式取指、ecall 往返、sys_get_ticks/sys_exit);**每进程地址空间(独立 satp)+ 用户栈守护页(D20)** 待 T1 剩余/T2 |
+| U/S 特权级 + 每进程地址空间 | ✅ 完成:U/S 特权级(T1:用户线程 U 模式取指、ecall 往返、sys_get_ticks/sys_exit);**每进程独立地址空间(T1.5:独立 satp 根表 + 切换 + 双进程同 VA 隔离)** + **用户栈守护页(D20)** |
 | 系统调用机制 + **L1 ABI 定义(对齐 LiteOS-A 风格)** | ✅ a7 传 syscall 号、a0 返回值(L1 占位:sys_get_ticks/sys_exit),sys_write/open 待实现 |
 | 进程管理:创建/退出/wait | ✅ spawn_user(用户态线程创建)+ exit_from_trap(用户线程退出,正确帧切换) |
 | ELF 加载器(RISC-V) | 独立编译程序可运行 |

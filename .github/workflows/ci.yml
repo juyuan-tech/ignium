@@ -36,6 +36,7 @@ jobs:
           grep -q "kernel heap selftest ok" /tmp/ignium-ci.log
           grep -q "scheduler selftest ok" /tmp/ignium-ci.log
           grep -q "sync primitives selftest ok" /tmp/ignium-ci.log
+          grep -q "M2: per-process address space ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
       # V3 审计 #11:多核引导仲裁回归测试纳入 CI。

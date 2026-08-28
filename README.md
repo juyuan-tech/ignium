@@ -81,12 +81,13 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── entry.S         # _start:SIE 清零/gp 初始化/副核停车/清 BSS/设栈/早期 trap stub
 │   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)
 │   │   ├── panic.rs        # panic:位置/消息/CPU dump/栈水位/双 panic 保护
+│   │   ├── process.rs      # 进程与每进程独立地址空间(M2 T1.5:id → satp 根表,create/root)
 │   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
-│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ M2 用户映射(map_user_page)
+│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ M2 用户映射 + 每进程根表(create_user_root/switch_root/is_mapped)
 │   │   ├── heap.rs         # 内核堆(slab 16B..2KB + buddy 页路径,#[global_allocator])
-│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程)
+│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程 + 每进程 satp 切换)
 │   │   ├── syscall.rs      # 用户态系统调用分发(M2 T1:a7 传号、a0 返回,GET_TICKS/EXIT)
 │   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
 │   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret/context_switch)

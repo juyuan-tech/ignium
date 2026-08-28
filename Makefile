@@ -57,6 +57,7 @@ test: build
 		&& grep -q "kernel heap selftest ok" /tmp/ignium-test.log \
 		&& grep -q "scheduler selftest ok" /tmp/ignium-test.log \
 		&& grep -q "sync primitives selftest ok" /tmp/ignium-test.log \
+		&& grep -q "M2: per-process address space ok" /tmp/ignium-test.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-test.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
 		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)
@@ -88,6 +89,7 @@ test-rva23: build-rva23
 		&& grep -q "kernel heap selftest ok" /tmp/ignium-rva23.log \
 		&& grep -q "scheduler selftest ok" /tmp/ignium-rva23.log \
 		&& grep -q "sync primitives selftest ok" /tmp/ignium-rva23.log \
+		&& grep -q "M2: per-process address space ok" /tmp/ignium-rva23.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log \
 		&& echo "RVA23 TEST PASS" || (echo "RVA23 TEST FAIL"; cat /tmp/ignium-rva23.log; exit 1)

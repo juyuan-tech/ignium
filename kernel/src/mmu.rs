@@ -272,6 +272,18 @@ pub fn init() {
     KERNEL_ROOT.store(root, Ordering::Relaxed);
     unsafe { mem::zero_page(root) };
 
+    // 内核区映射(M2 T1.5 抽为独立函数,init 与每进程根表共用)。
+    map_kernel_region(root);
+    enable(root);
+    debug!("satp switched to Sv39, root={:#x}", root);
+}
+
+/// 在给定根表上建立**内核驻留区**映射(固件/镜像/堆栈/MMIO/UART)。
+///
+/// `init` 用它在内核根表建立身份映射;每进程根表(M2 T1.5)同样调用
+/// 它复制内核区(S 权限,U=0),实现 M2-DESIGN §3.2 的"内核驻留区
+/// 共享、用户区页级隔离"。调用方须保证 `root` 已清零。
+fn map_kernel_region(root: usize) {
     let ram_start = crate::board::ram_start();
     let ram_end = crate::board::ram_end();
     assert!(
@@ -340,9 +352,64 @@ pub fn init() {
     // UART MMIO:4KB RW + A/D(无 X)。
     let uart_base = crate::board::uart_base();
     map_4k(root, uart_base, uart_base, PTE_LEAF_RW).expect("UART MMIO mapping failed");
+}
 
-    enable(root);
-    debug!("satp switched to Sv39, root={:#x}", root);
+/// 创建**用户进程**的独立地址空间根表(M2 T1.5)。
+///
+/// - 分配 1 个清零页作根表;
+/// - 复制内核驻留区映射(见 `map_kernel_region`,S 权限 U=0);
+/// - **不写 satp**:根表在调度器切到该进程线程时经 `switch_root` 启用。
+///
+/// 返回根表物理地址,供 `map_user_page` 映射用户页与调度器切换。
+/// 调用方(process::create)须在 irq_save 下调用(建表含分配/写页表)。
+pub fn create_user_root() -> Result<usize, ()> {
+    let root = mem::alloc_pages(0).ok_or(())?;
+    unsafe { mem::zero_page(root) };
+    map_kernel_region(root);
+    Ok(root)
+}
+
+/// 切换到指定根表(每进程地址空间切换用)。
+///
+/// 与当前 satp 相同则 **no-op**(零开销:频繁切换同进程线程时不无谓
+/// 冲刷 TLB);不同则写 satp + 全量 `sfence.vma`。身份映射下内核区
+/// 地址不变,切换根表不影响当前指令流/栈访问。
+///
+/// ISR 内可用:仅 CSR 读写 + sfence,无分配、无锁。
+pub fn switch_root(root_paddr: usize) {
+    let target = SATP_MODE_SV39 | (root_paddr >> 12);
+    if satp() == target {
+        return;
+    }
+    enable(root_paddr);
+}
+
+/// 只读检查 `vaddr` 在 `root` 下是否已映射(M2 T1.5 结构性校验用)。
+///
+/// 从根表逐级走查(L2→L1→L0),各级缺失/叶子早退,**不分配、不发
+/// TLB 刷新**。中间级叶子(1GB/2MB 超页)视为已映射。
+pub fn is_mapped(root: usize, vaddr: usize) -> bool {
+    let l2 = (vaddr >> 30) & 0x1FF;
+    let l1 = (vaddr >> 21) & 0x1FF;
+    let l0 = (vaddr >> 12) & 0x1FF;
+    let root_t = root as *const u64;
+    let e2 = pte_read(root_t, l2);
+    if e2 & PTE_V == 0 {
+        return false;
+    }
+    if e2 & (PTE_R | PTE_W | PTE_X) != 0 {
+        return true; // L2 叶子(1GB 超页)
+    }
+    let l1_t = (((e2 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as *const u64;
+    let e1 = pte_read(l1_t, l1);
+    if e1 & PTE_V == 0 {
+        return false;
+    }
+    if e1 & (PTE_R | PTE_W | PTE_X) != 0 {
+        return true; // L1 叶子(2MB 超页)
+    }
+    let l0_t = (((e1 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as *const u64;
+    pte_read(l0_t, l0) & PTE_V != 0
 }
 
 /// 映射 [start, end) 4KB 对齐区域,每页调用 map_4k。
