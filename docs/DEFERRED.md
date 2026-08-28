@@ -3,34 +3,41 @@
 集中登记审计/自审中**确认但不立即实施**的项目。每项含:来源、状态、
 触发条件。**"已记录就不算遗忘"** —— 新发现一律先登记再讨论。
 
-## 当前登记
+状态约定:`待办`(未启动)/ `已实现`(落地,注明位置)/ `已关闭`(被替代或无需再做)。
+
+## 待办(未启动)
 
 | # | 项目 | 来源 | 触发条件 | 状态 |
 |---|---|---|---|---|
 | D1 | 中断快速路径(仅保存调用者保存寄存器) | 自审优化报告 | M2 调度器之前 | 待办 |
-| D2 | 页权限拆分(代码 RX / 数据 RW,现整体 RWX) | 多次审计 | M1.5 | **已实现**(审计 18 轮):mmu.rs 内核镜像按段拆分(代码 RX / 只读数据 R / 可写数据 RW),堆/栈区域 RW(无 X) |
-| D3 | 分配器加锁 | 审计 HIGH-1(12 轮):SpinLock 已包装分配器;审计 17 轮 MED-3 完成 **IRQ 安全变体**(加锁保存/恢复 SIE);剩余 = ISR 分配策略(由 D11 容量预留兜底) | 调度器里程碑 | **已实现** |
-| D4 | 栈守护页(boot/trap 栈) | 审计多轮 | M1.5(MMU 已就绪) | **已实现**(审计 18 轮):linker.ld 插入 4KB guard 页,mmu::init 中 unmap,栈溢出→页故障 |
-| D5 | FDT 解析(RAM/UART/时钟频率/保留区实际大小) | 审计 M4/多轮 | M1.5 | **已实现**(审计 18 轮):kernel/src/fdt.rs 最小解析器,提取 RAM/定时器频率/UART/保留区;board.rs 运行时参数化 |
-| D6 | 板级常量 FDT 化(board.rs 为唯一落点) | 审计 11 轮 M4 | 随 D5 | **已实现**(审计 18 轮):board.rs 由编译期常量改为运行时函数,回退默认值 |
 | D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前(M2) | 待办:陷阱栈从全局单栈改为 per-hart 数组(按 hartid/tp 索引),sscratch 指向 per-hart 栈顶 |
 | D8 | 副核唤醒与多核 bring-up | 自审/ROADMAP | M2+ | 待办:引导者(仲裁赢家)在初始化完成后通过 SBI IPI 或 HSM 扩展唤醒副核;副核从 park 进入内核(初始化 per-hart 陷阱栈后加入调度) |
 | D9 | 控制台输出锁(多核防交错) | uart.rs 注释 | 多核唤醒前(M2) | 待办:Wrap uart::putc in SpinLock,防止多核同时输出在串口上交错 |
+| D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办:用户进程故障应杀进程而非整机停机(ROADMAP M2 已列,见阶段 2「用户态异常恢复」) |
+| D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办:接口形态见 mmu.rs 模块头;x86_64 移植时下沉为 arch::mmu |
+| D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | **P1 已实现**(审计 18 轮):Makefile test-rva23 目标 + CI rva23 job;cpu.rs 模块(ISA 诊断输出);扩展编译+`-cpu max` 冒烟通过。P2/P3 待 M2/M2+ |
+| D18 | early_trap 最小诊断输出(真机 bring-up 期 UART 未就绪时静默停机,审计 17 轮 INFO-4;文档化为 bring-up 风险,真机适配时落实) | 审计 17 轮 INFO-4 | 真机 bring-up | 待办 |
 | D19 | 多核调度器支持 | 审计 18 轮 | M2+ | 待办:per-CPU 空闲线程/idle 循环、per-CPU 就绪队列(或全局锁+迁移)、线程亲和性;当前 SCHED 全局锁在单核下正确,多核下可工作但不缩放 |
 | D20 | 线程栈守护页(堆分配 16KB 无 guard) | 审计 V3 M1 | M2(每进程地址空间) | 待办:线程栈越界→静默破坏相邻堆内存;boot/trap 栈已有 guard(D4)。运行期 sp 水位检测不可靠(idle 实际跑引导栈会误报),M2 用户态按进程地址空间天然隔离 |
 | D21 | UART 波特率分频按 FDT clock-frequency 计算 | 审计多轮 pro #6 | 真机 bring-up 前(不属 M1.5:M1.5 全部 QEMU 内) | 待办:当前固定分频 0x0C(QEMU 忽略);读串口节点 clock-frequency,分频 = clk/(16×波特率) |
-| D22 | woken 高优先级线程的抢占(V4 审计 HIGH):on_tick 只认 frame_valid,被唤醒线程(ctx_valid-only)无法被定时器抢占 → 低优忙循环可长时间饿死高优 | 审计 V4 HIGH | M2(IPC 依赖 wake 驱动抢占) | 待办:需要"唤醒即触发抢占"或 ISR 内 ctx 切换(与 D1 中断快速路径协同设计);当前单核内核态无显式暴露 |
+| D22 | woken 高优先级线程的抢占(V4 审计 HIGH):on_tick 只认 frame_valid,被唤醒线程(ctx_valid-only)无法被定时器抢占 → 低优忙循环可长时间饿死高优 | 审计 V4 HIGH | M2(IPC 依赖 wake 驱动抢占) | 待办:需要"唤醒即触发抢占"或 ISR 内 ctx 切换(与 D1 中断快速路径协同设计);当前单核内核态无显式暴露。M2 IPC(优先级继承)强依赖 |
 | D23 | 早期 UART 用硬编码基址(V4 MED):uart::init 在 FDT 解析前写默认 0x10000000,真机若不在该址会误写无关 MMIO | 审计 V4 MED | 真机 bring-up 前 | 待办:真机须先解析 FDT(或经 SBI 调试控制台)再驱动 UART;reinit 对 QEMU 足够 |
 | D24 | FDT 多内存 bank / `#address-cells`/`#size-cells` 变体:当前只取首个 reg 对且仅 2-cell/1-cell | 自审(挑剔视角) | M2/真机 | 待办:多 bank 需 buddy 支持不连续区间;`#cells` 变体(如 3-cell)需按 node 解析 cells 属性 |
-| D10 | 用户页交接前清零(防信息泄漏) | 审计 M4(mem.rs) | M2 用户态 | M2 前置已就绪:mem::alloc_pages_zeroed(整块清零);用户页交接时调用即可 |
-| D11 | ISR 内分配安全(与 D3 配套,防死锁) | 优化报告遗留风险 | 调度器里程碑 | **已实现**(审计 16 轮):就绪队列/reaper/线程 Vec 容量预留(MAX_THREADS=64),ISR 路径零分配;调度器临界区 irq_save/restore;ISR 内仍禁止主动分配(新需求走 D3 IRQ 安全锁) |
-| D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办 |
-| D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办 |
-| D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | **P1 已实现**(审计 18 轮):Makefile test-rva23 目标 + CI rva23 job;cpu.rs 模块(ISA 诊断输出);扩展编译+`-cpu max` 冒烟通过 |
-| D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa;当前无条件用 stimecmp,写读回断言可给出明确诊断) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析已落地,可读取 riscv,isa) | **已实现**(自审 18 轮继续推进):riscv64.rs 增 USE_SSTC 标志 + arm_timer 双路径;enable_timer 首次用 SBI(专不怕 trap),cpu::init_from_fdt 检测 isa 含 sstc 则切 stimecmp |
-| D18 | early_trap 最小诊断输出(真机 bring-up 期 UART 未就绪时静默停机,审计 17 轮 INFO-4;文档化为 bring-up 风险,真机适配时落实) | 审计 17 轮 INFO-4 | 真机 bring-up | 待办 |
 
-## 已关闭(移动到这里)
+## 已实现(落地)
+
+| # | 项目 | 来源 | 触发条件 | 落地位置 |
+|---|---|---|---|---|
+| D2 | 页权限拆分(代码 RX / 数据 RW,现整体 RWX) | 多次审计 | M1.5 | mmu.rs 内核镜像按段拆分(代码 RX / 只读数据 R / 可写数据 RW),堆/栈区域 RW(无 X) |
+| D3 | 分配器加锁 | 审计 HIGH-1(12 轮) | 调度器里程碑 | SpinLock 包装分配器;审计 17 轮 MED-3 完成 **IRQ 安全变体**(加锁保存/恢复 SIE);ISR 分配由 D11 容量预留兜底 |
+| D4 | 栈守护页(boot/trap 栈) | 审计多轮 | M1.5(MMU 已就绪) | linker.ld 插入 4KB guard 页,mmu::init 中 unmap,栈溢出→页故障 |
+| D5 | FDT 解析(RAM/UART/时钟频率/保留区实际大小) | 审计 M4/多轮 | M1.5 | kernel/src/fdt.rs 最小解析器,提取 RAM/定时器频率/UART/保留区;board.rs 运行时参数化 |
+| D6 | 板级常量 FDT 化(board.rs 为唯一落点) | 审计 11 轮 M4 | 随 D5 | board.rs 由编译期常量改为运行时函数,回退默认值 |
+| D10 | 用户页交接前清零(防信息泄漏) | 审计 M4(mem.rs) | M2 用户态 | mem::alloc_pages_zeroed(整块清零);用户页交接(T1 boot 测试)已调用 |
+| D11 | ISR 内分配安全(与 D3 配套,防死锁) | 优化报告遗留风险 | 调度器里程碑 | 就绪队列/reaper/线程 Vec 容量预留(MAX_THREADS=64),ISR 路径零分配;调度器临界区 irq_save/restore |
+| D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析已落地) | riscv64.rs 增 USE_SSTC 标志 + arm_timer 双路径;enable_timer 首次用 SBI(不怕 trap),cpu::init_from_fdt 检测 isa 含 sstc 则切 stimecmp |
+
+## 已关闭(被替代/无需再做)
 
 | # | 项目 | 关闭原因 |
 |---|---|---|
@@ -44,3 +51,4 @@
 
 - 新延迟项先登记后讨论;拒绝"口头已知"。
 - 每轮审计核对本表:已具备触发条件的项目必须启动。
+- 状态变更须同步更新(落地 → 移入「已实现」;不再需要 → 移入「已关闭」)。

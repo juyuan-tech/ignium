@@ -31,6 +31,10 @@ make qemu    # 启动到 QEMU(交互查看)
 make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 ```
 
+> **不想装工具链?** 用仓库内 `.devcontainer/`(Docker)隔离构建/测试:
+> 构建镜像后 `.devcontainer/docker-make.sh test` 即可,宿主机零污染
+> (详见 `.devcontainer/Dockerfile`)。
+
 预期输出:
 
 ```
@@ -80,15 +84,17 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
-│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分:代码RX/数据RW/堆栈RW)
+│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ M2 用户映射(map_user_page)
 │   │   ├── heap.rs         # 内核堆(slab 16B..2KB + buddy 页路径,#[global_allocator])
-│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出)
+│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程)
+│   │   ├── syscall.rs      # 用户态系统调用分发(M2 T1:a7 传号、a0 返回,GET_TICKS/EXIT)
 │   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
 │   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret/context_switch)
 │   ├── build.rs            # 链接脚本绝对路径传递(CARGO_MANIFEST_DIR)
 │   ├── Cargo.toml
 │   └── linker.ld           # 链接脚本(栈独立于镜像,_alloc_start 红线)
-├── scripts/                # 工具(ai_audit.py 外部 AI 审计,密钥不入库)
+├── scripts/                # 工具(ai_audit.py 外部 AI 审计,密钥不入库;用法见 scripts/README.md)
+├── .devcontainer/          # Docker 开发环境(隔离构建/测试,rsproxy 镜像源)
 ├── docs/
 │   ├── DESIGN.md           # 架构设计原则
 │   ├── M2-DESIGN.md        # M2 设计(U/S 切换/ecall ABI/IPC/能力/每进程地址空间)
@@ -121,7 +127,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 | M0 ✓ | QEMU 启动 + UART 打印 |
 | M1 ✓ | trap/定时器/内存管理/分页/内核堆/调度/同步原语 |
 | M1.5 ✓ | FDT 解析/页权限拆分/栈守护页/RVA23 P1/压力自检/页表接口补全 |
-| M2 | 用户进程 + IPC + 能力 |
+| M2 | 用户进程 + IPC + 能力(T1 ✓:用户态线程 + ecall 系统调用) |
 | M3 | 用户态服务 + shell |
 | M4 | 健壮性/测试 + OpenHarmony 组件移植 |
 | M5 | x86_64 移植 |
