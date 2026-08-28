@@ -469,6 +469,14 @@ pub unsafe extern "C" fn trap_handler(
     } else if scause == CAUSE_ECALL_FROM_U {
         // M2 T1:用户态系统调用(U 模式 ecall;S 模式 ecall 由 medeleg
         // 保留给 M,不会回到本向量)。同步异常路径(中断分支已 return)。
+        // S2(本轮安全加固):防御纵深 —— 若 medeleg 被错误配置/改动,
+        // scause=8 也可能来自 S 模式(SPP=1)。内核线程误入用户 syscall
+        // (尤其 EXIT)会破坏调度器状态,拒绝并 fail-loudly。
+        if unsafe { *frame.add(CS_SSTATUS) } & (1 << 8) != 0 {
+            error!("FATAL: ecall from S-mode (SPP=1, sepc={sepc:#x}); refusing user syscall");
+            dump_trap_frame(frame);
+            halt()
+        }
         if unsafe { crate::syscall::handle(frame) } {
             // 用户请求退出:exit_from_trap 在陷阱上下文直接切换,
             // 永不返回(见 sched.rs 该函数注释:必须走帧恢复,否则

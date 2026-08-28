@@ -167,6 +167,13 @@ pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Res
     if !paddr.is_multiple_of(4096) {
         return Err(());
     }
+    // S1(本轮安全加固):只允许映射分配器管理的物理页。内核镜像/
+    // 固件/MMIO/FDT 保留区一旦标 U 位映射,用户态即可读写内核数据
+    // —— 一次调用方失误即内核完全失守。分配器区内的堆/页表页
+    // 与用户页同区,属 T2 页所有权问题,此处先封住非分配器区域。
+    if !crate::mem::page_in_range(paddr) {
+        return Err(());
+    }
     let l2 = (vaddr >> 30) & 0x1FF;
     let l1 = (vaddr >> 21) & 0x1FF;
     let l0 = (vaddr >> 12) & 0x1FF;
@@ -361,8 +368,11 @@ pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
     let l0_t = unsafe { ensure_table(l1_t, l1)? };
     pte_write(l0_t, l0, 0);
     // H2(审计 18 轮外部):unmap 后立即刷新 TLB,防后续访问命中陈旧映射。
+    // P4(本轮性能):unmap 只影响该虚拟地址的映射,用单地址 sfence.vma
+    // (rs1=vaddr,rs2=x0)取代全 TLB 冲刷(rs1=x0) —— 守卫页解映射等
+    // 高频路径不再清空整条 TLB。
     unsafe {
-        asm!("sfence.vma zero, zero", options(nostack));
+        asm!("sfence.vma {}, zero", in(reg) vaddr, options(nostack));
     }
     Ok(())
 }

@@ -255,6 +255,13 @@ impl Scheduler {
         if self.ticks_run < SLICE_TICKS {
             // 时间片未到:仅当更高优先级就绪(帧有效)才抢占。
             let cur_prio = self.threads[self.current].prio as usize;
+            // P2(本轮性能):当前线程已是最高优先级(0)时,更高优先级
+            // 扫描范围 `0..cur_prio` 必然为空 → higher 恒 false ——
+            // 直接早退,省掉最常见的无抢占路径(tick 内)的就绪队列
+            // 扫描。与原始逻辑严格等价(0..0 的 any 恒为 false)。
+            if cur_prio == 0 {
+                return frame;
+            }
             let higher = (0..cur_prio).any(|l| {
                 self.ready[l].iter().any(|&id| {
                     id != self.current

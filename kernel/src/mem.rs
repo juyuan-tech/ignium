@@ -404,6 +404,16 @@ pub fn page_count() -> usize {
     with_allocator(|a| a.real_count)
 }
 
+/// 物理地址是否落在分配器管理区(`[base, base + real_count 页)`)?
+///
+/// M2 用户映射安全加固(S1):只允许把**分配器页**暴露给用户态。
+/// 内核镜像/固件/MMIO/FDT 保留区(均低于 base 或在保留刻蚀内)
+/// 若被标 U 位映射,用户态即可读写内核数据 —— 一次调用方失误
+/// 即内核完全失守。
+pub fn page_in_range(paddr: usize) -> bool {
+    with_allocator(|a| paddr >= a.base && paddr < a.base + a.real_count * PAGE_SIZE)
+}
+
 /// 分配区物理基址(内核堆的页索引换算用)。
 pub fn base() -> usize {
     with_allocator(|a| a.base)
