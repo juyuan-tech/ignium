@@ -46,6 +46,8 @@ jobs:
           grep -q "M2 T3b: per-CPU sched ok" /tmp/ignium-ci.log
           grep -q "M2 T3c: shared mem ok" /tmp/ignium-ci.log
           grep -q "M2 T3c: cap dup/revoke ok" /tmp/ignium-ci.log
+          grep -q "M2: user fault recovery ok" /tmp/ignium-ci.log
+          grep -q "M2: IPC latency ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
       # V3 审计 #11:多核引导仲裁回归测试纳入 CI。
@@ -61,6 +63,8 @@ jobs:
           grep -q "M2 T3b: per-CPU sched ok" /tmp/ignium-smp.log
           grep -q "M2 T3c: shared mem ok" /tmp/ignium-smp.log
           grep -q "M2 T3c: cap dup/revoke ok" /tmp/ignium-smp.log
+          grep -q "M2: user fault recovery ok" /tmp/ignium-smp.log
+          grep -q "M2: IPC latency ok" /tmp/ignium-smp.log
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log
 
   rva23:
@@ -99,5 +103,7 @@ jobs:
           grep -q "M2 T3b: per-CPU sched ok" /tmp/ignium-rva23.log
           grep -q "M2 T3c: shared mem ok" /tmp/ignium-rva23.log
           grep -q "M2 T3c: cap dup/revoke ok" /tmp/ignium-rva23.log
+          grep -q "M2: user fault recovery ok" /tmp/ignium-rva23.log
+          grep -q "M2: IPC latency ok" /tmp/ignium-rva23.log
           test "$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log

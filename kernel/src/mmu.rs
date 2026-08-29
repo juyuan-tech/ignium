@@ -405,6 +405,58 @@ pub fn create_user_root() -> Result<usize, ()> {
     Ok(root)
 }
 
+/// 销毁用户进程地址空间(M2 D12):回收进程自有页与各级页表。
+///
+/// 走查 Sv39 根表并释放**进程自有**页(仅 U=1 的 L0 叶子物理页 + 各级
+/// 表页 + 根页;内核驻留区 U=0 叶子/超页归内核共享 —— 释放会破坏内核
+/// 自身或其它进程,一律跳过)。
+///
+/// # 调用前提
+/// - 当前 satp **不得**指向 `root`(调用方须已 `switch_root(kernel_root())`,
+///   否则释放后取指/访存立即故障);
+/// - 本进程持有的 Shm cap 已先行 revoke(共享页仍 U 映射时释放会
+///   double-free)。
+pub fn destroy_root(root: usize) {
+    let root_t = root as *const u64;
+    for l2 in 0..512 {
+        let e2 = pte_read(root_t, l2);
+        if e2 & PTE_V == 0 {
+            continue;
+        }
+        if e2 & (PTE_R | PTE_W | PTE_X) != 0 {
+            continue; // L2 叶子(1GB 超页)= 内核区,跳过
+        }
+        let l1_pa = (((e2 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as usize;
+        let l1_t = l1_pa as *const u64;
+        for l1 in 0..512 {
+            let e1 = pte_read(l1_t, l1);
+            if e1 & PTE_V == 0 {
+                continue;
+            }
+            if e1 & (PTE_R | PTE_W | PTE_X) != 0 {
+                continue; // L1 叶子(2MB 超页)= 内核区,跳过
+            }
+            let l0_pa = (((e1 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as usize;
+            let l0_t = l0_pa as *const u64;
+            for l0 in 0..512 {
+                let e0 = pte_read(l0_t, l0);
+                if e0 & PTE_V == 0 {
+                    continue;
+                }
+                if e0 & PTE_U != 0 {
+                    // 用户叶子页:进程自有(order-0),归还 buddy。
+                    let pa = (((e0 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as usize;
+                    mem::free_pages(pa).expect("destroy_root: free user page");
+                }
+                // U=0 叶子 = 内核区 4KB 页,归内核共享,跳过。
+            }
+            mem::free_pages(l0_pa).expect("destroy_root: free L0 table");
+        }
+        mem::free_pages(l1_pa).expect("destroy_root: free L1 table");
+    }
+    mem::free_pages(root).expect("destroy_root: free root table");
+}
+
 /// 切换到指定根表(每进程地址空间切换用)。
 ///
 /// 与当前 satp 相同则 **no-op**(零开销:频繁切换同进程线程时不无谓

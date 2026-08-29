@@ -32,6 +32,8 @@ pub fn boot_tests() {
     boot_ipc_stress_test();
     boot_shm_test();
     boot_cap_test();
+    boot_fault_recovery_test();
+    boot_ipc_latency_bench();
 }
 
 /// M2 T1:用户态线程 + ecall 冒烟。
@@ -353,7 +355,9 @@ fn boot_ipc_test() {
 fn map_iso_proc(root: usize, prog: &[u32]) -> (usize, usize) {
     let code_pa = crate::mem::alloc_pages_zeroed(0).expect("iso code page");
     let shared_pa = crate::mem::alloc_pages_zeroed(0).expect("iso shared page");
-    let _stack_lo = crate::mem::alloc_pages_zeroed(0).expect("iso stack guard page");
+    // 栈守护页 = 0x4000_2000 处的**未映射空洞**(D20 语义:溢出越界即页故障),
+    // 无需单独分配 —— 曾有一个从未映射/从未释放的 `_stack_lo` 占位页,
+    // 每进程泄漏 1 页(M2 D12 自审清理)。stack_hi 映射于 0x4000_3000。
     let stack_hi = crate::mem::alloc_pages_zeroed(0).expect("iso stack page");
     assert!(
         crate::mmu::map_user_page(root, 0x4000_0000, code_pa, 0xCB).is_ok(),
@@ -677,6 +681,241 @@ fn boot_cap_test() {
     );
     info!("M2 T3c: cap dup/revoke ok");
 }
+
+// ===== M2 D12:用户态异常恢复(进程故障 → 杀进程) =====
+
+/// M2 D12:用户态故障恢复 —— 进程故障被隔离为"杀进程",系统存活。
+///
+/// 场景:
+/// - 受害者进程 F:spawn 用户线程执行 `lw t0, 0(zero)`(机器码逐条核对:
+///   0x0000_2283 = opcode 0x03(lw) + funct3 010 + rd=t0(x5) + imm=0 →
+///   U 模式读 VA 0(根表未映射)→ scause=0xd 页故障、stval=0、SPP=0);
+///   经 D12 kill 路径被杀:地址空间销毁(`destroy_root` 回收页)、IPC 清理、
+///   调度器线程标记退出、切走;
+/// - 健康进程 H:spawn 用户线程写 marker 后正常退出 —— 验证系统未被
+///   F 的故障拖垮。
+///
+/// 断言:
+/// - kill 计数 == 1(F 恰好被杀一次;若故障未被隔离,F 会正常 exit →
+///   计数 0 → 断言失败,暴露回归);
+/// - H 的 marker 到齐(系统存活,调度仍正常);
+/// - `process::pid_root(F)==None`(F 已销毁)、`pid_root(H)==Some(root_h)`;
+/// - 空闲页数回到"F 创建前"水平(F 的地址空间页已全部回收)。
+///
+/// M2 D12 自审。被杀进程的**阻塞 donor 线程** —— send 到 H 后阻塞(登记
+/// 指向 H 的捐赠),随后 F 被用户态故障杀掉。验证 kill 路径撤销被杀进程
+/// 线程作为 donor 发出的捐赠(否则陈旧捐赠永久抬升 H 并占死捐赠表槽)。
+fn fault_donor() {
+    let f = FAULT_F_PID.load(Ordering::Relaxed);
+    match crate::ipc::send(f, 0, [0x55, 0, 0, 0, 0]) {
+        // 无人 recv → NoPeer 登记 pending + 捐赠,随后阻塞至被杀。
+        Ok(crate::ipc::SendBlock::NoPeer) => crate::sched::block_current(),
+        Ok(crate::ipc::SendBlock::Done) => panic!("fault donor: unexpected pairing"),
+        Err(e) => panic!("fault donor: send err {e:#x}"),
+    }
+}
+
+/// F 进程 id(fault_donor 读 cap 目标用)。
+static FAULT_F_PID: AtomicUsize = AtomicUsize::new(0);
+
+fn boot_fault_recovery_test() {
+    // 1) 建 F / H 两个进程。
+    let f_pid = crate::process::create().expect("fault: create F");
+    let h_pid = crate::process::create().expect("fault: create H");
+    let root_f = crate::process::root(f_pid);
+    let root_h = crate::process::root(h_pid);
+    // F 程序:`lw t0, 0(x0)` → 页故障;后续 exit 为**死代码**(若故障未被
+    // 隔离,F 会正常退出 → kill 计数 0 → 断言失败)。
+    let prog_f: [u32; 3] = [
+        0x0000_2283, // lw   t0, 0(x0)   (U 模式读 VA 0:页故障 scause=0xd)
+        0x0010_0893, // addi a7, x0, 1   (SYSCALL_EXIT, 死代码)
+        0x0000_0073, // ecall
+    ];
+    let prog_h: [u32; 5] = [
+        0x4000_12b7, // lui  t0, 0x40001  (t0 = shared)
+        0x0510_0313, // addi t1, x0, 0x51 (marker)
+        0x0062_a023, // sw   t1, 0(t0)    (shared[0] = 0x51)
+        0x0010_0893, // addi a7, x0, 1    (SYSCALL_EXIT)
+        0x0000_0073, // ecall
+    ];
+    let (_, _f_shared_pa) = map_iso_proc(root_f, &prog_f);
+    let (_, h_shared_pa) = map_iso_proc(root_h, &prog_h);
+    let h_shared = h_shared_pa as *const u32;
+    // 2) F 授权 cap(F, 0, H):供 F 的 donor 线程 send 到 H。
+    assert!(
+        crate::process::grant_cap(f_pid, 0, h_pid).is_ok(),
+        "fault: grant cap(F,0,H)"
+    );
+    FAULT_F_PID.store(f_pid, Ordering::Relaxed);
+    // 3) spawn F 的 donor 内核线程(**先**于故障线程,先入队先运行:send →
+    //    NoPeer → 阻塞并登记 F→H 捐赠)。此时其内核栈已分配。
+    crate::sched::spawn_owned(fault_donor, crate::sched::PRIO_HIGH, f_pid);
+    // 4) 全部分配完成后取空闲页基线(F 地址空间 + donor 栈的回收断言参照)。
+    let free_before_f = crate::mem::free_page_count();
+    // 5) 再 spawn 故障线程(HIGH,donor 阻塞后首启即故障),最后 spawn H。
+    crate::sched::spawn_user(f_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    crate::sched::spawn_user(h_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    // 6) 轮询 H 的 marker(系统存活 = 调度仍正常)。
+    let mut guard = 0;
+    while unsafe { core::ptr::read_volatile(h_shared) } != 0x51 {
+        assert!(
+            guard < 200_000,
+            "fault: system dead after user fault (H marker missing)"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 7) 显式清空 reaper(被杀 donor 的栈移交 reaper,回收前先排空,
+    //    使空闲页断言确定性成立 —— idle 轮询时间不可作强假设)。
+    crate::sched::drain_reaper();
+    // 8) 断言:kill 计数 == 1;F 已销毁、H 存活;F 地址空间页已回收;
+    //    被杀进程线程发出的陈旧捐赠已撤销。
+    assert!(
+        crate::sched::fault_kill_count() == 1,
+        "fault: expected exactly 1 kill (got {})",
+        crate::sched::fault_kill_count()
+    );
+    assert!(
+        crate::process::pid_root(f_pid).is_none(),
+        "fault: victim process must be destroyed"
+    );
+    assert!(
+        crate::process::pid_root(h_pid) == Some(root_h),
+        "fault: healthy process must survive"
+    );
+    assert!(
+        crate::sched::donation_count() == 0,
+        "fault: stale donation from killed process not revoked (got {})",
+        crate::sched::donation_count()
+    );
+    let free_after = crate::mem::free_page_count();
+    assert!(
+        free_after >= free_before_f,
+        "fault: address space not reclaimed (free {free_after} < {free_before_f})"
+    );
+    info!("M2: user fault recovery ok (process killed, system alive)");
+}
+
+// ===== M2 性能:IPC 延迟基准(注册消息往返) =====
+
+/// IPC 延迟基准:两个进程(经 cap 授权)的 ping-pong 线程各执行
+/// `send → recv`(请求/响应)`,配对完成即一轮往返。计时在发送方
+/// 线程内部、**预热 10 轮之后**开始(warmup 建立稳定配对节奏并覆盖
+/// 首次捐赠/唤醒开销),测得 `IPC_BENCH_N` 轮往返总 timebase 计数,
+/// 除以 `IPC_BENCH_N` 折算每轮延迟。
+///
+/// 语义说明:一轮往返 = 4 次系统调用(send/recv × 2)+ 2 次上下文切换
+/// (sender→recver→sender)+ 2 次 PIP 捐赠注册/撤销 —— 即"寄存器消息
+/// 同步 IPC 往返"的端到端成本。QEMU 时钟抖动 ±20%,数值仅作相对基准。
+fn boot_ipc_latency_bench() {
+    let pa = crate::process::create().expect("ipc bench: create pa");
+    let pb = crate::process::create().expect("ipc bench: create pb");
+    assert!(
+        crate::process::grant_cap(pa, 0, pb).is_ok(),
+        "ipc bench: grant cap(pa,0,pb)"
+    );
+    assert!(
+        crate::process::grant_cap(pb, 0, pa).is_ok(),
+        "ipc bench: grant cap(pb,0,pa)"
+    );
+    BENCH_IPC_PA.store(pa, Ordering::Relaxed);
+    BENCH_IPC_PB.store(pb, Ordering::Relaxed);
+    BENCH_IPC_TOTAL.store(0, Ordering::Relaxed);
+    BENCH_IPC_DONE.store(false, Ordering::Relaxed);
+    crate::sched::spawn_owned(ipc_bench_sender, crate::sched::PRIO_HIGH, pa);
+    crate::sched::spawn_owned(ipc_bench_recver, crate::sched::PRIO_HIGH, pb);
+    // 协作轮询直至测量完成(超时守卫;boot 期 SIE=0,无抢占)。
+    let mut guard = 0;
+    while !BENCH_IPC_DONE.load(Ordering::Relaxed) && guard < 4_000_000 {
+        crate::sched::yield_();
+        guard += 1;
+    }
+    assert!(BENCH_IPC_DONE.load(Ordering::Relaxed), "ipc bench timeout");
+    let dt = BENCH_IPC_TOTAL.load(Ordering::Relaxed);
+    // V4 纪律:用运行时 timebase 频率换算,不硬编码 10MHz。
+    let freq = crate::board::timer_freq() as u64;
+    let ns_per_tick = 1_000_000_000u64 / freq;
+    let us_roundtrip = (dt as u64).saturating_mul(ns_per_tick) / IPC_BENCH_N as u64 / 1000;
+    info!("M2: IPC latency ok (reg-msg ~{dt} ticks ~{us_roundtrip} us/roundtrip)");
+}
+
+/// IPC 延迟基准:发送方 —— 预热后计时 N 轮 `send→recv`,校验响应消息。
+fn ipc_bench_sender() {
+    let pa = BENCH_IPC_PA.load(Ordering::Relaxed);
+    // 1) 预热:建立"send 阻塞、recv 配对"的稳定节奏,覆盖首次开销。
+    for i in 0..IPC_BENCH_WARMUP {
+        ipc_bench_send(pa, 0x8000 + i);
+        ipc_bench_recv(pa, 0x9000 + i);
+    }
+    // 2) 计时主体。
+    let t0 = crate::arch::get_time();
+    for i in 0..IPC_BENCH_N {
+        ipc_bench_send(pa, 0xA000 + i);
+        ipc_bench_recv(pa, 0xB000 + i);
+    }
+    let t1 = crate::arch::get_time();
+    BENCH_IPC_TOTAL.store(t1.wrapping_sub(t0), Ordering::Relaxed);
+    BENCH_IPC_DONE.store(true, Ordering::Relaxed);
+}
+
+/// IPC 延迟基准:接收方 —— 服务 `WARMUP+N` 轮(先于发送方完成,不参与计时)。
+fn ipc_bench_recver() {
+    let pb = BENCH_IPC_PB.load(Ordering::Relaxed);
+    let total = IPC_BENCH_WARMUP + IPC_BENCH_N;
+    for _ in 0..total {
+        // 收到请求后回响应(消息 0 号 + 0x1000 供发送方校验配对完整性)。
+        let req = ipc_bench_recv_any(pb);
+        ipc_bench_send(pb, req + 0x1000);
+    }
+}
+
+/// recv,不校验消息号(接收方不知道具体请求号,完整性由发送方校验)。
+fn ipc_bench_recv_any(pid: usize) -> usize {
+    match crate::ipc::recv(pid, 0) {
+        Ok(crate::ipc::RecvBlock::Done(m)) => m[0],
+        Ok(crate::ipc::RecvBlock::NoPeer) => {
+            crate::sched::block_current();
+            crate::sched::take_ipc_msg().expect("ipc bench: recv msg")[0]
+        }
+        Err(e) => panic!("ipc bench: recv err {e:#x}"),
+    }
+}
+
+/// send + 处理 NoPeer 阻塞(与 stress_sender 同一阻塞协议)。
+fn ipc_bench_send(pid: usize, word0: usize) {
+    match crate::ipc::send(pid, 0, [word0, 0, 0, 0, 0]) {
+        Ok(crate::ipc::SendBlock::Done) => {}
+        Ok(crate::ipc::SendBlock::NoPeer) => crate::sched::block_current(),
+        Err(e) => panic!("ipc bench: send err {e:#x}"),
+    }
+}
+
+/// recv + 处理 NoPeer 阻塞(与 stress_recver 同一消息取得协议)。
+fn ipc_bench_recv(pid: usize, expect: usize) -> usize {
+    let m = match crate::ipc::recv(pid, 0) {
+        Ok(crate::ipc::RecvBlock::Done(m)) => m,
+        Ok(crate::ipc::RecvBlock::NoPeer) => {
+            crate::sched::block_current();
+            crate::sched::take_ipc_msg().expect("ipc bench: recv msg")
+        }
+        Err(e) => panic!("ipc bench: recv err {e:#x}"),
+    };
+    assert!(
+        m[0] == expect,
+        "ipc bench: msg mismatch got {:#x} want {expect:#x}",
+        m[0]
+    );
+    m[0]
+}
+
+/// 计时主体轮数。
+const IPC_BENCH_N: usize = 1000;
+/// 预热轮数(不计入统计)。
+const IPC_BENCH_WARMUP: usize = 10;
+static BENCH_IPC_PA: AtomicUsize = AtomicUsize::new(0);
+static BENCH_IPC_PB: AtomicUsize = AtomicUsize::new(0);
+static BENCH_IPC_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static BENCH_IPC_DONE: AtomicBool = AtomicBool::new(false);
 
 // ===== M2 T3b:per-CPU 调度(D19) =====
 

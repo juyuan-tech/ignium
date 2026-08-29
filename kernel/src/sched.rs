@@ -46,6 +46,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::arch::{self, Context, MAX_HARTS};
+use crate::error;
 use crate::info;
 use crate::sync::SpinLock;
 use crate::warn;
@@ -400,6 +401,67 @@ impl Scheduler {
         });
         for &proc in affected.iter().take(n) {
             self.requeue_proc_threads(proc);
+        }
+    }
+
+    /// M2 D12:撤销指定线程作为 donor 的全部捐赠(进程被杀时调用),受影响
+    /// peer 进程按自然优先级回落重排。与 `revoke_donations_for_proc`(按
+    /// 被捐进程定位)互补:后者清 `peer_proc == pid`(指向被杀的),本函数
+    /// 清 `donor_tid ∈ 被杀线程`(**被杀进程发出的**)—— `purge_process`
+    /// 只唤醒存活的配对方,被杀线程自己的捐赠无人撤销,不清理会永久
+    /// 抬升 peer 进程优先级并占死 `MAX_DONATIONS` 槽。
+    ///
+    /// `skip_proc`:不重排该进程(被杀的进程自身 —— 其线程已标记退出,
+    /// 重排会复活;仅当被杀线程曾自捐时才可能命中)。
+    fn revoke_donations_of(&mut self, tids: &[usize], skip_proc: Option<usize>) {
+        let mut affected = [0usize; MAX_THREADS];
+        let mut n = 0usize;
+        self.donations.retain(|d| {
+            if tids.contains(&d.donor_tid) {
+                if n < MAX_THREADS && !affected[..n].contains(&d.peer_proc) {
+                    affected[n] = d.peer_proc;
+                    n += 1;
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for &proc in affected.iter().take(n) {
+            if Some(proc) != skip_proc {
+                self.requeue_proc_threads(proc);
+            }
+        }
+    }
+
+    /// M2 D12:撤销指向进程 `proc` 的全部捐赠(进程被销毁时调用),受影响
+    /// donor 的所属进程按自然优先级回落重排。与 `revoke_donations`(按 donor
+    /// 线程定位)不同:本函数按**被捐进程**定位(`peer_proc == proc`)。
+    ///
+    /// 防御性兜底:常规路径上,阻塞于 IPC 的 donor 已由 `purge_process` →
+    /// `ipc_wake_with_err` 逐个唤醒并撤销;此处清理**尚未撤销**的陈旧捐赠
+    /// (如多核竞争窗口内新登记的),防捐赠抬升已无线程的无主进程。
+    fn revoke_donations_for_proc(&mut self, proc: usize) {
+        let mut affected = [0usize; MAX_THREADS];
+        let mut n = 0usize;
+        self.donations.retain(|d| {
+            if d.peer_proc == proc {
+                if n < MAX_THREADS && !affected[..n].contains(&d.donor_tid) {
+                    affected[n] = d.donor_tid;
+                    n += 1;
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for &tid in affected.iter().take(n) {
+            if let Some(p) = self.threads[tid].proc {
+                // 不重排被杀进程自身(其线程已被标记退出,重排会复活)。
+                if p != proc {
+                    self.requeue_proc_threads(p);
+                }
+            }
         }
     }
 
@@ -1026,7 +1088,40 @@ pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
     arch::irq_restore(irq);
 }
 
+/// M2 D12:唤醒阻塞中的 IPC 线程并投递"对端已亡"错误(不配对)。
+///
+/// 向目标线程帧 a0 写 `code`(负 errno)并前移 sepc(跳过 ecall),使其从
+/// recv/send 系统调用带错误返回(而非永久挂起);内核线程经 `ipc_msg`
+/// 中转同一错误。随后撤销该线程此前登记的捐赠(其 IPC 配对已不可能完成,
+/// 防陈旧捐赠抬升无主进程)。
+///
+/// 锁序:调用方须已释放 IPC 锁(IPC → SCHED 不重叠);本函数内再取 SCHED。
+pub fn ipc_wake_with_err(tid: usize, code: usize) {
+    let irq = arch::irq_save();
+    let mut s = SCHED.lock();
+    {
+        let t = &mut s.threads[tid];
+        debug_assert!(
+            t.state == ThreadState::Blocked,
+            "ipc_wake_with_err: tid {tid} not blocked"
+        );
+        t.frame[crate::arch::gpr::X_A0] = code;
+        t.frame[FRAME_SEPC] += 4;
+        // 内核线程读不到帧 → 错误码经 ipc_msg 中转(take_ipc_msg)。
+        t.ipc_msg = Some([code; crate::ipc::MSG_WORDS]);
+    }
+    s.enqueue(tid);
+    // M2 T2b(PIP):配对已不可能完成,撤销本线程登记的全部捐赠。
+    s.revoke_donations(tid);
+    drop(s);
+    arch::irq_restore(irq);
+}
+
 /// 当前线程 id(D19:本核的 current)。
+///
+/// M2 性能:IPC syscall 热路径(每次 send/recv 都查),#[inline] 配合
+/// release fat-LTO 跨模块内联,省一次调用帧。
+#[inline]
 pub fn current_id() -> usize {
     let irq = arch::irq_save();
     let s = SCHED.lock();
@@ -1040,6 +1135,10 @@ pub fn current_id() -> usize {
 ///
 /// 仅在用户线程的 syscall/trap 上下文调用(经 CAUSE_ECALL_FROM_U 到达),
 /// 当前必为用户线程;误调(内核线程) → panic(fail-loudly)。
+///
+/// M2 性能:syscall/trap 热路径(每次用户系统调用/故障都查),#[inline]
+/// 配合 release fat-LTO 跨模块内联,省一次调用帧。
+#[inline]
 pub fn current_proc() -> usize {
     let irq = arch::irq_save();
     let p = {
@@ -1048,6 +1147,100 @@ pub fn current_proc() -> usize {
     };
     arch::irq_restore(irq);
     p.expect("current_proc: current thread is not a user thread")
+}
+
+// ===== M2 D12:用户态异常恢复(进程故障 → 杀进程) =====
+
+/// 已杀进程数(用户态故障→杀进程;测试断言用)。
+static FAULT_KILL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// 当前已杀进程数。
+pub fn fault_kill_count() -> usize {
+    FAULT_KILL_COUNT.load(Ordering::Relaxed)
+}
+
+/// M2 D12:用户态故障 → 杀当前进程并切走(永不返回)。
+///
+/// 在 trap 上下文调用(trap_handler 同步异常分支、SPP=0 判定后)。顺序:
+/// 1. 诊断输出(`error!`,同步异常路径允许日志;前缀 `D12:` 而非 `TRAP:` ——
+///    门禁把后者当内核故障标志);
+/// 2. `ipc::purge_process(pid)` 清理 IPC pending,唤醒存活的配对方并投递
+///    "对端已亡"错误(IPC → SCHED 锁序);
+/// 3. SCHED 锁内把进程**所有**线程置 `Exited`、恢复数据失效;非当前线程:
+///    非 Running 的栈移交 reaper、槽入 free_slots(当前线程由
+///    `exit_from_trap` 统一处理);**Running 于其它核的线程跳过** —— 已知
+///    局限(其 TCB 归该核调度器所有;地址空间已销毁,其下一次用户访存会
+///    再次走本路径自愈);同时清理指向被杀进程的陈旧捐赠;
+/// 4. `mmu::switch_root(kernel_root())` —— **必须先切走再释放根表**(当前
+///    satp 仍是进程根表,直接释放会使取指/访存立即故障);
+/// 5. `process::destroy(pid)` 销毁进程(revoke Shm → 回收地址空间页 → 槽
+///    失效);已销毁的进程(自愈路径)幂等无操作;
+/// 6. `exit_from_trap()` 切换(切走时 `do_switch` 会 switch_root 到 next
+///    线程根表)。
+pub fn kill_current_process(scause: usize, sepc: usize, stval: usize) -> ! {
+    // 1) 诊断(同步异常路径允许日志;避免字面 "TRAP:" —— 门禁误判)。
+    error!("D12: user fault scause={scause:#x} sepc={sepc:#x} stval={stval:#x}; killing process");
+    let pid = current_proc();
+    FAULT_KILL_COUNT.fetch_add(1, Ordering::Relaxed);
+    // 2) IPC 清理 + 唤醒存活配对方(IPC → SCHED 锁序)。
+    crate::ipc::purge_process(pid);
+    // 3) SCHED 锁内标记全部进程线程。
+    {
+        let irq = arch::irq_save();
+        let mut s = SCHED.lock();
+        let h = arch::hartid();
+        let cur = s.current[h];
+        // 收集进程全部线程(除当前线程 —— 由 exit_from_trap 统一处理)。
+        let mut victims = [0usize; MAX_THREADS];
+        let mut n = 0usize;
+        for id in 0..s.threads.len() {
+            if s.threads[id].proc == Some(pid) && id != cur && n < MAX_THREADS {
+                victims[n] = id;
+                n += 1;
+            }
+        }
+        // 摘除被杀进程线程的就绪队列项(防槽复用后陈旧队列项误调度
+        // 新线程)。
+        for q in s.ready.iter_mut().flatten() {
+            q.retain(|&id| !victims[..n].contains(&id));
+        }
+        for &id in victims.iter().take(n) {
+            // Running 于其它核:该核调度器拥有其 TCB —— 跳过(已知局限)。
+            if s.threads[id].state == ThreadState::Running {
+                continue;
+            }
+            // 非当前线程:栈移交 reaper(用户线程 stack=None,安全无操作),
+            // 槽入 free_slots 复用;恢复数据失效(线程不会再被选中运行)。
+            if let Some(stack) = s.threads[id].stack.take() {
+                s.reaper.push_back(stack);
+            }
+            s.threads[id].state = ThreadState::Exited;
+            s.threads[id].frame_valid = false;
+            s.threads[id].ctx_valid = false;
+            s.free_slots.push_back(id);
+        }
+        // 清理指向被杀进程的陈旧捐赠(peer_proc == pid,防抬升无主进程)。
+        s.revoke_donations_for_proc(pid);
+        // 清理被杀进程线程作为 donor 发出的捐赠(防永久抬升其它进程)。
+        // victims + 当前线程(由 exit_from_trap 标记退出)一并撤销。
+        let mut killed = [0usize; MAX_THREADS];
+        let mut kn = 0usize;
+        for &id in victims.iter().take(n) {
+            killed[kn] = id;
+            kn += 1;
+        }
+        killed[kn] = cur;
+        kn += 1;
+        s.revoke_donations_of(&killed[..kn], Some(pid));
+        drop(s);
+        arch::irq_restore(irq);
+    }
+    // 4) 先切回内核根表,再释放进程根表(当前 satp 仍是进程根表)。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    // 5) 销毁进程(revoke Shm → 回收地址空间页 → 槽失效)。
+    crate::process::destroy(pid);
+    // 6) exit_from_trap 切走(内部再取 SCHED 锁;当前线程由其统一标记退出)。
+    crate::sched::exit_from_trap()
 }
 
 /// 回收已退出线程的栈(LOW-3/审计 17 轮):idle 循环调用,配合

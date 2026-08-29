@@ -144,6 +144,10 @@ pub enum CapError {
 }
 
 /// 能力错误 → 负 errno(usize 编码,与 L1 ABI 一致)。
+///
+/// M2 性能:IPC 错误路径热调用(每次能力校验失败都查),#[inline] 配合
+/// release fat-LTO 跨模块内联。
+#[inline]
 pub fn cap_errno(err: CapError) -> usize {
     match err {
         CapError::InvalidSlot | CapError::WrongType => crate::syscall::SYS_ERR_EINVAL,
@@ -194,6 +198,10 @@ pub fn grant_shm_cap(pid: usize, slot: usize, shm_id: usize) -> Result<(), CapEr
 /// 供 IPC 目标解析(须 `Cap::Proc`)与共享页校验(`Cap::Shm`)。槽越界 →
 /// `InvalidSlot`;空槽/进程不存在 → `NotFound`。**不 panic**(syscall 路径
 /// 的用户传入 pid/slot 经本函数非 panic 校验)。
+///
+/// M2 性能:IPC syscall 热路径(每次 send/recv 的目标解析都查),#[inline]
+/// 配合 release fat-LTO 跨模块内联。
+#[inline]
 pub fn cap_target(pid: usize, slot: usize) -> Result<Cap, CapError> {
     if slot >= MAX_CAPS {
         return Err(CapError::InvalidSlot);
@@ -292,4 +300,71 @@ pub fn pid_root(pid: usize) -> Option<usize> {
     }; // t 在此 drop(TABLE 锁释放)
     crate::arch::irq_restore(irq);
     r
+}
+
+/// 销毁进程(M2 D12):revoke 全部 Shm cap → 原子失效槽 → 回收地址空间。
+///
+/// 顺序:
+/// 1. **先 revoke 本进程全部 `Cap::Shm`**(TABLE 锁内收集、锁外逐个经
+///    `shm_revoke`:撤双方映射、清双方槽、释放共享页、注册表出列)—— 必须
+///    在地址空间释放之前完成:若共享页仍 U 映射,`destroy_root` 会对其
+///    double-free;
+/// 2. **锁内"捕获 root + 原子失效槽"**(`id = usize::MAX` + 入 `free` 池):
+///    并发 destroy(多核自愈路径)在此串行化 —— 先到者失效,后到者
+///    `filter(id == pid)` 失败即返回,杜绝同一根表双释放;
+/// 3. 锁外 `mmu::destroy_root(root)` 回收用户页/各级表页/根页。
+///
+/// 失效后 `pid_root`/`cap_target` 对已销毁进程返回 NotFound,槽位可复用。
+///
+/// # 前提
+/// 调用方须已 `switch_root(kernel_root())`(见 `mmu::destroy_root` 前提)。
+/// 重复调用(pid 已销毁)→ 无操作(幂等)。
+pub fn destroy(pid: usize) {
+    // 1) 收集并 revoke 全部 Shm cap。TABLE 锁内收集、锁外逐个 revoke:
+    //    shm_revoke 内部取 SHM 与 TABLE 锁,不得与本锁重叠。
+    let shm_ids: Vec<usize> = {
+        let irq = crate::arch::irq_save();
+        let ids = {
+            let t = TABLE.lock();
+            match t.slots.get(pid).filter(|p| p.id == pid) {
+                Some(p) => p
+                    .caps
+                    .iter()
+                    .filter_map(|c| match c {
+                        Some(Cap::Shm(id)) => Some(*id),
+                        _ => None,
+                    })
+                    .collect(),
+                None => return, // 已销毁/不存在:幂等无操作
+            }
+        }; // TABLE 锁在此释放
+        crate::arch::irq_restore(irq);
+        ids
+    };
+    for id in shm_ids {
+        // 重复 revoke(并发 destroy / 用户已 revoke)幂等返回 Err,无害。
+        let _ = crate::shm::shm_revoke(id);
+    }
+    // 2) 捕获 root + 原子失效槽(并发 destroy 在此串行化,防双释放)。
+    let root = {
+        let irq = crate::arch::irq_save();
+        let r = {
+            let mut t = TABLE.lock();
+            match t.slots.get_mut(pid).filter(|p| p.id == pid) {
+                Some(p) => {
+                    let root = p.root;
+                    p.id = usize::MAX;
+                    p.caps = [None; MAX_CAPS];
+                    t.free.push_back(pid);
+                    Some(root)
+                }
+                None => None,
+            }
+        }; // TABLE 锁在此释放
+        crate::arch::irq_restore(irq);
+        r
+    };
+    let Some(root) = root else { return }; // 已被并发 destroy 处理
+                                           // 3) 锁外回收地址空间页(用户页/各级表页/根页)。
+    crate::mmu::destroy_root(root);
 }

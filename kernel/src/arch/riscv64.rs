@@ -569,6 +569,12 @@ pub unsafe extern "C" fn trap_handler(
         frame
     } else {
         // ===== 其它同步异常 =====
+        // M2 D12:按来源分派 —— 用户态故障(SPP=0)杀进程并切走(不返回);
+        // 内核态故障(SPP=1)仍是内核 bug,保持 dump + halt。D12 的日志
+        // 用 "D12:" 前缀而非 "TRAP:" —— 门禁把后者当内核故障标志。
+        if unsafe { *frame.add(CS_SSTATUS) } & (1 << 8) == 0 {
+            crate::sched::kill_current_process(scause, sepc, stval);
+        }
         error!("TRAP: exception scause={scause:#x} sepc={sepc:#x} stval={stval:#x}");
         dump_trap_frame(frame);
         halt()

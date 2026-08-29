@@ -404,6 +404,27 @@ pub fn page_count() -> usize {
     with_allocator(|a| a.real_count)
 }
 
+/// 当前空闲物理页数(遍历各阶空闲链表求和)。
+///
+/// 测试/诊断用:M2 D12 进程销毁(`process::destroy` → `mmu::destroy_root`)
+/// 后断言地址空间页已回收。只读遍历空闲链表,不修改状态;含空闲块
+/// 首字解引用,仅非 ISR 路径使用。
+pub fn free_page_count() -> usize {
+    with_allocator(|a| {
+        let mut n = 0usize;
+        for order in 0..=MAX_ORDER {
+            let mut cur = a.free_lists[order];
+            while cur != FREE_NONE {
+                n += 1usize << order;
+                // SAFETY:空闲链表节点由 push/unlink 维护,首字为下一
+                // 节点索引(恒 < page_count);只读,不改链表。
+                cur = unsafe { (a.block_addr(cur) as *const usize).read() };
+            }
+        }
+        n
+    })
+}
+
 /// 物理地址是否落在分配器管理区(`[base, base + real_count 页)`)?
 ///
 /// M2 用户映射安全加固(S1):只允许把**分配器页**暴露给用户态。

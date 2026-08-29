@@ -148,6 +148,50 @@ pub fn send(pid: usize, slot: usize, msg: [usize; MSG_WORDS]) -> Result<SendBloc
     Ok(SendBlock::NoPeer)
 }
 
+/// M2 D12:进程被杀时清理 IPC 状态。
+///
+/// 移除 pending 队列中所有 `sender_pid == pid || recver_pid == pid` 项
+/// (被杀进程自己的挂起 send/recv —— 其线程已被标记退出,不再唤醒);对
+/// **存活配对方**唤醒并投递"对端已亡"错误(`-ENOENT`,目标进程不存在),
+/// 防止其永久挂起:
+/// - `dst_pid == pid` 的 pending send 之 sender 线程(等 pid 收消息);
+/// - `src_pid == pid` 的 pending recv 之 recver 线程(等 pid 发消息)。
+///
+/// 锁序:本函数持 IPC 锁收集,释放后经 `sched::ipc_wake_with_err` 取 SCHED
+/// 锁(IPC → SCHED,不逆序)。
+pub fn purge_process(pid: usize) {
+    let mut wake_err: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    let mut ipc = IPC.lock();
+    // 1) 等 pid 发消息的存活 recver:唤醒并报"对端已亡"。
+    ipc.recvs.retain(|r| {
+        if r.src_pid == pid {
+            if r.recver_pid != pid {
+                wake_err.push((r.recver_tid, crate::syscall::SYS_ERR_ENOENT));
+            }
+            false
+        } else {
+            true
+        }
+    });
+    // 2) 等 pid 收消息的存活 sender:唤醒并报错。
+    ipc.sends.retain(|s| {
+        if s.dst_pid == pid {
+            if s.sender_pid != pid {
+                wake_err.push((s.sender_tid, crate::syscall::SYS_ERR_ENOENT));
+            }
+            false
+        } else {
+            true
+        }
+    });
+    // 3) 杀掉进程自己的挂起 send(发给其它进程但尚未配对)。
+    ipc.sends.retain(|s| s.sender_pid != pid);
+    drop(ipc); // 释放 IPC 锁后再唤醒(IPC → SCHED 不重叠)。
+    for (tid, code) in wake_err {
+        crate::sched::ipc_wake_with_err(tid, code);
+    }
+}
+
 /// 从 `slot` 指向的目标进程接收消息。
 ///
 /// 成功(配对)返回 `Done(msg)`;暂无匹配 send 返回 `NoPeer`(已登记,调用方
