@@ -2,7 +2,8 @@
 
 > 目标阶段:**M2**(用户进程 + IPC + 能力 + 多核前置)。本文为 M2 设计
 > 基线,先文档后代码(遵循 DESIGN.md「先读透 seL4/rCore,前 3 个月
-> 重文档轻代码」)。为草案,实现前须按里程碑纪律评审。
+> 重文档轻代码」)。**M2 已收官(v0.1.0-M2)**:正文标注 ✅ 的项均落地;
+> ⏳ 项(ELF 加载器、wait)按决策延至 M3。
 
 ## 1. 目标与验收(对齐 ROADMAP M2)
 
@@ -10,12 +11,12 @@
 |---|---|
 | U/S 特权级 + 每进程地址空间 | 用户代码执行 ecall |
 | 系统调用机制 + **L1 ABI 定义(对齐 LiteOS-A 风格)** | sys_read/write/open 占位 |
-| 进程管理:创建/退出/wait | spawn+exit+wait 全链路 |
-| ELF 加载器(RISC-V) | 独立编译程序可运行 |
-| **IPC**:同步 + 注册发送 + 阻塞/唤醒 + 优先级继承 | A→B 消息往返正确 |
-| IPC 性能:寄存器小消息 + 共享内存大消息 | 延迟可测并记录 |
-| 能力模型简化版:未授权 IPC 被拒 | 拒绝测试用例 |
-| 多核前置:D7/D8/D9/D19 | 4 核 QEMU 所有 hart idle,调度分配线程到各核 |
+| 进程管理:创建/退出/wait | spawn+exit+wait 全链路 | ✅ 创建/退出/销毁(D12:用户线程退出后进程销毁 + 地址空间页回收);wait 属 M3(spawn 服务化) |
+| ELF 加载器(RISC-V) | 独立编译程序可运行 | ⏳ 延至 M3(M2 收官决策,见 DEFERRED) |
+| **IPC**:同步 + 注册发送 + 阻塞/唤醒 + 优先级继承 | A→B 消息往返正确 | ✅ T2a(核心)+ T2b(PIP) |
+| IPC 性能:寄存器小消息 + 共享内存大消息 | 延迟可测并记录 | ✅ 延迟基准 ~4 µs/往返;共享内存大消息 T3c |
+| 能力模型简化版:未授权 IPC 被拒 | 拒绝测试用例 | ✅ T2a 未授权拒绝;T3c Cap 枚举 + dup/revoke |
+| 多核前置:D7/D8/D9/D19 | 4 核 QEMU 所有 hart idle,调度分配线程到各核 | ✅ T3a(唤醒/陷阱栈/控制台锁)+ T3b(per-CPU 调度) |
 
 ## 2. 线程模型演进
 
@@ -111,7 +112,13 @@ on_tick 候选谓词放宽)。实现见 `ipc.rs`(锁序 TABLE → IPC → SCHED,
 `Donation` 表,`enqueue` 用有效优先级选队,`on_tick` 用有效优先级判
 抢占(被抬升者不被中间优先级打断);配对完成撤销。D22 提供抢占基础。
 压力测试:内核线程 send/recv 环 1000 次,消息无丢失无损坏,捐赠表
-配对后清空。多级捐赠链为近似(单跳 + 自然链);进程销毁/页回收仍待办。
+配对后清空。多级捐赠链为近似(单跳 + 自然链)。
+
+**进程销毁/页回收已落地(D12,收官)**:`process::destroy`(Shm cap 先行
+revoke → 槽原子失效 → `mmu::destroy_root` 回收进程自有页);用户态故障经
+`kill_current_process` 杀进程,捐赠表**双向**清理(`revoke_donations_for_proc`
+清指向被杀进程的 + `revoke_donations_of` 清被杀线程发出的),详见
+`reports/2026-08-29-m2-d12-recovery-perf.md`。
 
 ### 5.2 共享内存大消息
 
@@ -128,9 +135,12 @@ on_tick 候选谓词放宽)。实现见 `ipc.rs`(锁序 TABLE → IPC → SCHED,
 ## 6. 进程生命周期
 
 - **spawn**:加载 ELF → 建地址空间 + 首线程 → 初始帧(SPP=0)入队。
-- **exit**:回收地址空间页(逐页 unmap/free)→ 线程栈回收
-  (现有 reaper)→ 唤醒 wait 者。
-- **wait**:父进程 `wait(pid)` 阻塞直至子退出或信号。
+  当前为 `sched::spawn_user(pid, ...)`(测试程序以机器码注入地址空间,
+  `tests.rs`);ELF 加载器延至 M3。
+- **exit**:回收地址空间页(逐页 unmap/free)→ 线程栈回收(现有 reaper)
+  → 进程销毁。**已落地(D12)**:用户线程退出后进程无存活线程 → 经
+  `process::destroy` 回收(Shm cap revoke → 槽失效 → 根表回收)。
+- **wait**:父进程 `wait(pid)` 阻塞直至子退出或信号 —— M3(spawn 服务化)。
 
 ## 7. ELF 加载器
 
@@ -143,11 +153,11 @@ on_tick 候选谓词放宽)。实现见 `ipc.rs`(锁序 TABLE → IPC → SCHED,
 
 进入 IPC 压力前必须先交付(否则每核独立调度/IPC 跨核语义先天缺陷):
 
-- **D7** per-hart 陷阱栈(sscratch 按 hartid 数组)。
-- **D8** 副核唤醒(SBI IPI/HSM),per-hart init + 进入调度。
-- **D9** 控制台输出锁。
+- **D7** per-hart 陷阱栈(sscratch 按 hartid 数组)。✅ T3a
+- **D8** 副核唤醒(SBI IPI/HSM),per-hart init + 进入调度。✅ T3a
+- **D9** 控制台输出锁。✅ T3a
 - **D19** per-CPU 就绪队列 / 线程亲和性;SCHED 全局锁先保持
-  (正确性优先,缩放后评)。
+  (正确性优先,缩放后评)。✅ T3b(线程亲和按核归位;全局锁缩放留待 M3)
 
 ## 9. 实现顺序建议(里程碑内 T0→T3)
 
@@ -159,7 +169,10 @@ on_tick 候选谓词放宽)。实现见 `ipc.rs`(锁序 TABLE → IPC → SCHED,
      能力表(未授权拒绝)+ D22 woken 抢占。
    - **T2b ✓(已落地)**:优先级继承(PIP,按进程捐赠表 + 有效优先级)+
      IPC 压力测试(内核线程 send/recv 环 1000 次)。
-4. **T3 完善**:共享内存大消息、revoke、多核前置的并行开展。
+4. **T3 完善**:**已落地** —— T3a 多核 bring-up(D7/D8/D9)、T3b per-CPU
+   调度(D19)、T3c 共享内存大消息 + 能力 revoke/dup(见
+   `reports/2026-08-29-m2-t3c-sharedmem-cap.md`);收官项 **D12** 用户态异常
+   恢复 + 进程销毁/页回收(见 `reports/2026-08-29-m2-d12-recovery-perf.md`)。
 
 ## 10. 风险与对策
 
@@ -173,5 +186,5 @@ on_tick 候选谓词放宽)。实现见 `ipc.rs`(锁序 TABLE → IPC → SCHED,
 
 ## 关联登记
 
-- DEFERRED:D7/D8/D9/D10/D19/D20/D22/D23/D24。
-- docs/ROADMAP.md「阶段 2」。
+- DEFERRED:D1/D7/D8/D9/D10/D12/D19/D20/D22/D23/D24(已实现项状态已同步)。
+- docs/ROADMAP.md「阶段 2」(✅ 已完成,v0.1.0-M2)。

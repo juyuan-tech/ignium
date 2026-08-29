@@ -22,9 +22,10 @@ make test-rva23 # RVA23 P1:Zba/Zbb/Zbs+Zicond 扩展 + -cpu max 冒烟
 五条全绿才能提交。dev 与 release 双 profile 都要能编译:
 `cargo build` 与 `cargo build --release`。
 
-> 门禁三处 grep 同步纪律:新增里程碑 banner(如 `M2 ... ok`)时,必须
-> 同步更新 `Makefile` 的 `test`/`test-rva23` 与 `.github/workflows/ci.yml`
-> 的 build/rva23 两处 job 的 `grep -q` 断言,否则本地过、CI 挂。
+> 门禁 **6 处 grep 同步纪律**:新增里程碑 banner(如 `M2 ... ok`)时,必须
+> 同步更新 **`Makefile` 的 `test`/`test-smp`/`test-rva23` 三处** 与
+> **`.github/workflows/ci.yml` 的 build/smp/rva23 三处 job** 的 `grep -q`
+> 断言,共 6 处缺一不可,否则本地过、CI 挂。
 
 ## 红线(不可违反)
 
@@ -44,16 +45,19 @@ make test-rva23 # RVA23 P1:Zba/Zbb/Zbs+Zicond 扩展 + -cpu max 冒烟
    由陷阱栈吸收。M1 之后若需 ISR 日志,先引入锁或 ISR 缓冲。
 6. 工具链/CI 版本两处同步(rust-toolchain.toml + ci.yml)。
 7. 新增 Rust 代码必须写注释:模块级文档 + 每个 unsafe 的 Safety 说明。
-8. **多核限制**:当前单核(副 hart 在 entry.S park)。改多核代码前必须
-   同时实现 D7(per-hart 陷阱栈)+ D9(控制台锁)+ D8(副核唤醒)。
+8. **多核**:已落地(T3a:D7 per-hart 陷阱栈 + D8 副核唤醒 + D9 控制台锁;
+   T3b:D19 per-CPU 调度 + 线程亲和)。多核代码改动仍须守住:per-hart 陷阱栈
+   到位、控制台锁、跨核 Running 线程回收局限(杀进程路径,D12)与跨核
+   TLB/停核 shootdown 未实现 —— 见 docs/DESIGN.md「已知限制」。
 
 ## 结构速览
 
 - `kernel/` — 内核 crate(唯一特权层);arch 隔离层在 kernel/src/arch/;
   关键模块:board.rs(板级参数,运行时 FDT 推导)、fdt.rs(FDT 解析器)、
-  mem.rs(buddy)、mmu.rs(Sv39 页表)、heap.rs(内核堆)、sched.rs(线程调度)、
-  process.rs(M2:进程/每进程独立地址空间/能力表)、ipc.rs(M2 T2a:同步 IPC,
-  寄存器消息 + 阻塞配对)、tests.rs(M2 引导期冒烟测试)、sync.rs(同步原语)、
+  mem.rs(buddy)、mmu.rs(Sv39 页表 + 进程根表 create/destroy)、heap.rs(内核堆)、
+  sched.rs(线程调度 + D12 杀进程/捐赠双向清理)、process.rs(M2:进程/每进程
+  独立地址空间/能力表 + destroy)、ipc.rs(M2:同步 IPC/PIP + purge_process)、
+  tests.rs(M2 引导期冒烟测试 + IPC 延迟基准)、sync.rs(同步原语)、
   sbi.rs(SBI 调用)、logger/panic/uart
 - `scripts/ai_audit.py` — 外部 AI 审计(密钥走环境变量,见 scripts/README.md)
 - `docs/` — DESIGN.md(架构铁律)、M2-DESIGN.md(M2 设计,U/S 切换/IPC/能力)、

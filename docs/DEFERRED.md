@@ -9,18 +9,13 @@
 
 | # | 项目 | 来源 | 触发条件 | 状态 |
 |---|---|---|---|---|
-| D1 | 中断快速路径(仅保存调用者保存寄存器) | 自审优化报告 | M2 调度器之前 | 待办 |
-| D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前(M2) | 待办:陷阱栈从全局单栈改为 per-hart 数组(按 hartid/tp 索引),sscratch 指向 per-hart 栈顶 |
-| D8 | 副核唤醒与多核 bring-up | 自审/ROADMAP | M2+ | 待办:引导者(仲裁赢家)在初始化完成后通过 SBI IPI 或 HSM 扩展唤醒副核;副核从 park 进入内核(初始化 per-hart 陷阱栈后加入调度) |
-| D9 | 控制台输出锁(多核防交错) | uart.rs 注释 | 多核唤醒前(M2) | 待办:Wrap uart::putc in SpinLock,防止多核同时输出在串口上交错 |
-| D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | 待办:用户进程故障应杀进程而非整机停机(ROADMAP M2 已列,见阶段 2「用户态异常恢复」) |
+| D1 | 中断快速路径(仅保存调用者保存寄存器) | 自审优化报告 | M2 调度器之前 | 触发已到(M2 已收官),**按安全原则延后 M3 评估**:asm ABI 重构(仅存调用者保存寄存器)风险与本轮"安全"目标冲突;收益小(SSTC 已避开每 tick SBI ecall) |
 | D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办:接口形态见 mmu.rs 模块头;x86_64 移植时下沉为 arch::mmu |
-| D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | **P1 已实现**(审计 18 轮):Makefile test-rva23 目标 + CI rva23 job;cpu.rs 模块(ISA 诊断输出);扩展编译+`-cpu max` 冒烟通过。P2/P3 待 M2/M2+ |
+| D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | **P1 已实现**(审计 18 轮):Makefile test-rva23 目标 + CI rva23 job;cpu.rs 模块(ISA 诊断输出);扩展编译+`-cpu max` 冒烟通过。**P2 按 M2 收官决策延后 M2+**(Zicboz 页清零加速/Svpbmt 真机 MMIO/Zacas 原子,留待真机 bring-up 与后续里程碑评估),P3 仍 M2+ |
 | D18 | early_trap 最小诊断输出(真机 bring-up 期 UART 未就绪时静默停机,审计 17 轮 INFO-4;文档化为 bring-up 风险,真机适配时落实) | 审计 17 轮 INFO-4 | 真机 bring-up | 待办 |
-| D19 | 多核调度器支持 | 审计 18 轮 | M2+ | 待办:per-CPU 空闲线程/idle 循环、per-CPU 就绪队列(或全局锁+迁移)、线程亲和性;当前 SCHED 全局锁在单核下正确,多核下可工作但不缩放 |
 | D21 | UART 波特率分频按 FDT clock-frequency 计算 | 审计多轮 pro #6 | 真机 bring-up 前(不属 M1.5:M1.5 全部 QEMU 内) | 待办:当前固定分频 0x0C(QEMU 忽略);读串口节点 clock-frequency,分频 = clk/(16×波特率) |
 | D23 | 早期 UART 用硬编码基址(V4 MED):uart::init 在 FDT 解析前写默认 0x10000000,真机若不在该址会误写无关 MMIO | 审计 V4 MED | 真机 bring-up 前 | 待办:真机须先解析 FDT(或经 SBI 调试控制台)再驱动 UART;reinit 对 QEMU 足够 |
-| D24 | FDT 多内存 bank / `#address-cells`/`#size-cells` 变体:当前只取首个 reg 对且仅 2-cell/1-cell | 自审(挑剔视角) | M2/真机 | 待办:多 bank 需 buddy 支持不连续区间;`#cells` 变体(如 3-cell)需按 node 解析 cells 属性 |
+| D24 | FDT 多内存 bank / `#address-cells`/`#size-cells` 变体:当前只取首个 reg 对且仅 2-cell/1-cell | 自审(挑剔视角) | 真机 bring-up | 待办:M2 收官决策**延至真机 bring-up**(QEMU 单 bank 无触发条件);多 bank 需 buddy 支持不连续区间;`#cells` 变体(如 3-cell)需按 node 解析 cells 属性 |
 
 ## 已实现(落地)
 
@@ -36,6 +31,11 @@
 | D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析已落地) | riscv64.rs 增 USE_SSTC 标志 + arm_timer 双路径;enable_timer 首次用 SBI(不怕 trap),cpu::init_from_fdt 检测 isa 含 sstc 则切 stimecmp |
 | D20 | 线程栈守护页(**用户态部分**) | 审计 V3 M1 | M2(每进程地址空间) | 每进程地址空间(M2 T1.5):用户栈下 4KB 守护页(分配不映射,`mmu::is_mapped` 结构性校验);**内核线程栈(堆分配 16KB)守护页仍无,属遗留风险**(见 reports/2026-08-28-m2-t15-addrspace.md) |
 | D22 | woken 高优先级线程的抢占(V4 审计 HIGH):on_tick 只认 frame_valid,被唤醒线程(ctx_valid-only)无法被定时器抢占 → 低优忙循环可长时间饿死高优 | 审计 V4 HIGH | M2(IPC 依赖 wake 驱动抢占) | sched.rs(M2 T2a):on_tick/pick_next(false) 候选谓词放宽为 `frame_valid \|\| (ctx_valid && woken)`;被唤醒 ctx 线程经 `expand_ctx_to_frame` 展开为 S 模式帧再 frame_restore(sepc=ctx.ra、SPP=1),同步消费 woken。IPC 阻塞唤醒后即可抢占忙循环;PIP(T2b)依赖此基础 |
+| D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前(M2) | sched.rs/entry.S(M2 T3a):陷阱栈按 hartid 数组,sscratch 指向 per-hart 栈顶;副核唤醒后各自初始化 |
+| D8 | 副核唤醒与多核 bring-up | 自审/ROADMAP | M2+ | entry.S/sched.rs(M2 T3a):引导者仲裁赢家经 SBI IPI/HSM 唤醒副核;副核从 park 进入内核,初始化 per-hart 陷阱栈后加入调度 |
+| D9 | 控制台输出锁(多核防交错) | uart.rs 注释 | 多核唤醒前(M2) | uart.rs(M2 T3a):uart::putc 加 SpinLock,多核输出不再交错 |
+| D12 | 陷阱异常恢复路径(现为诊断后停机) | 多轮审计 | M2 用户态(需 per-hart 应急栈) | arch/riscv64.rs + sched.rs/process.rs/mmu.rs/ipc.rs(M2 D12):用户态故障(SPP=0)经 `kill_current_process` 杀进程 —— 清 IPC 挂起 + 标记线程退出 + 撤捐赠(双向)+ 切内核根表 + `process::destroy` 回收地址空间页;内核态故障仍停机。详见 `reports/2026-08-29-m2-d12-recovery-perf.md` |
+| D19 | 多核调度器支持 | 审计 18 轮 | M2+ | sched.rs(M2 T3b):per-CPU 空闲线程/idle 循环、per-CPU 就绪队列、线程亲和性(hart 亲和,enqueue/唤醒按亲和核归位);SCHED 全局锁保持(正确性优先,缩放留待 M3) |
 
 ## 已关闭(被替代/无需再做)
 

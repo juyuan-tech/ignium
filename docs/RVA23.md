@@ -8,7 +8,9 @@
 | QEMU virt 默认 CPU | `rv64imafdch` + `time,sstc` | —(QEMU 默认 CPU 也不完整,需 `-cpu max`) |
 | 使用的扩展 | A(原子)、C、Zicsr、Sv39 | — |
 
-**结论**:内核与工具链只覆盖 RVA23 的"RV64GC 子集",差距显著。
+**结论**:P1 已实现(编译目标扩展 Zba/Zbb/Zbs+Zicond + CI `-cpu max` 基线 +
+ISA 探测,见 §3);P2/P3 按 M2 收官决策延后(M2+ / 真机 bring-up)。整体距
+完整 RVA23 仍有差距,但"带扩展编译、子集平台仍可运行"的验证基线已建立。
 
 ## 2. RVA23 强制扩展差距清单
 
@@ -35,17 +37,18 @@
 
 ## 3. 支持计划(分阶段)
 
-### 阶段 P1(建议 M1.5):编译目标扩展 + 验证基线
-- [ ] 通过 `-C target-feature` 或自定义 target 启用 **Zba+Zbb+Zbs(+Zicond)**
-      (riscv64gc 基础上追加;gc 兼容 CPU 保证向后可运行)
-- [ ] CI 增加 `-cpu max` 引导矩阵(与默认 CPU 双跑,防特性回退)
-- [ ] 新增 `kernel/src/cpu.rs` 启动探测:读 `misa`/平台 ISA 字符串,
+### 阶段 P1(建议 M1.5):编译目标扩展 + 验证基线 —— ✅ 已实现
+- [x] 通过 `-C target-feature` 或自定义 target 启用 **Zba+Zbb+Zbs(+Zicond)**
+      (riscv64gc 基础上追加;gc 兼容 CPU 保证向后可运行)—— `make test-rva23`
+- [x] CI 增加 `-cpu max` 引导矩阵(与默认 CPU 双跑,防特性回退)—— CI rva23 job
+- [x] 新增 `kernel/src/cpu.rs` 启动探测:读 `misa`/平台 ISA 字符串,
       记录可用扩展(诊断 + 断言强制项)
 
-### 阶段 P2(M2):硬件特性利用
-- [ ] **Zicboz** 实现 `mem::zero_page`(无 Zicboz 时回退循环)
-- [ ] **Svpbmt** 为 MMIO/页表页设置内存类型(真机正确性)
-- [ ] **Zacas** 引入双字原子(能力表/无锁队列)
+### 阶段 P2(M2):硬件特性利用 —— ⏳ 按 M2 收官决策延后至 M2+
+- [ ] **Zicboz** 实现 `mem::zero_page`(无 Zicboz 时回退循环)—— 页清零加速,
+      当前循环实现正确,收益非关键路径
+- [ ] **Svpbmt** 为 MMIO/页表页设置内存类型(真机正确性)—— 需真机 bring-up 验证
+- [ ] **Zacas** 引入双字原子(能力表/无锁队列)—— 调度/能力表规模暂不需要
 - [ ] **Sstc** 可选:定时器改 stimecmp(QEMU 已支持,OpenSBI 兼容层保留)
 
 ### 阶段 P3(M2+,可选):完整性
@@ -67,5 +70,6 @@
 
 ## 5. 登记
 
-- ROADMAP:阶段 P1 挂 M1.5,P2 挂 M2。
+- ROADMAP:阶段 P1 挂 M1.5(✅ 已实现),P2 挂 M2(按决策延至 M2+),
+  P3 挂 M2+(可选)。
 - DEFERRED.md 同步条目(见 D16)。

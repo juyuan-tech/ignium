@@ -45,6 +45,14 @@ make gdb     # QEMU + GDB (gdb-multiarch, 端口 1234)
 [000000] [INFO ] M1: kernel heap selftest ok (slab 16B..2KB + page path)
 [000001] [INFO ] M1: scheduler selftest ok (cooperative + preemptive)
 [000001] [INFO ] M1: sync primitives selftest ok (mutex + condvar)
+...
+[0000xx] [INFO ] M2 T3c: shared mem ok
+[0000xx] [INFO ] M2 T3c: cap dup/revoke ok
+[0000xx] [ERROR] D12: user fault scause=0xd sepc=0x40000000 stval=0x0; killing process
+[0000xx] [INFO ] M2: user fault recovery ok (process killed, system alive)
+[0000xx] [INFO ] M2: IPC latency ok (reg-msg ~44k ticks ~4 us/roundtrip)
+[0000xx] [INFO ] bench: slab 64B alloc+dealloc ≈ 179 ns/op
+[0000xx] [INFO ] bench: context switch ≈ 261 ns/op (yield path)
 [000100] [INFO ] uptime: 100 ticks (1000 ms)
 [000200] [INFO ] uptime: 200 ticks (2000 ms)
 ...
@@ -81,17 +89,17 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── entry.S         # _start:SIE 清零/gp 初始化/副核停车/清 BSS/设栈/早期 trap stub
 │   │   ├── logger.rs       # 分级日志(error/warn/info/debug/trace + tick)
 │   │   ├── panic.rs        # panic:位置/消息/CPU dump/栈水位/双 panic 保护
-│   │   ├── process.rs      # 进程与每进程独立地址空间(M2 T1.5:id → satp 根表)+ 简化能力表(T2a:grant_cap/cap_target)
-│   │   ├── ipc.rs          # 同步 IPC(M2 T2a/T2b:寄存器消息 5 字 + 阻塞配对 + 能力授权,未授权 → -errno;NoPeer 阻塞前登记 PIP 捐赠)
+│   │   ├── process.rs      # 进程与每进程独立地址空间(M2 T1.5:id → satp 根表)+ 简化能力表(T2a/T3c:Cap 枚举 + grant/cap_target/dup/revoke)+ 销毁(M2 D12:Shm revoke → 槽失效 → 根表回收)
+│   │   ├── ipc.rs          # 同步 IPC(M2 T2a/T2b/T3c:寄存器消息 5 字 + 阻塞配对 + 能力授权,未授权 → -errno;NoPeer 阻塞前登记 PIP 捐赠)+ 进程被杀时清理(purge_process)
 │   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
-│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ M2 用户映射 + 每进程根表(create_user_root/switch_root/is_mapped)
+│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ M2 用户映射 + 每进程根表(create_user_root/switch_root/is_mapped/destroy_root)
 │   │   ├── heap.rs         # 内核堆(slab 16B..2KB + buddy 页路径,#[global_allocator])
-│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程 + 每进程 satp 切换)
-│   │   ├── syscall.rs      # 用户态系统调用分发(M2 T1/T2a:a7 传号、a0 返回,GET_TICKS/EXIT/SEND/RECV)
+│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程 + 每进程 satp 切换 + D12 杀进程 kill_current_process/捐赠双向清理)
+│   │   ├── syscall.rs      # 用户态系统调用分发(M2 全量:a7 传号、a0 返回,EXIT/GET_TICKS/IPC_SEND/IPC_RECV/SHM_MAP/CAP_REVOKE/CAP_DUP + -errno)
 │   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
-│   │   ├── tests.rs        # M2 引导期冒烟测试(用户线程 ecall + 地址空间隔离 + 同步 IPC 往返/未授权拒绝)
+│   │   ├── tests.rs        # M2 引导期冒烟测试(用户线程 ecall + 地址空间隔离 + 同步 IPC/压力 + 共享内存/能力 + 用户故障恢复 + IPC 延迟基准)
 │   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret/context_switch)
 │   ├── build.rs            # 链接脚本绝对路径传递(CARGO_MANIFEST_DIR)
 │   ├── Cargo.toml
@@ -103,9 +111,10 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   ├── M2-DESIGN.md        # M2 设计(U/S 切换/ecall ABI/IPC/能力/每进程地址空间)
 │   ├── DEFERRED.md         # 延迟项注册表(含触发条件与状态)
 │   ├── RVA23.md            # RVA23 兼容性差距与分阶段支持计划
-│   ├── benchmarks.md       # 性能基线(M1.5 已建)
+│   ├── benchmarks.md       # 性能基线(M1.5 + M2 IPC 延迟/LTO 对比)
 │   ├── reports/            # 详尽报告(每次修复/更新必写)
 │   └── audit-reports/      # 外部 AI 审计留档
+├── ROADMAP.md              # 里程碑路线图(阶段 0→5 + 每步验收)
 ├── .github/                # CI + Issue/PR 模板
 ├── AGENTS.md               # AI 协作者与团队执行规范(红线 + 报告规范)
 ├── CONTRIBUTING.md         # 贡献指南
@@ -121,7 +130,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 
 ## 路线
 
-见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓ / M2 T1 ✓ / M2 T2a ✓ / M2 T2b ✓**(同步 IPC 核心 + 简化能力表 + D22 woken 抢占 + **优先级继承 PIP + IPC 压力测试**),下一步 **M2 T3(共享内存大消息/revoke)**。
+见 [ROADMAP.md](ROADMAP.md)。当前进度:**M1 ✓ / M1.5 ✓ / M2 收官 ✓**(T0-T3c 全部落地:用户态线程 + 每进程地址空间 + 同步 IPC/PIP 压力测试 + 共享内存与能力 + 多核前置 + **用户态异常恢复 D12 + 进程销毁/页回收 + IPC 延迟基准**),下一步 **M3(用户态服务 + L2 兼容)**。
 
 ## 里程碑
 
@@ -130,7 +139,7 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 | M0 ✓ | QEMU 启动 + UART 打印 |
 | M1 ✓ | trap/定时器/内存管理/分页/内核堆/调度/同步原语 |
 | M1.5 ✓ | FDT 解析/页权限拆分/栈守护页/RVA23 P1/压力自检/页表接口补全 |
-| M2 | 用户进程 + IPC + 能力(T1 ✓:用户态线程 + ecall;T2a ✓:同步 IPC 核心 + 能力表 + D22 抢占;T2b ✓:优先级继承 PIP + IPC 压力测试) |
+| M2 ✓ | 用户进程 + IPC + 能力 + 多核前置(T1 ✓ 用户态线程 + ecall;T2a ✓ 同步 IPC 核心 + 能力表 + D22 抢占;T2b ✓ PIP + IPC 压力测试;T3a/b/c ✓ 多核 bring-up + per-CPU 调度 + 共享内存/能力;D12 ✓ 用户态异常恢复 + 进程销毁/页回收 + IPC 延迟基准) |
 | M3 | 用户态服务 + shell |
 | M4 | 健壮性/测试 + OpenHarmony 组件移植 |
 | M5 | x86_64 移植 |
