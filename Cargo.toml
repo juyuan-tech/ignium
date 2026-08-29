@@ -20,3 +20,8 @@ panic = "abort"
 # 发布构建同样开启:内核阶段安全优先;若 M2+ 性能基准显示 IPC 路径
 # 受溢出检查影响,再按子系统局部禁用并记录理由。
 overflow-checks = true
+# M2 安全性能(自审确认零运行时语义变化):整 crate 单 codegen 单元 +
+# fat LTO —— 纯编译期优化,跨模块内联 syscall/调度热路径与桶调度;
+# 不触碰 panic 策略与溢出检查。代价:增量编译变慢(仅发布 profile)。
+lto = "fat"
+codegen-units = 1

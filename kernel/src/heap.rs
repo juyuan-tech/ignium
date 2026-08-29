@@ -312,6 +312,9 @@ pub fn bench() {
         if p.is_null() {
             panic!("bench: alloc oom");
         }
+        // M2 自审:black_box 防止编译器消除 alloc→dealloc 对(LTO 后
+        // LLVM 会把无逃逸的 malloc/free 对整体消除,基准虚报 0 ns/op)。
+        core::hint::black_box(p);
         unsafe { alloc::alloc::dealloc(p, layout) };
     }
     let dt = crate::arch::get_time().wrapping_sub(t0);
