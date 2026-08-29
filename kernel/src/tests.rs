@@ -30,6 +30,8 @@ pub fn boot_tests() {
     boot_process_addrspace_test();
     boot_ipc_test();
     boot_ipc_stress_test();
+    boot_shm_test();
+    boot_cap_test();
 }
 
 /// M2 T1:用户态线程 + ecall 冒烟。
@@ -480,6 +482,201 @@ static STRESS_RECV_COUNT: AtomicUsize = AtomicUsize::new(0);
 static STRESS_RECV_SUM: AtomicUsize = AtomicUsize::new(0);
 static STRESS_SENDER_DONE: AtomicBool = AtomicBool::new(false);
 static STRESS_RECVER_DONE: AtomicBool = AtomicBool::new(false);
+
+// ===== M2 T3c:共享内存(mmap_share)+ 能力 revoke/dup =====
+
+/// M2 T3c:共享内存测试 —— 一页物理内存映射进 A/B 两进程地址空间,双槽改授
+/// `Cap::Shm(id)`;A 写 0xA5、B 读回并写 0xB5;用户态 `syscall 6`(CAP_REVOKE)
+/// 撤销后双 root 映射消失、页回收、双槽失效、注册表出列。
+///
+/// 场景:
+/// 1. A 槽 0 持 `Cap::Proc(B)`;`syscall 5 (SHM_MAP)`(a0=本槽0,a1=对端槽1,
+///    a2=len=4096)→ `mmap_share`:分配一页、映射到 A/B 的 `SHM_VA`,
+///    改授 A 槽0/B 槽1 为 `Cap::Shm(id)`,返回 shm_id(存 A shared[0]);
+/// 2. A 写 `SHM_VA[0]=0xA5` → A done(shared[1]=0x333);
+/// 3. 主上下文经 `shm_paddr(id)` 读物理页,断言 0xA5;
+/// 4. B 读 `SHM_VA[0]`(=0xA5)→ 存 B shared[0];写 `SHM_VA[1]=0xB5` →
+///    存 B shared[1](revoke 后 B 的私有页仍可读的记录);
+/// 5. B `syscall 6 (CAP_REVOKE)`(a0=槽 1,Shm cap)→ 整页撤销,status 存
+///    B shared[2];B done(shared[3]=0x777);
+/// 6. 断言:双 root `is_mapped(SHM_VA)==false`、双槽失效(NotFound)、
+///    `shm_paddr(id)==None`(注册表出列)。页回收经 revoke status==0 验证
+///    (shm_revoke 内部 `free_pages` 失败会返回错误)。
+fn boot_shm_test() {
+    // 1) 建进程 A/B;A 槽 0 持 Cap::Proc(B)。B 槽 1 初始为空,由 mmap_share 改授。
+    let a_pid = crate::process::create().expect("shm: create A");
+    let b_pid = crate::process::create().expect("shm: create B");
+    let root_a = crate::process::root(a_pid);
+    let root_b = crate::process::root(b_pid);
+    assert!(
+        crate::process::grant_cap(a_pid, 0, b_pid).is_ok(),
+        "shm: grant cap(A,0,B)"
+    );
+    // 2) 用户程序(机器码逐条核对 S 型/I 型立即数;A 建共享,B 读回+撤销)。
+    let prog_a: [u32; 14] = [
+        0x4000_12b7, // lui   t0, 0x40001        (t0 = shared)
+        0x0000_0513, // addi  a0, x0, 0         (SHM_MAP: 本槽 0)
+        0x0010_0593, // addi  a1, x0, 1         (对端槽 1)
+        0x0000_1637, // lui   a2, 1             (len = 4096)
+        0x0050_0893, // addi  a7, x0, 5         (SYSCALL_SHM_MAP)
+        0x0000_0073, // ecall
+        0x00a2_a023, // sw    a0, 0(t0)         (shared[0] = shm_id)
+        0x5000_0337, // lui   t1, 0x50000       (t1 = SHM_VA)
+        0x0a50_0393, // addi  t2, x0, 0xA5
+        0x0073_2023, // sw    t2, 0(t1)         (SHM_VA[0] = 0xA5)
+        0x3330_0313, // addi  t1, x0, 0x333     (done marker)
+        0x0062_a223, // sw    t1, 4(t0)         (shared[1] = 0x333)
+        0x0010_0893, // addi  a7, x0, 1         (SYSCALL_EXIT)
+        0x0000_0073, // ecall
+    ];
+    let prog_b: [u32; 15] = [
+        0x4000_12b7, // lui   t0, 0x40001        (t0 = shared)
+        0x5000_0337, // lui   t1, 0x50000        (t1 = SHM_VA)
+        0x0003_2e03, // lw    t3, 0(t1)          (t3 = SHM_VA[0] = 0xA5)
+        0x01c2_a023, // sw    t3, 0(t0)          (shared[0] = 0xA5)
+        0x0b50_0393, // addi  t2, x0, 0xB5
+        0x0073_2223, // sw    t2, 4(t1)          (SHM_VA[1] = 0xB5)
+        0x0072_a223, // sw    t2, 4(t0)          (shared[1] = 0xB5 记录)
+        0x0010_0513, // addi  a0, x0, 1          (CAP_REVOKE: 槽 1 = Shm cap)
+        0x0060_0893, // addi  a7, x0, 6          (SYSCALL_CAP_REVOKE)
+        0x0000_0073, // ecall
+        0x00a2_a423, // sw    a0, 8(t0)          (shared[2] = revoke status)
+        0x7770_0313, // addi  t1, x0, 0x777      (done marker)
+        0x0062_a623, // sw    t1, 12(t0)         (shared[3] = 0x777)
+        0x0010_0893, // addi  a7, x0, 1          (SYSCALL_EXIT)
+        0x0000_0073, // ecall
+    ];
+    let (_, a_shared_pa) = map_iso_proc(root_a, &prog_a);
+    let (_, b_shared_pa) = map_iso_proc(root_b, &prog_b);
+    let a_shared = a_shared_pa as *const u32;
+    let b_shared = b_shared_pa as *const u32;
+    // 3) spawn A:主上下文 yield 轮询,直至 A 建好共享页并写 done 标记。
+    crate::sched::spawn_user(a_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    let mut guard = 0;
+    while unsafe { core::ptr::read_volatile(a_shared.add(1)) } != 0x333 {
+        assert!(guard < 200_000, "A did not create shm");
+        crate::sched::yield_();
+        guard += 1;
+    }
+    let shm_id = unsafe { core::ptr::read_volatile(a_shared) } as usize;
+    // 4) revoke 前:物理页已有 A 写的 0xA5(同一页 = SHM_VA+0)。
+    let paddr = crate::shm::shm_paddr(shm_id).expect("shm: must be registered");
+    assert!(
+        unsafe { core::ptr::read_volatile(paddr as *const u32) } == 0xA5,
+        "shm: A marker before revoke"
+    );
+    // 5) spawn B:轮询 B done(读回、写记录、revoke 全部完成)。
+    crate::sched::spawn_user(b_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    let mut guard = 0;
+    while unsafe { core::ptr::read_volatile(b_shared.add(3)) } != 0x777 {
+        assert!(guard < 200_000, "B shm roundtrip timeout");
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 6) B 读到的共享页值 == 0xA5;B 写回记录 == 0xB5(revoke 后仍可读);
+    //    revoke status == 0(整页撤销成功,页已回收)。
+    let b_read = unsafe { core::ptr::read_volatile(b_shared) };
+    assert!(
+        b_read == 0xA5,
+        "shm: B must read A marker (got {b_read:#x})"
+    );
+    assert!(
+        unsafe { core::ptr::read_volatile(b_shared.add(1)) } == 0xB5,
+        "shm: B must write B marker"
+    );
+    assert!(
+        unsafe { core::ptr::read_volatile(b_shared.add(2)) } == 0,
+        "shm: B revoke must succeed"
+    );
+    // 7) revoke 后:双 root 均不映射 SHM_VA;双槽失效;注册表出列。
+    assert!(
+        !crate::mmu::is_mapped(root_a, crate::shm::SHM_VA),
+        "shm: A map must be gone"
+    );
+    assert!(
+        !crate::mmu::is_mapped(root_b, crate::shm::SHM_VA),
+        "shm: B map must be gone"
+    );
+    assert!(
+        crate::process::cap_target(a_pid, 0) == Err(crate::process::CapError::NotFound),
+        "shm: A cap slot must be cleared"
+    );
+    assert!(
+        crate::process::cap_target(b_pid, 1) == Err(crate::process::CapError::NotFound),
+        "shm: B cap slot must be cleared"
+    );
+    assert!(
+        crate::shm::shm_paddr(shm_id).is_none(),
+        "shm: registry must be drained"
+    );
+    info!("M2 T3c: shared mem ok (map/revoke)");
+}
+
+/// M2 T3c:能力 dup/revoke 测试 —— Proc 能力的复制与撤销语义。
+///
+/// A 槽 0 持 `Cap::Proc(B)`:
+/// 1. `syscall 7 (CAP_DUP)`(a0=源槽0, a1=目标槽2)→ 复制 Cap 值到槽 2,
+///    status 存 shared[0];
+/// 2. `syscall 6 (CAP_REVOKE)`(a0=槽 0,Proc cap)→ 仅清原槽,status 存
+///    shared[1];
+/// 3. A done(shared[2]=0x777)。
+///
+/// 断言:dup/revoke 均成功;槽 2 仍持 `Cap::Proc(B)`(dup 副本不受 revoke
+/// 影响);槽 0 已失效(NotFound)。
+fn boot_cap_test() {
+    let a_pid = crate::process::create().expect("cap: create A");
+    let b_pid = crate::process::create().expect("cap: create B");
+    let root_a = crate::process::root(a_pid);
+    assert!(
+        crate::process::grant_cap(a_pid, 0, b_pid).is_ok(),
+        "cap: grant cap(A,0,B)"
+    );
+    let prog: [u32; 14] = [
+        0x4000_12b7, // lui   t0, 0x40001       (t0 = shared)
+        0x0000_0513, // addi  a0, x0, 0         (CAP_DUP: 源槽 0)
+        0x0020_0593, // addi  a1, x0, 2         (目标槽 2)
+        0x0070_0893, // addi  a7, x0, 7         (SYSCALL_CAP_DUP)
+        0x0000_0073, // ecall
+        0x00a2_a023, // sw    a0, 0(t0)         (shared[0] = dup status)
+        0x0000_0513, // addi  a0, x0, 0         (CAP_REVOKE: 槽 0)
+        0x0060_0893, // addi  a7, x0, 6         (SYSCALL_CAP_REVOKE)
+        0x0000_0073, // ecall
+        0x00a2_a223, // sw    a0, 4(t0)         (shared[1] = revoke status)
+        0x7770_0313, // addi  t1, x0, 0x777     (done marker)
+        0x0062_a423, // sw    t1, 8(t0)         (shared[2] = 0x777)
+        0x0010_0893, // addi  a7, x0, 1         (SYSCALL_EXIT)
+        0x0000_0073, // ecall
+    ];
+    let (_, a_shared_pa) = map_iso_proc(root_a, &prog);
+    let a_shared = a_shared_pa as *const u32;
+    crate::sched::spawn_user(a_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    let mut guard = 0;
+    while unsafe { core::ptr::read_volatile(a_shared.add(2)) } != 0x777 {
+        assert!(guard < 200_000, "cap dup/revoke timeout");
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // dup 成功(status 0);revoke 成功(status 0)。
+    assert!(
+        unsafe { core::ptr::read_volatile(a_shared) } == 0,
+        "cap: dup must succeed"
+    );
+    assert!(
+        unsafe { core::ptr::read_volatile(a_shared.add(1)) } == 0,
+        "cap: revoke must succeed"
+    );
+    // dup 槽 2 仍指向 B;revoke 只清原槽 0。
+    use crate::process::Cap;
+    assert!(
+        crate::process::cap_target(a_pid, 2) == Ok(Cap::Proc(b_pid)),
+        "cap: dup slot must point to B"
+    );
+    assert!(
+        crate::process::cap_target(a_pid, 0) == Err(crate::process::CapError::NotFound),
+        "cap: revoked slot must be gone"
+    );
+    info!("M2 T3c: cap dup/revoke ok");
+}
 
 // ===== M2 T3b:per-CPU 调度(D19) =====
 

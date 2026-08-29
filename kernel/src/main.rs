@@ -30,6 +30,7 @@ mod panic;
 mod process;
 mod sbi;
 mod sched;
+mod shm;
 mod sync;
 mod syscall;
 mod tests;
@@ -172,8 +173,10 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
         Ok(()) => info!("M1: sync primitives selftest ok (mutex + condvar)"),
         Err(e) => panic!("sync primitives selftest failed: {e}"),
     }
-    // M2 引导期冒烟测试(T1 用户态 + T1.5 每进程地址空间,定义与说明
-    // 见 tests.rs)。置于 irq_enable 之前,隔离定时器中断干扰。
+    // M2 T3c:共享页注册表容量预留(在 boot_tests 之前,引导期非 ISR 分配)。
+    shm::init();
+    // M2 引导期冒烟测试(T1 用户态 + T1.5 每进程地址空间 + T3c 共享内存,
+    // 定义与说明见 tests.rs)。置于 irq_enable 之前,隔离定时器中断干扰。
     tests::boot_tests();
     // D8:唤醒副核。放 boot_tests 之后(单核确定性不受扰)与
     // irq_enable 之前(副核上线即 idle 停等,不开中断不影响其引导)。

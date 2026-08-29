@@ -482,10 +482,10 @@ pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
 
 /// 冲刷 TLB(全部)。
 ///
-/// arch 层契约接口(DESIGN.md arch_mmu_*):当前未在热路径使用
-/// (`map_user_page`/`unmap_4k` 用单地址 sfence,`switch_root` 切换时
-/// 全量 sfence),保留供 T2 页回收/批量解除映射使用。
-#[allow(dead_code)] // arch 契约 API;当前无调用方
+/// arch 层契约接口(DESIGN.md arch_mmu_*):`map_user_page`/`unmap_4k`
+/// 用单地址 sfence,`switch_root` 切换时全量 sfence。T3c 共享页 revoke
+/// 撤销双方映射后调用本函数作当前核 TLB 全量兜底(跨核 shootdown 以
+/// "satp 切换全刷 + 本核 sfence"简化,M2 单页共享、revoke 即销毁页)。
 pub fn tlb_flush() {
     unsafe {
         asm!("sfence.vma zero, zero", options(nostack));

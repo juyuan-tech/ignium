@@ -12,6 +12,17 @@ pub const SYSCALL_EXIT: usize = 1;
 pub const SYSCALL_GET_TICKS: usize = 2;
 pub const SYSCALL_IPC_SEND: usize = 3;
 pub const SYSCALL_IPC_RECV: usize = 4;
+pub const SYSCALL_SHM_MAP: usize = 5;
+pub const SYSCALL_CAP_REVOKE: usize = 6;
+pub const SYSCALL_CAP_DUP: usize = 7;
+
+/// 负 errno 的 usize 编码(与 L1 ABI 一致,见 M2-DESIGN §4.1)。
+/// 统一存放本模块:ipc.rs 的 `IPC_ERR_*` 与其别名,process::cap_errno
+/// 亦引用 —— 单一事实来源。
+pub const SYS_ERR_EINVAL: usize = usize::MAX;
+pub const SYS_ERR_EACCES: usize = usize::MAX - 1;
+pub const SYS_ERR_ENOENT: usize = usize::MAX - 2;
+pub const SYS_ERR_ENOMEM: usize = usize::MAX - 3;
 
 /// 帧 GPR 槽位(arch::gpr 索引别名;x(n+1),如 A0=x10)。
 const GPR_A0: usize = crate::arch::gpr::X_A0; // x10
@@ -87,6 +98,57 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
                 }
                 Err(code) => {
                     unsafe { *frame.add(GPR_A0) = code };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
+        }
+        SYSCALL_SHM_MAP => {
+            // a0=本槽, a1=对端槽, a2=len;成功返回 a0=shm_id,失败负 errno。
+            let a_slot = unsafe { *frame.add(GPR_A0) };
+            let b_slot = unsafe { *frame.add(GPR_A1) };
+            let len = unsafe { *frame.add(GPR_A2) };
+            match crate::shm::mmap_share(crate::sched::current_proc(), a_slot, b_slot, len) {
+                Ok(id) => {
+                    unsafe { *frame.add(GPR_A0) = id };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(code) => {
+                    unsafe { *frame.add(GPR_A0) = code };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
+        }
+        SYSCALL_CAP_REVOKE => {
+            // a0=槽;成功 a0=0;Cap::Shm → 整页撤销,Cap::Proc → 清槽。
+            let slot = unsafe { *frame.add(GPR_A0) };
+            match crate::process::cap_revoke(crate::sched::current_proc(), slot) {
+                Ok(()) => {
+                    unsafe { *frame.add(GPR_A0) = 0 };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(e) => {
+                    unsafe { *frame.add(GPR_A0) = crate::process::cap_errno(e) };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
+        }
+        SYSCALL_CAP_DUP => {
+            // a0=源槽, a1=目标槽;成功 a0=0。
+            let from = unsafe { *frame.add(GPR_A0) };
+            let to = unsafe { *frame.add(GPR_A1) };
+            match crate::process::cap_duplicate(crate::sched::current_proc(), from, to) {
+                Ok(()) => {
+                    unsafe { *frame.add(GPR_A0) = 0 };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(e) => {
+                    unsafe { *frame.add(GPR_A0) = crate::process::cap_errno(e) };
                     unsafe { *frame.add(FRAME_SEPC) += 4 };
                     false
                 }

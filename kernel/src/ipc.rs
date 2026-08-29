@@ -36,16 +36,16 @@
 
 use alloc::collections::VecDeque;
 
-use crate::process::CapError;
+use crate::process::Cap;
 use crate::sync::SpinLock;
 
 /// 寄存器消息字数(经 a1..a5 传输)。
 pub const MSG_WORDS: usize = 5;
 
-/// `-EINVAL`(槽越界)以 usize 表示。
-pub const IPC_ERR_EINVAL: usize = usize::MAX;
-/// `-EACCES`(未授权/空槽)以 usize 表示。
-pub const IPC_ERR_EACCES: usize = usize::MAX - 1;
+/// `-EACCES`(未授权/空槽)以 usize 表示(single source:syscall.rs)。
+pub const IPC_ERR_EACCES: usize = crate::syscall::SYS_ERR_EACCES;
+// T3c:`-EINVAL`(槽越界 / Cap::Shm 类型错误)由 `process::cap_errno`
+// (InvalidSlot/WrongType → SYS_ERR_EINVAL)统一编码,不再单列别名。
 
 /// send 结果:配对成功 / 暂无可配 recv(调用方阻塞)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,23 +99,23 @@ static IPC: SpinLock<IpcState> = SpinLock::new(IpcState {
     recvs: VecDeque::new(),
 });
 
-/// 能力错误 → 负 errno(usize 编码,与 ABI 一致)。
-fn cap_err_code(err: CapError) -> usize {
-    match err {
-        CapError::InvalidSlot => IPC_ERR_EINVAL,
-        CapError::NotFound => IPC_ERR_EACCES,
-    }
-}
-
 /// 发送消息到 `slot` 指向的目标进程。
 ///
 /// 成功(配对)返回 `Done`;暂无匹配 recv 返回 `NoPeer`(已登记,调用方须
 /// 立即阻塞 —— 见模块头「原子性」);能力校验失败返回负 errno(不阻塞)。
+/// 目标解析要求 `Cap::Proc`;`Cap::Shm`(共享页能力)对 IPC 是类型错误 →
+/// `-EINVAL`(M2 T3c:cap_target 现返回 `Cap` 枚举)。
 pub fn send(pid: usize, slot: usize, msg: [usize; MSG_WORDS]) -> Result<SendBlock, usize> {
     // 1) 能力解析(TABLE 锁,已释放)。失败即返回,不登记、不阻塞。
     let dst = match crate::process::cap_target(pid, slot) {
-        Ok(d) => d,
-        Err(e) => return Err(cap_err_code(e)),
+        Ok(Cap::Proc(d)) => d,
+        // Cap::Shm 对 IPC 是类型错误 → -EINVAL(经 cap_errno(WrongType) 编码)。
+        Ok(Cap::Shm(_)) => {
+            return Err(crate::process::cap_errno(
+                crate::process::CapError::WrongType,
+            ))
+        }
+        Err(e) => return Err(crate::process::cap_errno(e)),
     };
     // 2) 取当前线程 id(SCHED 锁短暂获取、已释放)再取 IPC 锁 ——
     //    保持 SCHED → IPC 顺序,不与「IPC → SCHED」唤醒路径交叉重叠。
@@ -153,10 +153,17 @@ pub fn send(pid: usize, slot: usize, msg: [usize; MSG_WORDS]) -> Result<SendBloc
 /// 成功(配对)返回 `Done(msg)`;暂无匹配 send 返回 `NoPeer`(已登记,调用方
 /// 须立即阻塞);能力校验失败返回负 errno(不阻塞)。
 pub fn recv(pid: usize, slot: usize) -> Result<RecvBlock, usize> {
-    // 1) 能力解析(TABLE 锁,已释放)。
+    // 1) 能力解析(TABLE 锁,已释放);要求 Cap::Proc(共享页能力对 IPC
+    //    是类型错误 → -EINVAL)。
     let src = match crate::process::cap_target(pid, slot) {
-        Ok(s) => s,
-        Err(e) => return Err(cap_err_code(e)),
+        Ok(Cap::Proc(s)) => s,
+        // Cap::Shm 对 IPC 是类型错误 → -EINVAL(经 cap_errno(WrongType) 编码)。
+        Ok(Cap::Shm(_)) => {
+            return Err(crate::process::cap_errno(
+                crate::process::CapError::WrongType,
+            ))
+        }
+        Err(e) => return Err(crate::process::cap_errno(e)),
     };
     // 2) 同 send:先取 tid 再取 IPC 锁。
     let tid = crate::sched::current_id();
