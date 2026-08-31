@@ -207,8 +207,12 @@ pub fn shm_revoke(id: usize) -> Result<(), ()> {
     }
     // 3) 释放物理页(失败即 Err,调用方映射 ShmNotFound —— 页泄漏须暴露)。
     crate::mem::free_pages(sp.paddr).map_err(|_| ())?;
-    // 4) TLB 全量冲刷(当前核;跨核 shootdown 以 satp 切换全刷简化,M2)。
+    // 4) TLB 冲刷:当前核立即刷;**其它在线核经 REMOTE_REQ(TLB_FLUSH)+
+    //    IPI 投递并等待完成**(M3 T2 修复:M2 只刷本核,其它核陈旧 TLB
+    //    项会让其继续读到已释放物理页 —— 泄漏或数据错乱)。远端 SSIP
+    //    handler 仅 sfence,不取 SHM/表锁,无锁序反转。
     crate::mmu::tlb_flush();
+    crate::sched::tlb_shootdown_remote();
     Ok(())
 }
 

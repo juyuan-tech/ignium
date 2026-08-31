@@ -554,11 +554,25 @@ pub unsafe extern "C" fn trap_handler(
             }
             CAUSE_SUPERVISOR_SOFTWARE => {
                 // D19:跨核调度唤醒 —— wake() 对 idle 目标核发 SBI IPI,
-                // 本核从 wfi 醒来收到 S 软中断。仅清挂起位后返回原帧
-                // (wfi 被唤醒,idle 循环会重查本核就绪队列);不在此调度。
-                // 必须清 sip.SSIP,否则挂起位使下次 wfi 立即返回(忙转)。
+                // 本核从 wfi 醒来收到 S 软中断。
+                // M3 T2:扩展为远程请求通道 —— send_remote_req 置位
+                // REMOTE_REQ[h] 后同样发 IPI:TLB_FLUSH → 本核 sfence;
+                // FORCE_KILL → 停杀本核当前线程并切走。必须清 sip.SSIP,
+                // 否则挂起位使下次 wfi 立即返回(忙转)。
+                let h = hartid();
                 unsafe {
                     asm!("csrc sip, {}", in(reg) 2usize, options(nostack));
+                }
+                let req = crate::sched::take_remote_request(h);
+                if req & crate::sched::REMOTE_TLB_FLUSH != 0 {
+                    // 跨核 TLB shootdown:本核冲刷全部地址(revoke 已撤映射,
+                    // 陈旧 TLB 项不能残留)。远端只 sfence,不取 SHM/表锁。
+                    crate::mmu::tlb_flush();
+                }
+                if req & crate::sched::REMOTE_FORCE_KILL != 0 {
+                    // 停杀当前线程并切走(返回下一线程帧,汇编据此 sret;
+                    // 与 on_tick 同构,ISR 内零分配零日志)。
+                    return unsafe { crate::sched::force_kill_current(frame, h) };
                 }
                 frame
             }

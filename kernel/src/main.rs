@@ -67,14 +67,27 @@ pub static mut BOOT_RELEASE: u32 = 0;
 /// D8:已进入 `secondary_main` 的副核数(不含 boot hart)。
 static HARTS_ONLINE: AtomicUsize = AtomicUsize::new(0);
 
+/// M3 T2:已上线副核位图(bit h = hart h 已 mark_online;boot hart 不含,
+/// 跨核请求方总是跳过自身)。`tlb_shootdown_remote` 据此只对**已在跑内核
+/// 的核**发 IPI —— 未上线核 park 在 OpenSBI,无内核 satp/TLB,投递会
+/// 无响应地 200ms 超时(实测 boot 期 shm_revoke 曾触发)。
+static HARTS_ONLINE_MASK: AtomicUsize = AtomicUsize::new(0);
+
 /// 副核进入 idle 后调用(`secondary_main` 内;Relaxed 足够,仅计数)。
 fn mark_online() {
+    let h = crate::arch::hartid();
     HARTS_ONLINE.fetch_add(1, Ordering::Relaxed);
+    HARTS_ONLINE_MASK.fetch_or(1usize << h, Ordering::Relaxed);
 }
 
 /// 已上线副核数(不含 boot hart)。
 fn harts_online() -> usize {
     HARTS_ONLINE.load(Ordering::Relaxed)
+}
+
+/// M3 T2:已上线副核位图(boot hart 位不置;调用方跳过自身)。
+pub(crate) fn harts_online_mask() -> usize {
+    HARTS_ONLINE_MASK.load(Ordering::Relaxed)
 }
 
 /// 发布序屏障(boot hart 发布 BOOT_SATP/BOOT_RELEASE 时使用)。
@@ -193,6 +206,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     // M2 T3b:多核调度冒烟(boot hart、irq_enable 后调用 —— 副核已上线并
     // 进入各自 idle 循环,可接收按亲和性分配的线程)。定义见 tests.rs。
     tests::smp_sched_test();
+    // M3 T2:跨核 IPI 停核 + Running 线程回收 + 跨核 TLB shootdown 冒烟
+    // (跨核场景;单核退化为 N=1 仍打印 banner)。定义见 tests.rs。
+    tests::smp_crosscore_test();
     // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
     // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。
     // LOW-3(审计 17 轮):idle 无 yield 路径,退出线程的栈在此回收

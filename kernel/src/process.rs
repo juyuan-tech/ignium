@@ -25,8 +25,15 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 
-/// 最大进程数(容量预留,与 `MAX_THREADS` 对齐的纪律)。
-pub const MAX_PROCESSES: usize = 16;
+/// 最大存活进程数(纯容量预留:进程表为 `Vec<Process>`,无固定数组/
+/// 位域/ABI 依赖,上限只作资源护栏)。`create` 容量按**存活**进程计,
+/// 已销毁槽位经 `free` FIFO 复用(见 `create`)。
+///
+/// 取值依据:M2 引导冒烟套件本身持有 16 个存活进程(每测试一对/多对
+/// 进程,销毁机制 D12 才落地,遗留进程未清理);M3 T2 跨核停杀/射杀
+/// 测试需再建 3 个。16 + 3 已逼近旧值 16,故提至 32 为后续 M3 服务
+/// (syscall 服务进程)预留余量。
+pub const MAX_PROCESSES: usize = 32;
 
 /// 每进程能力槽数(简化能力表,M2 T2a)。
 ///
@@ -60,7 +67,8 @@ struct Process {
 /// 进程表(IRQ 安全 SpinLock;进程表不进入 ISR 路径)。
 struct ProcessTable {
     slots: Vec<Process>,
-    /// 已销毁进程的槽位(FIFO 复用;本里程碑无销毁,恒空)。
+    /// 已销毁进程的槽位(FIFO 复用;`create` 容量按存活进程计 =
+    /// `slots.len() - free.len()`,见 `create` 注释)。
     free: VecDeque<usize>,
 }
 
@@ -77,7 +85,12 @@ static TABLE: SpinLock<ProcessTable> = SpinLock::new(ProcessTable {
 pub fn create() -> Result<usize, ()> {
     let irq = crate::arch::irq_save();
     let mut t = TABLE.lock();
-    if t.slots.len() >= MAX_PROCESSES {
+    // 容量按**存活**进程计:slots.len() 含已销毁但槽位待复用(在 free
+    // 队列)的进程 —— 用 len - free.len() 判断,否则销毁后槽位永远无法
+    // 复用(M3 T2 实测:boot 测试 16 次 create + 2 次 destroy 后,free 有
+    // 2 个空槽,旧守卫 len>=16 却拒绝后续 create)。
+    let live = t.slots.len().saturating_sub(t.free.len());
+    if live >= MAX_PROCESSES {
         drop(t);
         crate::arch::irq_restore(irq);
         return Err(());

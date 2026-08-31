@@ -1211,3 +1211,174 @@ pub fn smp_sched_test() {
     );
     info!("M2 T3b: per-CPU sched ok ({n} harts)");
 }
+
+// ===== M3 T2:跨核 IPI 停核 + Running 线程回收 + 跨核 TLB shootdown =====
+
+/// 核 1 busy-loop 用户程序:写 marker 0x5A 到 shared(0x4000_1000 物理页)
+/// 后自旋(核 1 独享、不退出 —— 跨核 kill 的目标;若被杀,其下一指令
+/// 永不执行,故自旋体内无副作用)。编码经 rustc 汇编器逐条核对。
+const CC_KILL_PROG: [u32; 4] = [
+    0x4000_12b7, // lui  t0, 0x40001  (t0 = 0x4000_1000 = shared)
+    0x05a0_0313, // addi t1, x0, 0x5a (marker)
+    0x0062_a023, // sw   t1, 0(t0)    (shared[0] = 0x5a)
+    0x0000_006f, // jal  x0, 0        (自旋)
+];
+/// 核 1 SHM 读程序:写 marker 0x5B 到 SHM_VA 后自旋读 SHM_VA。revoke 后
+/// 下一次 `lw` 必须页故障 —— 若核 1 TLB 未被 shootdown 冲刷,线程会从
+/// 陈旧 TLB 读已释放物理页(陈旧数据),永不故障 → 断言超时暴露回归。
+const CC_SHOOTDOWN_PROG: [u32; 5] = [
+    0x5000_02b7, // lui  t0, 0x50000  (t0 = SHM_VA = 0x5000_0000)
+    0x05b0_0313, // addi t1, x0, 0x5b (marker)
+    0x0062_a023, // sw   t1, 0(t0)    (SHM_VA[0] = 0x5b)
+    0x0002_a383, // lw   t2, 0(t0)    (读 SHM_VA;revoke 后此处页故障)
+    0xfe00_0ee3, // beq  x0, x0, -4   (回到 lw,自旋)
+];
+/// 核 1 重新 spawn 的运行标志(停杀后调度器可再分配)。
+static CC_RESPAWN_RAN: AtomicBool = AtomicBool::new(false);
+
+fn cc_respawn_thread() {
+    CC_RESPAWN_RAN.store(true, Ordering::Relaxed);
+}
+
+/// M3 T2 阶段 1:跨核 IPI 停杀 —— 进程 A 的用户线程 Running 于**非 boot
+/// hart**(busy-loop 自旋不退出),boot hart `kill_process(pid)` → 置
+/// `THREAD_KILL_REQUEST` + 发 FORCE_KILL IPI → 目标核 SSIP handler
+/// `force_kill_current` 立即停杀回收(栈 → reaper、槽 → free_slots、状态 →
+/// Exited)。断言:请求全清、槽回收、`pid_root` 失效、目标核可再 spawn。
+fn smp_kill_phase(n: usize) {
+    if n < 2 {
+        return; // 单核退化:无"其它核 Running 线程"场景,由 banner 覆盖。
+    }
+    // 目标核须**非 boot hart**:busy 线程自旋不退出,若亲和 boot hart,测试
+    // 上下文一次 yield 后永不恢复。boot hart 不一定是 hart 0(实测 -smp 4
+    // 为 hart 1),取首个非 boot 核;n≥2 时该核恒存在。
+    let boot = crate::arch::hartid();
+    let tgt = if boot != 0 { 0 } else { 1 };
+    // 1) 建进程 + 用户 busy-loop 线程(亲和核 1)。
+    let pid = crate::process::create().expect("cckill: create process");
+    let root = crate::process::root(pid);
+    let (_, shared_pa) = map_iso_proc(root, &CC_KILL_PROG);
+    let shared = shared_pa as *const u32;
+    let tid = crate::sched::spawn_user(pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    crate::sched::set_affinity(tid, tgt);
+    // 停杀回收基线 = spawn **之后**的空闲槽数:busy 线程可能复用已退出
+    // 线程的槽位(spawn 前 count 已含该槽,回收后回到 spawn 前值,不满足
+    // "> free_before";复用/新槽两种情况在 "> free_after_spawn" 下都能
+    // 正确判定泄漏)。
+    // 2) 等线程在核 1 运行并写 marker(物理页直读;写后自旋,不退出)。
+    let mut guard = 0u32;
+    while unsafe { core::ptr::read_volatile(shared) } != 0x5a {
+        assert!(
+            guard < 200_000,
+            "cckill: busy thread never ran on hart {tgt}"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 3) 跨核杀进程:线程 Running 于核 1,应被 IPI 停杀并回收。
+    let free_after_spawn = crate::sched::free_slot_count();
+    let exited = crate::sched::kill_process(pid);
+    assert!(!exited, "cckill: idle caller must not exit");
+    assert!(
+        crate::process::pid_root(pid).is_none(),
+        "cckill: process must be destroyed"
+    );
+    let free_after_kill = crate::sched::free_slot_count();
+    assert!(
+        free_after_kill > free_after_spawn,
+        "cckill: running thread slot not reclaimed (free {free_after_kill} <= {free_after_spawn} after spawn)"
+    );
+    assert!(
+        crate::sched::pending_kill_request_count() == 0,
+        "cckill: stale kill request remains"
+    );
+    // 4) 核 1 可再 spawn 并运行(停杀后调度器正常)。
+    CC_RESPAWN_RAN.store(false, Ordering::Relaxed);
+    let tid2 = crate::sched::spawn(cc_respawn_thread, crate::sched::PRIO_HIGH);
+    crate::sched::set_affinity(tid2, tgt);
+    guard = 0;
+    while !CC_RESPAWN_RAN.load(Ordering::Relaxed) && guard < 500_000 {
+        guard += 1;
+        crate::sched::yield_();
+    }
+    assert!(
+        CC_RESPAWN_RAN.load(Ordering::Relaxed),
+        "cckill: hart {tgt} cannot respawn after kill"
+    );
+    crate::sched::drain_reaper();
+}
+
+/// M3 T2 阶段 2:跨核 TLB shootdown —— 进程 B 的用户线程 Running 于**非
+/// boot hart** 反复读 SHM_VA(其 TLB 已缓存该页)。boot hart `shm_revoke`
+/// 撤双方映射后对目标核发 TLB_FLUSH IPI(远端 sfence)。断言:B 线程**下一
+/// 次**访存页故障并被 D12 自愈杀死 —— 而非从陈旧 TLB 读到已释放物理页
+/// 的陈旧数据。
+fn smp_shootdown_phase(n: usize) {
+    if n < 2 {
+        return;
+    }
+    // 同 smp_kill_phase:目标核须非 boot hart(busy 读循环自旋不退出)。
+    let boot = crate::arch::hartid();
+    let tgt = if boot != 0 { 0 } else { 1 };
+    // 1) 建 A/B,mmap_share(A,0,B,1) → SHM_VA 双根表映射 + 双槽改授。
+    let a_pid = crate::process::create().expect("ccsd: create A");
+    let b_pid = crate::process::create().expect("ccsd: create B");
+    let root_b = crate::process::root(b_pid);
+    assert!(
+        crate::process::grant_cap(a_pid, 0, b_pid).is_ok(),
+        "ccsd: grant cap(A,0,B)"
+    );
+    let shm_id = crate::shm::mmap_share(a_pid, 0, 1, crate::shm::SHM_LEN).expect("ccsd: mmap");
+    // B 的用户程序写 SHM marker 后自旋读 SHM_VA(map_iso_proc 映射代码页)。
+    let (_, _b_shared_pa) = map_iso_proc(root_b, &CC_SHOOTDOWN_PROG);
+    let tid = crate::sched::spawn_user(b_pid, 0x4000_0000, 0x4000_4000, crate::sched::PRIO_HIGH);
+    crate::sched::set_affinity(tid, tgt);
+    // 2) 等 B 线程在核 1 运行并写 SHM marker(经 shm_paddr 直读物理页)。
+    let paddr = crate::shm::shm_paddr(shm_id).expect("ccsd: shm must be registered");
+    let shm = paddr as *const u32;
+    let mut guard = 0u32;
+    while unsafe { core::ptr::read_volatile(shm) } != 0x5b {
+        assert!(
+            guard < 200_000,
+            "ccsd: B thread never touched SHM on hart {tgt}"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 3) 跨核 revoke:撤双映射 + 释放页 + 对核 1 发 TLB_FLUSH IPI。
+    let kill_before = crate::sched::fault_kill_count();
+    assert!(crate::shm::shm_revoke(shm_id).is_ok(), "ccsd: revoke");
+    assert!(
+        crate::shm::shm_paddr(shm_id).is_none(),
+        "ccsd: shm must be deregistered"
+    );
+    // 4) B 线程下一次访存 SHM_VA 须页故障 → D12 杀 B(证明核 1 TLB 已刷;
+    //    未刷则读陈旧数据、永不故障 → 超时断言失败)。
+    guard = 0;
+    while crate::sched::fault_kill_count() == kill_before {
+        assert!(
+            guard < 500_000,
+            "ccsd: hart {tgt} read stale SHM (TLB not flushed)"
+        );
+        guard += 1;
+        crate::sched::yield_();
+    }
+    assert!(
+        crate::process::pid_root(b_pid).is_none(),
+        "ccsd: B must be killed by D12 after revoke"
+    );
+    // B 已由 D12 销毁;A 仅持已被 revoke 的 Shm cap,destroy 幂等清理。
+    crate::process::destroy(a_pid);
+    crate::sched::drain_reaper();
+}
+
+/// M3 T2:跨核 IPI 停核 + Running 线程回收 + 跨核 TLB shootdown 冒烟
+/// (boot hart、irq_enable 后、smp_sched_test 之后调用)。两阶段均只对
+/// 多核有意义;单核(n=1)退化仍打印 banner。banner:
+/// `M3 T2: cross-core kill/shootdown ok (N harts)`(6 处 grep 同步)。
+pub fn smp_crosscore_test() {
+    let n = crate::board::cpu_count().min(crate::arch::MAX_HARTS);
+    smp_kill_phase(n);
+    smp_shootdown_phase(n);
+    info!("M3 T2: cross-core kill/shootdown ok ({n} harts)");
+}

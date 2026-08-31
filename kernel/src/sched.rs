@@ -576,6 +576,49 @@ impl Scheduler {
         self.threads[next].frame.as_mut_ptr()
     }
 
+    /// M3 T2:停杀本核当前线程并切走(SSIP ISR 内,中断关闭、零分配零日志,
+    /// 只取 SCHED 锁)。与 `on_tick` 同构:返回恢复帧指针,汇编据此 sret。
+    ///
+    /// 语义:`kill_process` 已把该线程的 `THREAD_KILL_REQUEST` 置位;本函数
+    /// 检查**本核当前线程**是否有停杀请求 —— 无(请求发出前线程已自行退出
+    /// 换出,槽可能已复用而由 spawn 清零)直接返回原帧;有则:状态置
+    /// Exited、恢复数据失效、栈移交 reaper、槽入 free_slots、清停杀请求,
+    /// 随后 pick 下一线程并切换(satp 先切)。
+    ///
+    /// 不复制当前帧(线程已死,无需恢复);`next` 必须可帧恢复
+    /// (`pick_next(hart, false)` 只选帧有效或被唤醒的 ctx 线程,后者经
+    /// `expand_ctx_to_frame` 展开)。捐赠已在 `kill_process` 中按进程撤销
+    /// (本函数停杀时该线程无法注册新捐赠 —— 注册必经阻塞路径,而阻塞即
+    /// 换出、`THREAD_KILL_REQUEST[cur]` 必为 false)。
+    fn force_kill_current(&mut self, frame: *mut usize, hart: usize) -> *mut usize {
+        let cur = self.current[hart];
+        if !THREAD_KILL_REQUEST[cur].load(Ordering::Acquire) {
+            // 请求不属于本核当前线程(已换出/已自行退出):无事可做。
+            return frame;
+        }
+        // 停杀:状态/恢复数据失效,栈移交 reaper(用户线程 stack=None,
+        // 安全无操作),槽入 free_slots 复用,清停杀请求。
+        if let Some(stack) = self.threads[cur].stack.take() {
+            self.reaper.push_back(stack);
+        }
+        self.threads[cur].state = ThreadState::Exited;
+        self.threads[cur].frame_valid = false;
+        self.threads[cur].ctx_valid = false;
+        self.threads[cur].woken = false;
+        self.free_slots.push_back(cur);
+        THREAD_KILL_REQUEST[cur].store(false, Ordering::Release);
+        self.ticks_run[hart] = 0;
+        // pick 下一线程(抢占路径:只选帧有效/被唤醒 ctx 线程,可帧恢复)。
+        let next = self.pick_next(hart, false);
+        self.current[hart] = next;
+        if !self.threads[next].frame_valid {
+            self.expand_ctx_to_frame(next);
+        }
+        // 切换 satp 根表(相同则 no-op);汇编据此 sret 进入 next。
+        crate::mmu::switch_root(self.threads[next].root);
+        self.threads[next].frame.as_mut_ptr()
+    }
+
     /// M2 T2a(D22):把线程的协作上下文(ctx)展开为 S 模式陷阱帧。
     ///
     /// 用途:抢占路径(on_tick)选中「被唤醒且仅 ctx_valid」的线程时,
@@ -620,6 +663,9 @@ impl Scheduler {
                 self.threads.len()
             }
         };
+        // M3 T2:槽位复用时清停杀请求 —— 防陈旧 FORCE_KILL 误杀复用槽的
+        // 新线程(旧线程已退出但请求位残留时,新线程占用该槽即安全)。
+        THREAD_KILL_REQUEST[id].store(false, Ordering::Relaxed);
         // 零化-free 栈分配(性能优化):`vec![0u8; N]` 会白付 16KB
         // memset —— 栈内容无需初始化(初始帧/上下文显式构造)。
         // V3 审计 #10:函数名不再误导为"zeroed"。
@@ -705,6 +751,8 @@ impl Scheduler {
                 self.threads.len()
             }
         };
+        // M3 T2:槽位复用时清停杀请求(同 spawn;防陈旧 FORCE_KILL 误杀)。
+        THREAD_KILL_REQUEST[id].store(false, Ordering::Relaxed);
         // MED-10(审计 15 轮):优先级越界钳制,防就绪队列越界 panic。
         let prio = prio.min(PRIO_LEVELS as u8 - 1);
         // M2 T1.5:取所属进程的地址空间根表(缓存进 Thread,供
@@ -1180,6 +1228,132 @@ pub fn current_proc() -> usize {
     p.expect("current_proc: current thread is not a user thread")
 }
 
+// ===== M3 T2:跨核远程请求(IPI 停核 + TLB shootdown) =====
+
+/// 远程请求位:请求目标核冲刷其全部 TLB(shm revoke 跨核失效)。
+pub const REMOTE_TLB_FLUSH: usize = 1 << 0;
+/// 远程请求位:请求目标核**立即停杀**其当前 Running 线程(进程销毁)。
+pub const REMOTE_FORCE_KILL: usize = 1 << 1;
+
+/// per-hart 远程请求字。置位方经 `fetch_or` + SBI IPI 投递;目标核 SSIP
+/// handler 用 `swap(0)` 读取并清空(ack 语义)。新请求若在 swap 之后到达,
+/// 由后续 IPI 再触发一次 SSIP 处理 —— 无丢失唤醒。内存序:置位方 Release
+/// 保证其写(如 revoke 的 unmap / kill 的 THREAD_KILL_REQUEST)对处理方
+/// Acquire 可见。
+static REMOTE_REQ: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
+
+/// 线程停杀请求位(线程 id 索引)。`kill_process` 对 Running 于其它核的
+/// 进程线程置位;目标核 SSIP handler 在 `force_kill_current` 中消费
+/// (置 Exited + 清位)。**槽位复用前必须清零**(spawn/spawn_user)——
+/// 防陈旧请求误杀复用槽的新线程。
+static THREAD_KILL_REQUEST: [AtomicBool; MAX_THREADS] =
+    [const { AtomicBool::new(false) }; MAX_THREADS];
+
+/// 跨核请求有界等待上限(单位:mtimer 周期;20 × 10ms = 200ms)。
+const REMOTE_WAIT_TIMEOUT: usize = 20;
+
+/// kill 停杀目标打包位域:`id | (hart << FORCE_PACK_HART_SHIFT)`。
+/// id < MAX_THREADS(=64)只占低 16 位,hart < MAX_HARTS(=4)位于高位,
+/// 两者互不重叠(打包进单个 usize 数组以省栈,见 kill_process 注释)。
+const FORCE_PACK_ID_MASK: usize = 0xFFFF;
+const FORCE_PACK_HART_SHIFT: usize = 16;
+
+/// 向 `hart` 投递远程请求(置位 + SBI IPI)。
+///
+/// 调用方**必须先释放 SCHED 锁**:目标核 SSIP handler(FORCE_KILL)要取
+/// SCHED 锁停杀,持锁发 IPI 会让目标核在锁外自旋等锁,形成锁序反转。
+/// 本核不发 IPI(请求位由本核直接处理)。IPI 失败仅降级:FORCE_KILL 有
+/// 界等待超时后回退 D12 自愈路径,TLB_FLUSH 由该核下次 satp 切换全刷
+/// 兜底 —— 不阻断主路径。
+fn send_remote_req(hart: usize, bits: usize) {
+    debug_assert!(hart < MAX_HARTS);
+    REMOTE_REQ[hart].fetch_or(bits, Ordering::Release);
+    let rc = crate::sbi::send_ipi(1u64 << hart, 0);
+    if rc != 0 {
+        warn!(
+            "M3 T2: SBI send_ipi(hart {hart}) failed (rc=0x{rc:x}); remote req {bits:#x} pending"
+        );
+    }
+}
+
+/// SSIP handler 读取并清空本核远程请求(ack 语义)。
+pub fn take_remote_request(hart: usize) -> usize {
+    REMOTE_REQ[hart].swap(0, Ordering::AcqRel)
+}
+
+/// M3 T2:跨核 TLB shootdown —— 对除本核外的**已上线**核发 TLB_FLUSH 请求
+/// 并有界等待清空。远端 SSIP handler **只 sfence**,不取 SHM/表锁 → 无锁序
+/// 反转。仅非 ISR 上下文调用(shm_revoke / 测试)。
+pub fn tlb_shootdown_remote() {
+    let n = crate::board::cpu_count().min(crate::arch::MAX_HARTS);
+    let self_h = arch::hartid();
+    // M3 T2(实测修正):只对**已上线**核发 IPI —— 未上线核 park 在 OpenSBI
+    // 的 M 模式 wfi,不识别 S 级 SSIP,投递后无响应只能 200ms 超时并残留
+    // 陈旧请求位(main.rs HARTS_ONLINE_MASK)。boot 期无副核上线时本函数
+    // 退化为纯本地 sfence(shm_revoke 已先刷本核),零开销、零副作用。
+    let online = crate::harts_online_mask();
+    let mut sent = 0usize;
+    for (h, rq) in REMOTE_REQ.iter().enumerate().take(n) {
+        if h == self_h || online & (1usize << h) == 0 {
+            continue;
+        }
+        rq.fetch_or(REMOTE_TLB_FLUSH, Ordering::Release);
+        let rc = crate::sbi::send_ipi(1u64 << h, 0);
+        if rc != 0 {
+            // 目标核未在线/失败:位残留,陈旧 TLB 项由该核下次 satp 切换
+            // 全刷兜底(架构保证不读陈旧映射)。
+            warn!("M3 T2: SBI send_ipi(hart {h}) failed (rc=0x{rc:x}); TLB shootdown degraded");
+        } else {
+            sent += 1;
+        }
+    }
+    if sent == 0 {
+        return;
+    }
+    // 有界等待全部远端 sfence 完成(位被 swap 清空)。中断无关:get_time
+    // 直读 CSR,不依赖本核定时器。
+    let start = arch::get_time();
+    let timeout = arch::timer_interval().wrapping_mul(REMOTE_WAIT_TIMEOUT);
+    loop {
+        let mut all_clear = true;
+        for (h, rq) in REMOTE_REQ.iter().enumerate().take(n) {
+            if h == self_h {
+                continue;
+            }
+            if rq.load(Ordering::Acquire) & REMOTE_TLB_FLUSH != 0 {
+                all_clear = false;
+                break;
+            }
+        }
+        if all_clear {
+            break;
+        }
+        if arch::get_time().wrapping_sub(start) >= timeout {
+            warn!("M3 T2: TLB shootdown timeout; relying on satp-switch full flush");
+            break;
+        }
+    }
+}
+
+/// 已退出、可复用的 TCB 槽数(测试断言:跨核停杀后槽被回收)。
+pub fn free_slot_count() -> usize {
+    let irq = arch::irq_save();
+    let n = {
+        let s = SCHED.lock();
+        s.free_slots.len()
+    };
+    arch::irq_restore(irq);
+    n
+}
+
+/// 未清停杀请求数(测试断言:跨核停杀后请求应全清)。原子读,仅诊断用。
+pub fn pending_kill_request_count() -> usize {
+    THREAD_KILL_REQUEST
+        .iter()
+        .filter(|f| f.load(Ordering::Relaxed))
+        .count()
+}
+
 // ===== M2 D12:用户态异常恢复(进程故障 → 杀进程) =====
 
 /// 已杀进程数(用户态故障→杀进程;测试断言用)。
@@ -1192,38 +1366,70 @@ pub fn fault_kill_count() -> usize {
 
 /// M2 D12:用户态故障 → 杀当前进程并切走(永不返回)。
 ///
-/// 在 trap 上下文调用(trap_handler 同步异常分支、SPP=0 判定后)。顺序:
-/// 1. 诊断输出(`error!`,同步异常路径允许日志;前缀 `D12:` 而非 `TRAP:` ——
-///    门禁把后者当内核故障标志);
-/// 2. `ipc::purge_process(pid)` 清理 IPC pending,唤醒存活的配对方并投递
-///    "对端已亡"错误(IPC → SCHED 锁序);
-/// 3. SCHED 锁内把进程**所有**线程置 `Exited`、恢复数据失效;非当前线程:
-///    非 Running 的栈移交 reaper、槽入 free_slots(当前线程由
-///    `exit_from_trap` 统一处理);**Running 于其它核的线程跳过** —— 已知
-///    局限(其 TCB 归该核调度器所有;地址空间已销毁,其下一次用户访存会
-///    再次走本路径自愈);同时清理指向被杀进程的陈旧捐赠;
-/// 4. `mmu::switch_root(kernel_root())` —— **必须先切走再释放根表**(当前
-///    satp 仍是进程根表,直接释放会使取指/访存立即故障);
-/// 5. `process::destroy(pid)` 销毁进程(revoke Shm → 回收地址空间页 → 槽
-///    失效);已销毁的进程(自愈路径)幂等无操作;
-/// 6. `exit_from_trap()` 切换(切走时 `do_switch` 会 switch_root 到 next
-///    线程根表)。
+/// 在 trap 上下文调用(trap_handler 同步异常分支、SPP=0 判定后)。
+/// 薄封装:`kill_process(pid)` 完成后 `exit_from_trap()` 切走(故障线程
+/// 必属 pid,防御性兜底)。
 pub fn kill_current_process(scause: usize, sepc: usize, stval: usize) -> ! {
-    // 1) 诊断(同步异常路径允许日志;避免字面 "TRAP:" —— 门禁误判)。
+    // 诊断(同步异常路径允许日志;避免字面 "TRAP:" —— 门禁误判)。
     error!("D12: user fault scause={scause:#x} sepc={sepc:#x} stval={stval:#x}; killing process");
     let pid = current_proc();
+    let cur_in_pid = kill_process(pid);
+    if !cur_in_pid {
+        // D12 入口即故障线程所属进程,cur_in_pid 恒真;防御性兜底。
+        error!("D12: faulting thread not part of pid {pid}; halting");
+        arch::halt()
+    }
+    // exit_from_trap 切走(内部再取 SCHED 锁;当前线程由其统一标记退出)。
+    crate::sched::exit_from_trap()
+}
+
+/// M3 T2:按 pid 杀进程(公共核心)。
+///
+/// 顺序:
+/// 1. `ipc::purge_process(pid)` 清理 IPC pending,唤醒存活配对方并投递
+///    "对端已亡"错误(IPC → SCHED 锁序);
+/// 2. SCHED 锁内把进程**所有**线程置 `Exited`、恢复数据失效;非当前线程
+///    (当前线程由 `exit_from_trap` 统一处理):
+///    - 非 Running 的栈移交 reaper、槽入 free_slots;
+///    - **Running 于其它核的线程不再跳过**(M3 T2 修复已知局限):置
+///      `THREAD_KILL_REQUEST` + 记录其所在核;
+///    - 清理指向被杀进程的陈旧捐赠(peer_proc == pid 与 donor 两方向);
+/// 3. 释放 SCHED 锁后,对 Running 于其它核的线程所在核发
+///    `REMOTE_FORCE_KILL` IPI(锁外投递:目标核 SSIP handler 要取 SCHED 锁);
+/// 4. **有界等待**全部停杀请求清空(目标核 `force_kill_current` 消费后置
+///    Exited + 清位);超时 warn 并回退旧 D12 自愈路径(destroy 幂等,残留
+///    线程下一次用户访存再走本路径);
+/// 5. `mmu::switch_root(kernel_root())` —— **必须先切走再释放根表**(当前
+///    satp 可能是进程根表,直接释放会使取指/访存立即故障);
+/// 6. `process::destroy(pid)` 销毁进程(revoke Shm → 回收地址空间页 → 槽
+///    失效);已销毁的进程(自愈路径)幂等无操作;
+///
+/// 返回:当前线程是否属于 `pid`(true = 调用方须 `exit_from_trap` 切走)。
+pub fn kill_process(pid: usize) -> bool {
     FAULT_KILL_COUNT.fetch_add(1, Ordering::Relaxed);
-    // 2) IPC 清理 + 唤醒存活配对方(IPC → SCHED 锁序)。
+    // 1) IPC 清理 + 唤醒存活配对方(IPC → SCHED 锁序)。
     crate::ipc::purge_process(pid);
-    // 3) SCHED 锁内标记全部进程线程。
+    // 2) SCHED 锁内标记全部进程线程;区分"本核当前线程"(exit_from_trap
+    //    统一处理)与"Running 于其它核"(置停杀请求)。
+    //
+    // 栈占用约束(实测 D12 陷阱栈预算 ~7.9KB):kill 路径只允许两个
+    // MAX_THREADS 数组 —— force 目标用 `id | (hart << 16)` 打包进单个
+    // 数组,cur 复用 victims 尾槽。**4 数组版本(force_harts+force_ids+
+    // victims+killed)曾把 D12 陷阱处理器栈溢出进守护页**(S 模式 store
+    // 页故障 → 嵌套 trap → trap_vector 静默停机),故严禁再加数组。
+    let mut victims = [0usize; MAX_THREADS];
+    let mut force = [0usize; MAX_THREADS];
+    let mut n = 0usize;
+    let mut fn_ = 0usize;
+    let cur_in_pid;
     {
         let irq = arch::irq_save();
         let mut s = SCHED.lock();
         let h = arch::hartid();
         let cur = s.current[h];
+        cur_in_pid = s.threads[cur].proc == Some(pid);
         // 收集进程全部线程(除当前线程 —— 由 exit_from_trap 统一处理)。
-        let mut victims = [0usize; MAX_THREADS];
-        let mut n = 0usize;
+        // cur 已排除,故 n ≤ MAX_THREADS-1,尾槽可供 cur 复用。
         for id in 0..s.threads.len() {
             if s.threads[id].proc == Some(pid) && id != cur && n < MAX_THREADS {
                 victims[n] = id;
@@ -1236,8 +1442,15 @@ pub fn kill_current_process(scause: usize, sepc: usize, stval: usize) -> ! {
             q.retain(|&id| !victims[..n].contains(&id));
         }
         for &id in victims.iter().take(n) {
-            // Running 于其它核:该核调度器拥有其 TCB —— 跳过(已知局限)。
             if s.threads[id].state == ThreadState::Running {
+                // Running 于其它核(cur 已排除):其 TCB 归该核调度器所有,
+                // 置停杀请求,由该核 SSIP handler 在 force_kill_current
+                // 中立即回收(不等下一 tick / 用户访存自愈)。
+                THREAD_KILL_REQUEST[id].store(true, Ordering::Release);
+                // 目标核号打包进高位(id < 64 只占低 16 位,与核号互不
+                // 重叠),省一个 512B 数组(见上文栈占用约束)。
+                force[fn_] = id | (s.threads[id].hart << FORCE_PACK_HART_SHIFT);
+                fn_ += 1;
                 continue;
             }
             // 非当前线程:栈移交 reaper(用户线程 stack=None,安全无操作),
@@ -1253,25 +1466,50 @@ pub fn kill_current_process(scause: usize, sepc: usize, stval: usize) -> ! {
         // 清理指向被杀进程的陈旧捐赠(peer_proc == pid,防抬升无主进程)。
         s.revoke_donations_for_proc(pid);
         // 清理被杀进程线程作为 donor 发出的捐赠(防永久抬升其它进程)。
-        // victims + 当前线程(由 exit_from_trap 标记退出)一并撤销。
-        let mut killed = [0usize; MAX_THREADS];
-        let mut kn = 0usize;
-        for &id in victims.iter().take(n) {
-            killed[kn] = id;
-            kn += 1;
-        }
-        killed[kn] = cur;
-        kn += 1;
-        s.revoke_donations_of(&killed[..kn], Some(pid));
+        // victims + 当前线程(由 exit_from_trap 标记退出)一并撤销;
+        // cur 复用 victims 尾槽(收集后 n ≤ MAX_THREADS-1,不越界)。
+        victims[n] = cur;
+        s.revoke_donations_of(&victims[..n + 1], Some(pid));
         drop(s);
         arch::irq_restore(irq);
     }
-    // 4) 先切回内核根表,再释放进程根表(当前 satp 仍是进程根表)。
+    // 3) 锁外:对 Running 于其它核的线程所在核发 FORCE_KILL IPI。
+    for &pk in force.iter().take(fn_) {
+        send_remote_req(pk >> FORCE_PACK_HART_SHIFT, REMOTE_FORCE_KILL);
+    }
+    // 4) 有界等待全部停杀请求清空(目标核 force_kill_current 消费)。
+    if fn_ > 0 {
+        let start = arch::get_time();
+        let timeout = arch::timer_interval().wrapping_mul(REMOTE_WAIT_TIMEOUT);
+        loop {
+            let mut all_clear = true;
+            for &pk in force.iter().take(fn_) {
+                let id = pk & FORCE_PACK_ID_MASK;
+                if THREAD_KILL_REQUEST[id].load(Ordering::Acquire) {
+                    all_clear = false;
+                    break;
+                }
+            }
+            if all_clear {
+                break;
+            }
+            if arch::get_time().wrapping_sub(start) >= timeout {
+                // 超时:目标核未能及时停杀(如该核长时间关中断 / 线程已
+                // 自行退出但槽未复用,请求位残留)。回退旧自愈路径 ——
+                // destroy 幂等,残留线程下一次用户访存走 D12。
+                warn!(
+                    "M3 T2: cross-core kill timeout for {fn_} thread(s) of pid {pid}; \
+                     falling back to D12 self-heal"
+                );
+                break;
+            }
+        }
+    }
+    // 5) 先切回内核根表,再释放进程根表(当前 satp 可能是进程根表)。
     crate::mmu::switch_root(crate::mmu::kernel_root());
-    // 5) 销毁进程(revoke Shm → 回收地址空间页 → 槽失效)。
+    // 6) 销毁进程(revoke Shm → 回收地址空间页 → 槽失效);destroy 幂等。
     crate::process::destroy(pid);
-    // 6) exit_from_trap 切走(内部再取 SCHED 锁;当前线程由其统一标记退出)。
-    crate::sched::exit_from_trap()
+    cur_in_pid
 }
 
 /// 回收已退出线程的栈(LOW-3/审计 17 轮):idle 循环调用,配合
@@ -1479,6 +1717,17 @@ fn do_switch(t: &SwitchTarget) {
 pub unsafe fn on_tick(frame: *mut usize, hart: usize) -> *mut usize {
     let mut s = SCHED.lock();
     s.on_tick(frame, hart)
+}
+
+/// M3 T2:SSIP 停杀回调(目标核 ISR 上下文)。与 on_tick 同构:中断关闭、
+/// 零分配零日志,仅取 SCHED 锁。返回恢复帧指针(汇编据此 sret 进入下一
+/// 线程);`kill_process` 的锁外有界等待轮询 `THREAD_KILL_REQUEST` 确认。
+///
+/// # Safety
+/// `frame` 必须是当前陷阱帧(见 trap_handler);`hart` = 当前运行核。
+pub unsafe fn force_kill_current(frame: *mut usize, hart: usize) -> *mut usize {
+    let mut s = SCHED.lock();
+    s.force_kill_current(frame, hart)
 }
 
 /// M2 T3b(D19):把线程 `id` 的亲和性设为 `hart`(迁移其就绪队列)。
