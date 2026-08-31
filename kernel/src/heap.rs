@@ -13,8 +13,11 @@
 //!   见 sync.rs 约束与 DEFERRED D11)。
 //! - **OOM**:分配内部 panic(`handle_alloc_error` 走稳定路径,
 //!   无需 unstable 属性)。
-//! - slab 页释放策略:当前**永不归还** buddy(每档最多 1~2 页,
-//!   M1 规模可接受;归还与页回收在 M2 引入)。
+//! - **slab 页归还(M2)**:全空的**非 head** slab 页在下次任一档
+//!   grow 时被懒回收扫描摘链、复位判别表后归还 buddy(空页检测不
+//!   依赖 used 计数,沿空闲槽链数到容量即空)。head 页保留作每档
+//!   快复用缓存 —— 单槽 alloc→dealloc churn 恒复用 head,不触发
+//!   取/还页,bench 快路径与引入前逐指令一致(数值不变)。
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -28,9 +31,10 @@ use crate::sync::SpinLock;
 const SLAB_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
 /// 非 slab 页标记。
 const NOT_SLAB: u8 = 0xFF;
-/// 每页 slab 头(页首 16 字节)。
+/// 每页 slab 头(页首 16 字节;槽自 page+size 起,16B 档时 header
+/// 恰好占满首槽位,32B 档起留 16B 空档)。
 struct SlabHeader {
-    /// 同档 slab 页链(预留;M1 无页回收,仅维护)。
+    /// 同档 slab 页链(head → next → …);空页懒回收时摘链。
     next: *mut SlabHeader,
     /// 空闲槽链表头(槽内首字存 next 地址;哨兵 = usize::MAX)。
     free_list: usize,
@@ -174,6 +178,9 @@ impl KernelHeap {
 
     /// 新建一页 slab 并构建空闲槽链表,返回页头。
     unsafe fn new_slab(&mut self, idx: usize) -> *mut SlabHeader {
+        // M2 懒回收:grow 前扫描全部档,把"全空且非 head"的 slab 页
+        // 摘链归还 buddy(冷路径;head 页保留,热路径逐指令不变)。
+        unsafe { self.sweep_empty_pages() };
         let page = mem::alloc_pages(0).expect("kernel heap: slab page OOM");
         let size = SLAB_SIZES[idx];
         // 槽从 page+size 开始(页首 size 字节被 header 占用;
@@ -200,6 +207,62 @@ impl KernelHeap {
         // 登记判别表。
         slab_class_set(page, idx as u8);
         header
+    }
+
+    /// 懒回收:扫描全部档,把"全空且非 head"的 slab 页摘链归还 buddy。
+    ///
+    /// 在 `new_slab`(任一档 grow)前调用 —— 冷路径;把归还机制移出
+    /// dealloc 热路径,单槽 alloc→dealloc churn 逐指令等价引入前
+    /// (bench 数值不变)。head 页恒保留作每档快复用缓存。
+    ///
+    /// 空页检测不依赖计数器:沿空闲槽链数到**页容量**即空(链尾哨兵
+    /// usize::MAX)。摘链先于归还,链上永不残留已释放页;归还前先复位
+    /// 判别表,防该页被 buddy 复用后仍被误判为 slab 页。
+    ///
+    /// #[inline(never)]:fat-LTO 若把它内联进 new_slab → slab_alloc,
+    /// 热路径 alloc 的寄存器压力暴涨(实测 9→16 个被调用方保存寄存器,
+    /// bench +10%)。保持冷路径分离,热路径逐指令不变。
+    #[inline(never)]
+    unsafe fn sweep_empty_pages(&mut self) {
+        for idx in 0..SLAB_SIZES.len() {
+            let head = self.classes[idx].head;
+            if head.is_null() {
+                continue;
+            }
+            let mut prev = head;
+            let mut page = unsafe { (*head).next };
+            while !page.is_null() {
+                let next = unsafe { (*page).next };
+                if self.slab_page_empty(page, idx) {
+                    // 摘链(跳过本页)后复位判别表、归还 buddy。
+                    unsafe { (*prev).next = next };
+                    slab_class_set(page as usize, NOT_SLAB);
+                    mem::free_pages(page as usize).expect("kernel heap: invalid slab sweep free");
+                } else {
+                    prev = page;
+                }
+                page = next;
+            }
+        }
+    }
+
+    /// 页是否已全空:空闲槽链长 == 页容量(槽数)。
+    ///
+    /// 页满时 free_list 为哨兵(链长 0);`n > capacity` 为防御性早退,
+    /// 防链表损坏导致的死循环。
+    fn slab_page_empty(&self, page: *const SlabHeader, idx: usize) -> bool {
+        let size = SLAB_SIZES[idx];
+        let capacity = (mem::PAGE_SIZE - size) / size;
+        let mut slot = unsafe { (*page).free_list };
+        let mut n = 0usize;
+        while slot != usize::MAX {
+            n += 1;
+            if n > capacity {
+                return false;
+            }
+            slot = unsafe { *(slot as *const usize) };
+        }
+        n == capacity
     }
 
     /// 大对象:buddy 整块页,基址记录在返回指针前 8 字节。
@@ -267,7 +330,8 @@ impl KernelHeap {
                     ptr as usize, page, class, offset
                 );
             }
-            // slab 槽:压回页头空闲链表。
+            // slab 槽:压回页头空闲链表(空页归还由 grow 前懒回收负责,
+            // dealloc 热路径无计数器、无分支)。
             let header = page as *mut SlabHeader;
             unsafe {
                 *(ptr as *mut usize) = (*header).free_list;
@@ -406,6 +470,74 @@ pub fn self_test() -> Result<(), &'static str> {
     }
     unsafe { alloc::alloc::dealloc(extra, layout) };
     drop(ptrs);
+
+    // 7) M2:slab 空页懒回收 —— 全空**非 head** 页在下次任一档 grow
+    //    时归还 buddy(grow 前扫描,冷路径;head 页保留,热路径逐指令
+    //    不变,等价 bench 单槽 churn 不触发取/还页)。
+    {
+        // 用全新档避免跨用例耦合:256B 档 churn 出 3 个空页(1 head +
+        // 2 非 head),再以 1024B 档 grow 触发扫描。指针缓冲用
+        // with_capacity 一次性落在 512B 档(远离 256B,不干扰 churn)。
+        const SIZE: usize = 256;
+        let cap = (mem::PAGE_SIZE - SIZE) / SIZE; // 15 槽/页
+        let layout = Layout::from_size_align(SIZE, 8).map_err(|_| "bad layout")?;
+        let mut ptrs: Vec<*mut u8> = Vec::with_capacity(3 * cap);
+        // 填满 3 页(峰值:head + 2 非 head)。
+        for _ in 0..3 * cap {
+            let p = unsafe { alloc::alloc::alloc(layout) };
+            if p.is_null() {
+                return Err("slab return alloc");
+            }
+            ptrs.push(p);
+        }
+        // 全部释放 → 3 个空页(dealloc 热路径无回收,页仍被链持有)。
+        for &p in ptrs.iter() {
+            unsafe { alloc::alloc::dealloc(p, layout) };
+        }
+        drop(ptrs);
+        let mid = mem::free_page_count();
+        // 触发**另一档** grow 以运行懒回收:逐步持有 1024B 对象,直到
+        // free 计数变化 —— 即新增了页(new_slab 已执行,扫描已跑)。
+        // 不预知该档既有空槽数(步骤 1 的 Vec 缓冲曾在该档留页);首次
+        // 计数变化即停止,故至多新保留 1 个 grow 页。指针用栈数组持有,
+        // 避免循环内堆分配扰动被测档。
+        let grow = Layout::from_size_align(1024, 8).map_err(|_| "bad layout")?;
+        let mut grown: [*mut u8; 64] = [core::ptr::null_mut(); 64];
+        let mut n = 0usize;
+        loop {
+            let p = unsafe { alloc::alloc::alloc(grow) };
+            if p.is_null() {
+                return Err("slab return grow");
+            }
+            grown[n] = p;
+            n += 1;
+            if mem::free_page_count() != mid {
+                break; // 已 grow:new_slab 内懒回收已把空页归还 buddy
+            }
+            if n >= grown.len() {
+                return Err("slab return grow bound"); // 防御:不会发生
+            }
+        }
+        for &p in grown[..n].iter() {
+            unsafe { alloc::alloc::dealloc(p, grow) };
+        }
+        let free_after = mem::free_page_count();
+        // 归还(≥2 页)抵消 grow 新页(1)后仍有净增 → 空页确实回了 buddy。
+        if free_after <= mid {
+            return Err("slab empty page not returned to buddy");
+        }
+        // head 保留:单槽 alloc→dealloc(等价 bench 快路径)不触发取/还页
+        // —— 若 head 被过早归还,下次 alloc 会重新取页 → free 计数 -1。
+        let p = unsafe { alloc::alloc::alloc(layout) };
+        if p.is_null() {
+            return Err("slab return realloc");
+        }
+        let steady = mem::free_page_count();
+        unsafe { alloc::alloc::dealloc(p, layout) };
+        if mem::free_page_count() != steady {
+            return Err("slab head page prematurely reclaimed");
+        }
+    }
 
     Ok(())
 }

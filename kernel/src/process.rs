@@ -13,7 +13,10 @@
 //!   枚举值(空槽 = 未授权)。`Cap::Proc(pid)` = 对目标进程 IPC 的许可;
 //!   `Cap::Shm(id)` = 共享页所有权(T3c,`mmap_share` 改授,revoke 时
 //!   销毁整页)。`grant_cap`/`cap_target` 为 IPC 提供目标解析与授权
-//!   校验(未授权 → `CapError`)。销毁/页回收仍留待后续里程碑。
+//!   校验(未授权 → `CapError`)。销毁/页回收已实现(D12
+//!   `process::destroy`/`mmu::destroy_root`,共享页 cap 先 revoke 防
+//!   double-free);多核 Running 线程栈/槽不回收为已知局限(见
+//!   docs/DESIGN.md 已知限制)。
 //! - **锁序契约**:能力表(TABLE)先于 IPC 锁获取,绝不逆序;调用方
 //!   (syscall/引导测试)经 `cap_target` 读表后释放,再取 IPC 锁。
 

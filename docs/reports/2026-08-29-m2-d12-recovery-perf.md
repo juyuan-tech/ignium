@@ -248,8 +248,9 @@ N=1000 次 send/recv 配对往返计时,`ticks/N` 折算 µs。banner:
 - **多核 Running 线程**(已文档化):被杀进程线程正 Running 于其它核时不回收其
   栈/槽(该核调度器拥有 TCB);其下次用户访存再次走杀进程路径自愈。M3 跨核
   IPI 停核后彻底解决。
-- **slab 页永不归还 buddy**(既有):M1 规模可接受;页回收已在 M2 引入,
-  slab 归还策略留待 M3。
+- **slab 空页懒回收**:已在本轮完成(2026-08-30,`docs/reports/2026-08-31-m2-slab-return-cleanup.md`):
+  全空**非 head** slab 页在下次任一档 grow 时摘链归还 buddy;head 页保留作
+  快复用缓存,热路径逐指令不变。残余:空页在下次 grow 前暂留(有界)。
 - **D1 中断快速路径 / ELF 加载器 / RVA23 P2 / D24 多 bank**:按用户决策文档化
   延后(见 DEFERRED.md 刷新),与本次"安全"目标冲突项(M3 评估)。
 - **IPC 延迟绝对值**:QEMU 虚拟时钟抖动 ±20%,~4 µs 为量级参考;真机 bring-up
