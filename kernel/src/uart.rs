@@ -230,12 +230,7 @@ pub fn putc(c: u8) {
 /// (T3a 实测:副核上线与 banner 同时打印,QEMU -nographic 串口慢写
 /// 放大窗口;见 `locked_line` 说明)。
 pub fn write_str(s: &str) {
-    if PANIC_OUTPUT.load(Ordering::Relaxed) {
-        write_str_raw(s);
-        return;
-    }
-    let _guard = CONSOLE_LOCK.try_lock();
-    write_str_raw(s);
+    write_bytes(s.as_bytes());
 }
 
 /// T3a:多核 boot 期**整行原子**控制台输出(阻塞拿锁后执行 `f`)。
@@ -265,9 +260,23 @@ pub fn locked_line(f: impl FnOnce()) {
     f();
 }
 
+/// 输出任意字节序列(M3 T1 `sys_write` 用);`\n` 自动补 `\r\n`。
+///
+/// # 多核语义(D9)
+/// 与 `write_str` 同契约:正常路径 `try_lock` CONSOLE_LOCK,失败(panic
+/// 模式 / 他核持有)无锁裸写 —— best-effort,宁可字符错位也不死锁。
+pub fn write_bytes(bytes: &[u8]) {
+    if PANIC_OUTPUT.load(Ordering::Relaxed) {
+        write_bytes_raw(bytes);
+        return;
+    }
+    let _guard = CONSOLE_LOCK.try_lock();
+    write_bytes_raw(bytes);
+}
+
 /// 无锁裸写(底层出口)。调用方负责互斥(PANIC_OUTPUT / CONSOLE_LOCK)。
-fn write_str_raw(s: &str) {
-    for &b in s.as_bytes() {
+fn write_bytes_raw(bytes: &[u8]) {
+    for &b in bytes {
         if b == b'\n' {
             putc(b'\r');
         }

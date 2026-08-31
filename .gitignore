@@ -4,3 +4,6 @@
 
 __pycache__/
 *.pyc
+
+# cargo-in-cargo 用户程序构建产物(M3 T1;build.rs 以 CARGO_TARGET_DIR 隔离)
+/user/target

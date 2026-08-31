@@ -33,6 +33,7 @@ pub fn boot_tests() {
     boot_shm_test();
     boot_cap_test();
     boot_fault_recovery_test();
+    boot_elf_test();
     boot_ipc_latency_bench();
 }
 
@@ -794,6 +795,194 @@ fn boot_fault_recovery_test() {
         "fault: address space not reclaimed (free {free_after} < {free_before_f})"
     );
     info!("M2: user fault recovery ok (process killed, system alive)");
+}
+
+// ===== M3 T1:ELF 加载器(独立编译用户程序) =====
+
+/// 共享标记页 VA:须与 `user/src/main.rs` 的 `MARKER_VA`(0x4000_2000)
+/// 一致;且在 hello ELF 段映射范围之外(下方以 parse 结果断言 max_end)。
+const ELF_MARKER_VA: usize = 0x4000_2000;
+
+/// M3 T1:ELF 加载器冒烟(主交付)。
+///
+/// 验证链路:建进程 → `elf::parse`(校验 + 段不侵占 marker 页)→
+/// `elf::load`(include_bytes! 的 hello ELF 逐段映射 + 建初始栈 argc/argv)
+/// → `spawn_user_args`(argc/argv 注入 a0/a1)→ U 模式运行 → 用户程序写
+/// marker 页 `0xC0DE0000|argc` → 轮询断言 → 结构性断言(栈映射/守护页
+/// 空洞)→ 负面用例 → 销毁进程回收地址空间页。banner:
+/// `M3 T1: ELF loader ok (user ELF ran)`(6 处 grep 同步)。
+fn boot_elf_test() {
+    // 1) 建进程。
+    let pid = crate::process::create().expect("elf: create process");
+    let root = crate::process::root(pid);
+    // 2) 校验内嵌 ELF:入口非零、段不侵占 marker 页(加载器与测试自洽)。
+    let info = crate::elf::parse(crate::elf::HELLO_ELF).expect("elf: parse hello");
+    assert!(info.entry != 0, "elf: entry must be non-zero");
+    let max_end = info
+        .segments
+        .iter()
+        .map(|s| s.vaddr + s.memsz)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_end <= ELF_MARKER_VA,
+        "hello ELF segments grew beyond marker page (max_end={max_end:#x})"
+    );
+    // 3) 映射 marker 页(用户程序写 `0xC0DE0000 | argc` 于此)。
+    let marker_pa = crate::mem::alloc_pages_zeroed(0).expect("elf: marker page");
+    assert!(
+        crate::mmu::map_user_page(root, ELF_MARKER_VA, marker_pa, 0xC7).is_ok(),
+        "elf: map marker page"
+    );
+    // 4) 加载 ELF + 建初始栈(argv[0] = "hello")。
+    let args: [&[u8]; 1] = [b"hello"];
+    let loaded = crate::elf::load(pid, crate::elf::HELLO_ELF, &args).expect("elf: load hello");
+    assert!(loaded.argc == 1, "elf: argc must be 1");
+    // 5) spawn 用户线程(argc/argv 经初始帧 a0/a1 注入)。
+    crate::sched::spawn_user_args(
+        pid,
+        loaded.entry,
+        loaded.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded.argc,
+        loaded.argv,
+    );
+    // 6) 轮询 marker 直至用户程序写入(超时守卫)。
+    let marker = marker_pa as *const usize;
+    let expect = 0xC0DE_0000 | args.len();
+    let mut guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(marker) };
+        if v == expect {
+            break;
+        }
+        assert!(
+            guard < 200_000,
+            "user ELF did not write marker (value={v:#x}, expect={expect:#x})"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 7) 结构性断言:用户栈顶页已映射、栈底守护页未映射(D20 语义)。
+    assert!(
+        crate::mmu::is_mapped(root, crate::elf::USER_STACK_TOP - 4096),
+        "elf: user stack top page must be mapped"
+    );
+    assert!(
+        !crate::mmu::is_mapped(
+            root,
+            crate::elf::USER_STACK_TOP - (crate::elf::USER_STACK_PAGES + 1) * 4096,
+        ),
+        "elf: stack guard page must be unmapped"
+    );
+    // 8) 负面用例(parse 全字段校验)。
+    elf_negative_cases();
+    // 9) 清理:切内核根表 + 销毁进程(回收地址空间页;destroy_root 前提)。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    let free_before = crate::mem::free_page_count();
+    crate::process::destroy(pid);
+    crate::sched::drain_reaper();
+    let free_after = crate::mem::free_page_count();
+    assert!(
+        free_after >= free_before,
+        "elf: address space not reclaimed (free {free_after} < {free_before})"
+    );
+    info!("M3 T1: ELF loader ok (user ELF ran)");
+}
+
+/// 构造最小合法 ELF64(1 个 PT_LOAD),供负面用例逐字段破坏。
+/// `phdr = (flags, offset, vaddr, filesz, memsz)`。
+fn make_elf(entry: u64, phdr: (u32, u64, u64, u64, u64)) -> alloc::vec::Vec<u8> {
+    let mut e = alloc::vec![0u8; 64 + 56];
+    e[0..4].copy_from_slice(b"\x7fELF");
+    e[4] = 2; // EI_CLASS = ELFCLASS64
+    e[5] = 1; // EI_DATA = ELFDATA2LSB
+    e[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    e[18..20].copy_from_slice(&243u16.to_le_bytes()); // e_machine = EM_RISCV
+    e[24..32].copy_from_slice(&entry.to_le_bytes()); // e_entry
+    e[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    e[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    let (flags, offset, vaddr, filesz, memsz) = phdr;
+    let off = 64;
+    e[off..off + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    e[off + 4..off + 8].copy_from_slice(&flags.to_le_bytes());
+    e[off + 8..off + 16].copy_from_slice(&offset.to_le_bytes());
+    e[off + 16..off + 24].copy_from_slice(&vaddr.to_le_bytes());
+    // p_paddr = 0(加载器忽略)
+    e[off + 32..off + 40].copy_from_slice(&filesz.to_le_bytes());
+    e[off + 40..off + 48].copy_from_slice(&memsz.to_le_bytes());
+    e
+}
+
+/// M3 T1:ELF 解析负面用例(每个字段破坏 → 对应 ElfError)。
+fn elf_negative_cases() {
+    use crate::elf::ElfError;
+    // 合法基线。
+    let ok = make_elf(0x4000_0000, (5, 0x0, 0x4000_0000, 8, 8));
+    assert!(crate::elf::parse(&ok).is_ok(), "elf: baseline parse ok");
+    // 坏 magic。
+    let mut bad = make_elf(0x4000_0000, (5, 0x0, 0x4000_0000, 8, 8));
+    bad[0] = 0;
+    assert!(matches!(crate::elf::parse(&bad), Err(ElfError::BadMagic)));
+    // 非 64 位。
+    let mut bad = make_elf(0x4000_0000, (5, 0x0, 0x4000_0000, 8, 8));
+    bad[4] = 1;
+    assert!(matches!(crate::elf::parse(&bad), Err(ElfError::Not64)));
+    // 非 ET_EXEC。
+    let mut bad = make_elf(0x4000_0000, (5, 0x0, 0x4000_0000, 8, 8));
+    bad[16] = 1;
+    assert!(matches!(crate::elf::parse(&bad), Err(ElfError::NotExec)));
+    // 非 RISC-V(e_machine = bytes[18..20] LE = 243 = 0x00F3;改低字节 18)。
+    let mut bad = make_elf(0x4000_0000, (5, 0x0, 0x4000_0000, 8, 8));
+    bad[18] = 0;
+    assert!(matches!(crate::elf::parse(&bad), Err(ElfError::NotRiscv)));
+    // memsz < filesz(offset 有效,使检查命中 BadSegment 而非先 Truncated)。
+    let bad = make_elf(0x4000_0000, (5, 0x0, 0x4000_0000, 0x10, 8));
+    assert!(matches!(crate::elf::parse(&bad), Err(ElfError::BadSegment)));
+    // 文件内越界(p_offset + p_filesz > len)。
+    let bad = make_elf(0x4000_0000, (5, 0x1000, 0x4000_0000, 0x1000, 0x1000));
+    assert!(matches!(crate::elf::parse(&bad), Err(ElfError::Truncated)));
+    // vaddr 越界(Sv39 用户区上限 2^38;高于或等于即拒绝)。
+    let bad = make_elf(0x4000_0000, (5, 0x1000, 0x40_0000_0000, 8, 8));
+    assert!(matches!(
+        crate::elf::parse(&bad),
+        Err(ElfError::AddressTooHigh)
+    ));
+    // 页内偏移失配(offset 有效,使检查命中 BadSegment 而非先 Truncated)。
+    let bad = make_elf(0x4000_0000, (5, 0x1, 0x4000_0000, 8, 8));
+    assert!(matches!(crate::elf::parse(&bad), Err(ElfError::BadSegment)));
+    // 截断(头不足)。
+    assert!(matches!(
+        crate::elf::parse(&[0u8; 32]),
+        Err(ElfError::Truncated)
+    ));
+    // 段间覆盖:两 PT_LOAD 映射范围重叠(offset=0 有效,使检查命中
+    // Overlap 而非先 Truncated)。
+    let mut e = alloc::vec![0u8; 64 + 56 * 2];
+    e[0..4].copy_from_slice(b"\x7fELF");
+    e[4] = 2;
+    e[5] = 1;
+    e[16..18].copy_from_slice(&2u16.to_le_bytes());
+    e[18..20].copy_from_slice(&243u16.to_le_bytes());
+    e[24..32].copy_from_slice(&0x4000_0000u64.to_le_bytes());
+    e[32..40].copy_from_slice(&64u64.to_le_bytes());
+    e[56..58].copy_from_slice(&2u16.to_le_bytes());
+    for (i, (offset, vaddr, memsz)) in [
+        (0u64, 0x4000_0000u64, 0x1000u64),
+        (0u64, 0x4000_0000u64, 0x1000u64),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let off = 64 + i * 56;
+        e[off..off + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        e[off + 4..off + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        e[off + 8..off + 16].copy_from_slice(&offset.to_le_bytes());
+        e[off + 16..off + 24].copy_from_slice(&vaddr.to_le_bytes());
+        e[off + 32..off + 40].copy_from_slice(&8u64.to_le_bytes()); // filesz
+        e[off + 40..off + 48].copy_from_slice(&memsz.to_le_bytes());
+    }
+    assert!(matches!(crate::elf::parse(&e), Err(ElfError::Overlap)));
 }
 
 // ===== M2 性能:IPC 延迟基准(注册消息往返) =====

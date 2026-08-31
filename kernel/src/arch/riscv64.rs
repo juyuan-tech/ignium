@@ -277,6 +277,27 @@ pub fn irq_restore(on: bool) {
     }
 }
 
+/// 置 `sstatus.SUM`(位 18):S 模式允许访问 U 页(用户缓冲拷贝用)。
+///
+/// 调用方须在拷贝完成后用 `clear_sum` 还原;trap 恢复路径会把 sstatus
+/// 写回 trap 入口保存的原值,临时置位不会泄漏进被中断的用户上下文。
+/// 仅在 SIE=0 的 trap 处理上下文使用(本 kernel 的 syscall 处理即此),
+/// 拷贝期间不会被抢占。
+#[inline]
+pub fn set_sum() {
+    unsafe {
+        asm!("csrs sstatus, {}", in(reg) (1 << 18), options(nostack));
+    }
+}
+
+/// 清 `sstatus.SUM`(位 18):恢复默认(禁止 S 模式访问 U 页)。
+#[inline]
+pub fn clear_sum() {
+    unsafe {
+        asm!("csrc sstatus, {}", in(reg) (1 << 18), options(nostack));
+    }
+}
+
 /// 读取 mtimer 计数器(S 模式经 OpenSBI 委托,`csrr time` 直读)。
 /// 单位:OpenSBI 平台时钟周期(QEMU virt = 10 MHz)。
 #[inline]

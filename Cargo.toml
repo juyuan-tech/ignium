@@ -8,6 +8,10 @@
 [workspace]
 resolver = "2"
 members = ["kernel"]
+# user/ 是**独立 crate**(M3 T1):由 kernel/build.rs 经 cargo-in-cargo 构建
+# (CARGO_TARGET_DIR 隔离),非 workspace 成员 —— 排除,避免 cargo 把未在
+# members 内的包误判为 workspace 成员(见 user/ 模块头与 M3-DESIGN §3.5)。
+exclude = ["user"]
 
 [profile.dev]
 # 内核没有 unwinder,panic 一律 abort(默认 unwind 会链接失败)。

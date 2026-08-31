@@ -62,7 +62,8 @@ M2-DESIGN §7 仅提纲,本轮固化:**解析 + 校验 + 映射 + 用户栈 + ar
 - `e_phoff + e_phnum*56 ≤ len`;每个 `PT_LOAD`(type=1):
   - `p_offset + p_filesz ≤ len`(文件内越界 → `ElfError::Truncated`);
   - `p_memsz ≥ p_filesz`(bss 段 memsz>filesz);
-  - `p_vaddr < 0x4000_0000_0000`(Sv39 用户区上限);
+  - `p_vaddr < USER_VA_LIMIT`(= 2^38,即 `0x4000_0000_00`;Sv39 用户区上限,
+    单一来源 `mmu::USER_VA_LIMIT` —— 审计修正:M3-T1 发现曾误写 2^46);
   - 页内偏移匹配:`p_vaddr & 0xfff == p_offset & 0xfff`(段映射页对齐约束);
   - 段间无覆盖:按 `p_vaddr` 排序后逐对检查
     `p_vaddr + p_memsz > next.p_vaddr` → `ElfError::Overlap`。
@@ -82,8 +83,11 @@ M2-DESIGN §7 仅提纲,本轮固化:**解析 + 校验 + 映射 + 用户栈 + ar
 
 ### 3.4 用户栈 + argc/argv(RISC-V ABI)
 
-- `USER_STACK_TOP = 0x3FFF_0000_0000`,8 页(32KB);栈底下方 1 页守护
-  (VA 空洞不分配,沿用 D20 语义)。
+- `USER_STACK_TOP = USER_VA_LIMIT - 64K`(= 2^38 − 64K = `0x3FFFFF_0000`,
+  栈顶留余量且保证 bit38=0 规范化;审计修正:M3-T1 曾误用 2^46−2^40,
+  非规范 VA 致 QEMU TRANSLATE_FAIL),8 页(32KB);栈底下方 1 页守护
+  (VA 空洞不分配,沿用 D20 语义)。栈 8 页物理页独立分配、非连续,写按
+  所在页解引用物理地址。
 - `build_initial_stack`:自栈顶向下写 `argv[0..n]` 字符串 + 指针数组 + `argc`,
   对齐 16B;初始帧 a0=argc、a1=argv(与 spawn_user 现有帧构造一致)。
 
@@ -128,7 +132,11 @@ M2-DESIGN §7 仅提纲,本轮固化:**解析 + 校验 + 映射 + 用户栈 + ar
 
 **sys_write 语义(本轮)**:fd=1 → `uart::write_bytes(buf)`(NS16550,多核安全);
 fd≠1 → `-EBADF`(新 `SYS_ERR_EBADF = MAX-4`)。**逐页**校验 buf 在当前进程根表
-已映射(防跨页越界),len 上限 4096,越界 → `-EFAULT`(新 `SYS_ERR_EFAULT = MAX-5`)。
+映射为**用户页**(`mmu::is_user_mapped`,限 U 位 —— 防跨页越界,亦防放行内核区
+页泄漏内核内存),len 上限 4096,越界 → `-EFAULT`(新 `SYS_ERR_EFAULT = MAX-5`)。
+拷贝须置 `sstatus.SUM=1`(S 模式直读 U 页;trap 恢复路径写回原值,临时置位
+不泄漏;SIE=0 无抢占)—— M3-T1 实测首版缺 SUM 时 S 模式对 U 页立即
+`scause=0xd`,此处为修复记录。
 
 ## 6. 跨核 IPI 停核 + Running 线程回收 + 跨核 TLB shootdown
 

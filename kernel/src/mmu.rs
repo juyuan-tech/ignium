@@ -46,6 +46,14 @@ const PTE_PPN_MASK: u64 = (1u64 << 44) - 1;
 /// 2MB 超页。
 const SUPER_PAGE: usize = 2 * 1024 * 1024;
 
+/// Sv39 用户地址空间上限 = 2^38(低半 39 位 VA 中,VA[38]=0 为用户区)。
+///
+/// **审计修正(M3 T1)**:此前误写 `0x4000_0000_0000`(= 2^46),超出 Sv39
+/// 硬件可寻址范围 256 倍 —— 高位 vaddr 经此检查放行后映射进"看似有效却
+/// 无法翻译"的 L2 索引,QEMU 对非规范 VA 直接 TRANSLATE_FAIL(实测
+/// scause=0xf)。ELF 加载器用户栈落在高位用户 VA,首次触发本缺陷。
+pub const USER_VA_LIMIT: usize = 1 << 38;
+
 /// satp 的 Sv39 模式位。
 const SATP_MODE_SV39: usize = 8usize << 60;
 /// satp 的 PPN 字段掩码(位 0-43,**44 位**;H1:此前误写为 36 位,
@@ -165,7 +173,7 @@ unsafe fn ensure_table_user(parent: *const u64, idx: usize) -> Result<*const u64
 pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
     // 自审(挑剔视角):Sv39 用户地址空间上限 2^38。越界 vaddr 的
     // L2/L1/L0 索引会错位(高位省略),映射到错误区域 —— 必须拒绝。
-    if vaddr >= 0x4000_0000_0000 {
+    if vaddr >= USER_VA_LIMIT {
         return Err(());
     }
     // paddr 必须页对齐,否则 ppn 掩掉低 12 位 → 映射错页。
@@ -473,32 +481,49 @@ pub fn switch_root(root_paddr: usize) {
     enable(root_paddr);
 }
 
-/// 只读检查 `vaddr` 在 `root` 下是否已映射(M2 T1.5 结构性校验用)。
+/// 逐级走查 `vaddr` 在 `root` 下的叶子 PTE(缺失返回 0)。
 ///
-/// 从根表逐级走查(L2→L1→L0),各级缺失/叶子早退,**不分配、不发
-/// TLB 刷新**。中间级叶子(1GB/2MB 超页)视为已映射。
-pub fn is_mapped(root: usize, vaddr: usize) -> bool {
+/// **不分配、不发 TLB 刷新**;中间级叶子(1GB/2MB 超页)直接返回该 PTE。
+fn leaf_pte(root: usize, vaddr: usize) -> u64 {
     let l2 = (vaddr >> 30) & 0x1FF;
     let l1 = (vaddr >> 21) & 0x1FF;
     let l0 = (vaddr >> 12) & 0x1FF;
     let root_t = root as *const u64;
     let e2 = pte_read(root_t, l2);
     if e2 & PTE_V == 0 {
-        return false;
+        return 0;
     }
     if e2 & (PTE_R | PTE_W | PTE_X) != 0 {
-        return true; // L2 叶子(1GB 超页)
+        return e2; // L2 叶子(1GB 超页)
     }
     let l1_t = (((e2 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as *const u64;
     let e1 = pte_read(l1_t, l1);
     if e1 & PTE_V == 0 {
-        return false;
+        return 0;
     }
     if e1 & (PTE_R | PTE_W | PTE_X) != 0 {
-        return true; // L1 叶子(2MB 超页)
+        return e1; // L1 叶子(2MB 超页)
     }
     let l0_t = (((e1 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as *const u64;
-    pte_read(l0_t, l0) & PTE_V != 0
+    let e0 = pte_read(l0_t, l0);
+    if e0 & PTE_V == 0 {
+        return 0;
+    }
+    e0
+}
+
+/// 只读检查 `vaddr` 在 `root` 下是否已映射(M2 T1.5 结构性校验用)。
+pub fn is_mapped(root: usize, vaddr: usize) -> bool {
+    leaf_pte(root, vaddr) & PTE_V != 0
+}
+
+/// 只读检查 `vaddr` 在 `root` 下映射为**用户页**(叶子 PTE 含 U 位)。
+///
+/// M3 T1:`sys_write` 逐页校验用户缓冲用 —— 仅 V 位不足以区分用户页与
+/// 内核区页(进程根表含内核区映射);S 模式拷贝(SUM=1)若放行内核页会
+/// 泄漏内核内存,故须限定 U 页。
+pub fn is_user_mapped(root: usize, vaddr: usize) -> bool {
+    leaf_pte(root, vaddr) & (PTE_V | PTE_U) == PTE_V | PTE_U
 }
 
 /// 映射 [start, end) 4KB 对齐区域,每页调用 map_4k。

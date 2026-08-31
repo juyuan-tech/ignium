@@ -681,7 +681,18 @@ impl Scheduler {
     /// 指向该进程根表内用户可执行(U 位)的虚拟地址;`stack_top` 为用户
     /// 栈顶(用户可访问)。该线程**始终经 frame_restore(sret)恢复**:
     /// ctx_valid 恒 false,因此协作选中也走帧恢复 → U 模式保持。
-    fn spawn_user(&mut self, proc_id: usize, entry_pc: usize, stack_top: usize, prio: u8) -> usize {
+    ///
+    /// M3 T1:`argc`/`argv` 写入初始帧 a0/a1(RISC-V 进程入口约定,
+    /// `elf::load` 建初始栈后经 `spawn_user_args` 传入)。
+    fn spawn_user(
+        &mut self,
+        proc_id: usize,
+        entry_pc: usize,
+        stack_top: usize,
+        prio: u8,
+        argc: usize,
+        argv: usize,
+    ) -> usize {
         // M2 T0:同 spawn,优先复用已退出线程的 TCB 槽。
         let reuse = self.free_slots.pop_front();
         let id = match reuse {
@@ -702,7 +713,8 @@ impl Scheduler {
         let root = crate::process::root(proc_id);
         // 初始帧:sepc = 用户代码入口;SPIE=1(进 U 后开中断)、
         // **SPP=0 → sret 进入 U 模式**(与内核线程 S 模式不同);
-        // sp = 用户栈顶;gp = 0(用户程序不用内核 gp)。
+        // sp = 用户栈顶;gp = 0(用户程序不用内核 gp);
+        // a0=argc、a1=argv(经 sret 达用户 `_start`)。
         // CRITICAL-2(审计 16 轮):帧内 sp 必须有效 —— 恢复路径会
         // 从帧加载 sp;gp 与 trap_vector 入口无关(内核 gp 在 trap
         // 入口重载,此处占位 0)。
@@ -711,6 +723,9 @@ impl Scheduler {
         frame[FRAME_SSTATUS] = 1 << 5; // SPIE=1, SPP=0(U 模式)
         frame[1] = stack_top;
         frame[2] = 0;
+        // M3 T1:argc/argv → a0/a1(arch::gpr 索引,A 系统调用 ABI 单一来源)。
+        frame[crate::arch::gpr::X_A0] = argc;
+        frame[crate::arch::gpr::X_A1] = argv;
         let t = Thread {
             prio,
             state: ThreadState::Ready,
@@ -866,11 +881,27 @@ pub fn spawn(entry: fn(), prio: u8) -> usize {
 
 /// M2 T1:新建用户态线程(`proc_id` 为所属进程,`entry_pc`/`stack_top`
 /// 为用户可执行虚拟地址/用户栈顶;二者须已按 U 权限映射到该进程根表)。
+/// argc/argv 均为 0(M2 机器码程序用;ELF 程序用 `spawn_user_args`)。
 pub fn spawn_user(proc_id: usize, entry_pc: usize, stack_top: usize, prio: u8) -> usize {
+    spawn_user_args(proc_id, entry_pc, stack_top, prio, 0, 0)
+}
+
+/// M3 T1:新建用户态线程并注入 `argc`/`argv`(RISC-V 进程入口约定)。
+///
+/// `argc`/`argv` 经初始帧 a0/a1 到达用户 `_start`;`argv` 为进程初始栈
+/// 中 argv 指针数组首地址(`elf::load` 的 `LoadedElf::argv` 提供)。
+pub fn spawn_user_args(
+    proc_id: usize,
+    entry_pc: usize,
+    stack_top: usize,
+    prio: u8,
+    argc: usize,
+    argv: usize,
+) -> usize {
     let irq = arch::irq_save();
     let id = {
         let mut s = SCHED.lock();
-        s.spawn_user(proc_id, entry_pc, stack_top, prio)
+        s.spawn_user(proc_id, entry_pc, stack_top, prio, argc, argv)
     };
     arch::irq_restore(irq);
     id
