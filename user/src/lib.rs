@@ -59,6 +59,19 @@ pub const SHM_LEN: usize = 4096;
 /// M3-3:内存页固定 VA(避开 ELF 0x4000_0000 段 / SHM 0x5000_0000 /
 /// UART 0x6000_0000;客户端经 mem_map 映射 Cap::Page 至此)。
 pub const MEM_VA: usize = 0x7000_0000;
+/// M3-4:ramfs 文件系统服务 id(kernel services.rs `SERVICE_RAMFS=3`,须保持同步)。
+pub const RAMFS_SERVICE_ID: usize = 3;
+/// M3-4:ramfs_server 文件数据页映射 VA(L2=1 空档:避开 ELF 0x4000_0000 /
+/// SHM 0x5000_0000 / UART 0x6000_0000 / MEM 0x7000_0000;0x8000_0000 段是内核
+/// 身份映射不可用)。文件 fd 的页映射于 `RAMFS_VA + fd*4096`。
+pub const RAMFS_VA: usize = 0x7400_0000;
+/// M3-4:文件页槽范围(闭区间 3..=6;fd = 槽-3,与 ramfs_server 槽位编排一致)。
+pub const RAMFS_FILE_PAGE_START: usize = 3;
+pub const RAMFS_FILE_PAGE_END: usize = 6;
+/// M3-4:文件名最大长度(内联 IPC 3 字 = 24B;长名延后 D38)。
+pub const NAME_MAX: usize = 24;
+/// M3-4:文件表最大项数(= 文件页槽数 4)。
+pub const MAX_FILES: usize = 4;
 
 // ===== 消息协议(M3-DESIGN §10.8)=====
 /// WRITE 请求:arg1 = 数据长度,数据在 SHM_VA[0..len]。
@@ -71,12 +84,30 @@ pub const OP_PING: usize = 0x03;
 pub const OP_ALLOC: usize = 0x04;
 /// M3-3 FREE 请求:arg1 = client 归还页槽;回复 arg2 = 服务端归还接收槽。
 pub const OP_FREE: usize = 0x05;
+/// M3-4 ramfs 五 op 号(承接 uart 0x01-0x03 / mem 0x04-0x05,零新 syscall):
+/// OPEN 请求 arg1 = name_len(≤24), arg2-arg4 = 名字内联 3 字(24B)。
+pub const OP_FS_OPEN: usize = 0x06;
+/// READ 请求 arg1 = fd, arg2 = offset, arg3 = len;回复 arg2 = bytes_read(EOF→0)。
+pub const OP_FS_READ: usize = 0x07;
+/// WRITE 请求 arg1 = fd, arg2 = offset, arg3 = len;数据经 SHM_VA[0..len]。
+pub const OP_FS_WRITE: usize = 0x08;
+/// CLOSE 请求 arg1 = fd(保槽:Open→Closed,D40)。
+pub const OP_FS_CLOSE: usize = 0x09;
+/// UNLINK 请求 arg1 = fd(按 fd 释放页 + 清表)。
+pub const OP_FS_UNLINK: usize = 0x0A;
 /// 回复标记:回复首字 = op | 0x80。
 pub const OP_REPLY_FLAG: usize = 0x80;
 /// 协议级错误状态(未知 op;数值与内核 -EINVAL 编码一致)。
 pub const PROTO_ERR: usize = usize::MAX;
 /// M3-3 服务池空/归还失败错误(与 kernel `SYS_ERR_ENOMEM` 一致,须保持同步)。
 pub const ERR_ENOMEM: usize = usize::MAX - 3;
+/// M3-4 ramfs 协议级错误(仅用户协议层,数值与内核 errno 编码一致;内核
+/// 不复用)。EINVAL/ENOMEM 与既有 PROTO_ERR/ERR_ENOMEM 同值,取 USER_ERR_
+/// 名便于 ramfs 协议表达;EBADF 为**复活保留隙**(内核 syscall 级 MAX-4 保留
+/// 空档不复用,D39)。
+pub const USER_ERR_EINVAL: usize = usize::MAX;
+pub const USER_ERR_EBADF: usize = usize::MAX - 4;
+pub const USER_ERR_EEXIST: usize = usize::MAX - 6;
 
 /// panic handler:无输出通道(打印须走 IPC 到 uart_server;服务未就绪时
 /// 静默)。内核测试以 marker / 超时断言暴露 panic;spin_loop 缓解 empty_loop。
@@ -194,6 +225,37 @@ pub fn sys_mem_grant(src_slot: usize, peer_slot: usize, dst_slot: usize) -> usiz
 /// M3-3 mem_map:把 `Cap::Page` 以 U RW 映射进本进程根表(单映射不变量)。
 pub fn sys_mem_map(slot: usize, va: usize) -> usize {
     syscall(SYS_MEM_MAP, slot, va, 0, 0, 0, 0)
+}
+
+// ===== M3-4 ramfs 名字内联助手(防端序错配的单一编码点)=====
+
+/// 文件名编码为 3 个 usize 字(内联 IPC:每字 8 字节 little-endian,不足 24B
+/// 尾部零填充)。返回 `([w0,w1,w2], name_len)` —— 与 `name_from_words` 成对,
+/// 保证 client/server 端序一致(M3-DESIGN §12.4;长名延后 D38)。
+pub fn name_to_words(name: &[u8]) -> ([usize; 3], usize) {
+    let n = name.len().min(NAME_MAX);
+    let mut words = [0usize; 3];
+    for (i, w) in words.iter_mut().enumerate() {
+        let base = i * 8;
+        if base < n {
+            let hi = core::cmp::min(base + 8, n);
+            for (j, b) in name[base..hi].iter().enumerate() {
+                *w |= (*b as usize) << (j * 8);
+            }
+        }
+    }
+    (words, n)
+}
+
+/// 3 个 usize 字解码回 24B 文件名缓冲区(配套 `name_to_words`;未用尾部零)。
+pub fn name_from_words(words: &[usize; 3]) -> [u8; 24] {
+    let mut buf = [0u8; 24];
+    for (i, w) in words.iter().enumerate() {
+        for j in 0..8 {
+            buf[i * 8 + j] = ((w >> (j * 8)) & 0xff) as u8;
+        }
+    }
+    buf
 }
 
 // ===== uart client 库(打印/读取经 IPC + SHM 到 uart_server)=====

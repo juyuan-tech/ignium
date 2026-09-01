@@ -2,9 +2,10 @@
 // 相对路径(-Tkernel/linker.ld)依赖 cargo 工作目录,从子目录
 // 或 IDE 构建会解析失败;CARGO_MANIFEST_DIR 保证任意调用方式一致。
 //
-// M3 T1/T2 + M3-3:额外编译用户程序(user/ 独立 crate,lib + hello +
-// uart_server + memory_server + mem_client 四 bin),产物拷入 OUT_DIR 供
-// kernel `include_bytes!` 内嵌(方案 A,见 M3-DESIGN §3.5)。
+// M3 T1/T2 + M3-3/3-4:额外编译用户程序(user/ 独立 crate,lib + hello +
+// uart_server + memory_server + mem_client + ramfs_server + ramfs_client
+// 六 bin),产物拷入 OUT_DIR 供 kernel `include_bytes!` 内嵌(方案 A,见
+// M3-DESIGN §3.5)。
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -66,7 +67,8 @@ fn build_user_elf(kernel_dir: &str) {
     assert!(status.success(), "user program (ignium-user) build failed");
 
     // 拷入全部 bin 的 ELF(include_bytes! 内嵌):hello(boot_elf_test)、
-    // uart_server(M3-2 T1)、memory_server + mem_client(M3-3 服务/客户端)。
+    // uart_server(M3-2 T1)、memory_server + mem_client(M3-3 服务/客户端)、
+    // ramfs_server + ramfs_client(M3-4 文件服务/客户端)。
     let release_dir = target_dir
         .join("riscv64gc-unknown-none-elf")
         .join("release");
@@ -87,4 +89,14 @@ fn build_user_elf(kernel_dir: &str) {
         out_dir.join("mem_client.elf"),
     )
     .expect("copy mem_client ELF into OUT_DIR for include_bytes!");
+    std::fs::copy(
+        release_dir.join("ramfs_server"),
+        out_dir.join("ramfs_server.elf"),
+    )
+    .expect("copy ramfs_server ELF into OUT_DIR for include_bytes!");
+    std::fs::copy(
+        release_dir.join("ramfs_client"),
+        out_dir.join("ramfs_client.elf"),
+    )
+    .expect("copy ramfs_client ELF into OUT_DIR for include_bytes!");
 }

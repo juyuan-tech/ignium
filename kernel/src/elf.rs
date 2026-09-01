@@ -55,6 +55,18 @@ pub(crate) const MEMORY_SERVER_ELF: &[u8] =
 /// 内嵌的 M3-3 内存客户端 ELF:申请→映射→读写→归还往返(经 mem_server)。
 pub(crate) const MEM_CLIENT_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mem_client.elf"));
+/// 内嵌的 M3-4 ramfs 文件系统服务进程 ELF(同方案 A;纯用户态文件服务,
+/// 一切皆能力:零新 syscall/Cap,存储页经 mem_server 服务链申请 ——
+/// M3-DESIGN §12)。`tests::boot_ramfs_test`(M3-4 T1)加载运行;本提交暂无
+/// 消费方,`#[expect(dead_code)]`(M3-4 测试提交引用后移除)。
+#[expect(dead_code)]
+pub(crate) const RAMFS_SERVER_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ramfs_server.elf"));
+/// 内嵌的 M3-4 ramfs 客户端 ELF:open→write→read→close→unlink 全链路
+/// (经 ramfs_server + SHM 窗;同上,本提交暂无消费方)。
+#[expect(dead_code)]
+pub(crate) const RAMFS_CLIENT_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ramfs_client.elf"));
 
 /// ELF 加载/校验错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
