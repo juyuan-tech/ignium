@@ -27,6 +27,15 @@ pub const MAX_SERVICES: usize = 8;
 /// `user/src/lib.rs` 的 `UART_SERVICE_ID` 一致,须保持同步)。
 pub const SERVICE_UART: usize = 1;
 
+/// M3-3 内存服务 id(M3-3 第二个用户态服务 = memory_server 进程,发放
+/// `Cap::Page` 的唯一入口 —— 纯服务授权;与 `user/src/lib.rs` 的
+/// `MEMORY_SERVICE_ID` 一致,须保持同步)。
+///
+/// 本 commit 仅登记常量(lookup 断言随 M3-3 测试 commit);`#[expect(dead_code)]`
+/// 在测试 commit 引用后移除。
+#[expect(dead_code)]
+pub const SERVICE_MEMORY: usize = 2;
+
 /// 服务注册表槽:索引 = 服务 id(1 基);None = 未注册。
 ///
 /// `id` 字段与槽索引一致(冗余,`lookup` 作防御性失效标记校验,防槽位

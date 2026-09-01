@@ -48,6 +48,19 @@ pub(crate) const HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/he
 /// `tests::boot_elf_test` 校验解析;M3-2 T1 经 spawn_user_args 加载运行。
 pub(crate) const UART_SERVER_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/uart_server.elf"));
+/// 内嵌的 M3-3 内存服务进程 ELF(同方案 A,编译 `user/` 拷入 OUT_DIR)。
+/// 纯服务授权:经 IPC 发放 `Cap::Page` 的唯一入口(M3-DESIGN §11.3)。
+///
+/// 本 commit 仅嵌入(spawn 编排随 M3-3 测试 commit);`#[expect(dead_code)]`
+/// 在测试 commit 引用后移除(与 Cap::Page 变体同因:编译期强制依赖消费方)。
+#[expect(dead_code)]
+pub(crate) const MEMORY_SERVER_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/memory_server.elf"));
+/// 内嵌的 M3-3 内存客户端 ELF:申请→映射→读写→归还往返(经 mem_server)。
+/// 消费方 = M3-3 测试 commit(同上 expect 语义)。
+#[expect(dead_code)]
+pub(crate) const MEM_CLIENT_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mem_client.elf"));
 
 /// ELF 加载/校验错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

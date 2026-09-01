@@ -25,6 +25,11 @@ pub const SYS_SERVICE_REGISTER: usize = 10;
 pub const SYS_SERVICE_CONNECT: usize = 11;
 /// 设备页映射(a0=dev_id, a1=va;白名单见 kernel device.rs)。
 pub const SYS_MAP_DEVICE: usize = 12;
+/// M3-3:mem_grant(a0=源槽, a1=peer 槽, a2=对端目标槽)——
+/// **move** `Cap::Page`(只能移交给持 `Cap::Proc` 的已连接进程)。
+pub const SYS_MEM_GRANT: usize = 13;
+/// M3-3:mem_map(a0=槽, a1=va)—— `Cap::Page` U RW 映射进本进程根表。
+pub const SYS_MEM_MAP: usize = 14;
 
 // ===== M3-2 固定布局(与 M3-DESIGN §10.4 一致;禁止复制定义)=====
 /// 服务端 accept 槽(持 Cap::Proc(client),收发请求/回复)。
@@ -35,13 +40,25 @@ pub const SERVER_SHM_SLOT: usize = 1;
 pub const CLIENT_IPC_SLOT: usize = 2;
 /// 客户端 SHM 槽(经 cap_dup + shm_map 变 Cap::Shm(id))。
 pub const CLIENT_SHM_SLOT: usize = 3;
+/// M3-3 客户端收页槽(mem_client 复用 3 槽;uart 客户端该槽为 SHM 槽,
+/// 不同进程无冲突)。
+pub const CLIENT_PAGE_SLOT: usize = 3;
+/// M3-3 服务端页池槽范围(闭区间 1..=4,4 页;内核测试经 `pages::alloc` +
+/// `grant_typed_cap` 注入,引导编排见 DEFERRED D33)。
+pub const SERVER_POOL_START: usize = 1;
+pub const SERVER_POOL_END: usize = 4;
 /// UART 设备窗口 VA(避开 ELF 0x4000_0000 段 / SHM 0x5000_0000)。
 pub const UART_MMIO_VA: usize = 0x6000_0000;
 /// UART 服务 id(kernel services.rs 注册域 [1, MAX_SERVICES))。
 pub const UART_SERVICE_ID: usize = 1;
+/// M3-3:内存服务 id(kernel services.rs SERVICE_MEMORY=2,须保持同步)。
+pub const MEMORY_SERVICE_ID: usize = 2;
 /// 共享页固定 VA / 长度(与 kernel shm.rs SHM_VA / SHM_LEN 一致)。
 pub const SHM_VA: usize = 0x5000_0000;
 pub const SHM_LEN: usize = 4096;
+/// M3-3:内存页固定 VA(避开 ELF 0x4000_0000 段 / SHM 0x5000_0000 /
+/// UART 0x6000_0000;客户端经 mem_map 映射 Cap::Page 至此)。
+pub const MEM_VA: usize = 0x7000_0000;
 
 // ===== 消息协议(M3-DESIGN §10.8)=====
 /// WRITE 请求:arg1 = 数据长度,数据在 SHM_VA[0..len]。
@@ -50,10 +67,16 @@ pub const OP_WRITE: usize = 0x01;
 pub const OP_READ: usize = 0x02;
 /// PING 请求:连通性测试。
 pub const OP_PING: usize = 0x03;
+/// M3-3 ALLOC 请求:arg1 = client 收页槽(服务端经 mem_grant 移交 Cap::Page)。
+pub const OP_ALLOC: usize = 0x04;
+/// M3-3 FREE 请求:arg1 = client 归还页槽;回复 arg2 = 服务端归还接收槽。
+pub const OP_FREE: usize = 0x05;
 /// 回复标记:回复首字 = op | 0x80。
 pub const OP_REPLY_FLAG: usize = 0x80;
 /// 协议级错误状态(未知 op;数值与内核 -EINVAL 编码一致)。
 pub const PROTO_ERR: usize = usize::MAX;
+/// M3-3 服务池空/归还失败错误(与 kernel `SYS_ERR_ENOMEM` 一致,须保持同步)。
+pub const ERR_ENOMEM: usize = usize::MAX - 3;
 
 /// panic handler:无输出通道(打印须走 IPC 到 uart_server;服务未就绪时
 /// 静默)。内核测试以 marker / 超时断言暴露 panic;spin_loop 缓解 empty_loop。
@@ -160,6 +183,17 @@ pub fn sys_service_connect(id: usize, client_slot: usize, server_slot: usize) ->
 /// map_device:白名单设备 MMIO 页映射进本进程(排他 claim)。
 pub fn sys_map_device(dev_id: usize, va: usize) -> usize {
     syscall(SYS_MAP_DEVICE, dev_id, va, 0, 0, 0, 0)
+}
+
+/// M3-3 mem_grant:move `Cap::Page`(源槽 → 对端目标槽,清源槽;对端须持
+/// `Cap::Proc` —— 经 CLIENT_IPC_SLOT/SERVER_ACCEPT_SLOT 互授)。返回 a0。
+pub fn sys_mem_grant(src_slot: usize, peer_slot: usize, dst_slot: usize) -> usize {
+    syscall(SYS_MEM_GRANT, src_slot, peer_slot, dst_slot, 0, 0, 0)
+}
+
+/// M3-3 mem_map:把 `Cap::Page` 以 U RW 映射进本进程根表(单映射不变量)。
+pub fn sys_mem_map(slot: usize, va: usize) -> usize {
+    syscall(SYS_MEM_MAP, slot, va, 0, 0, 0, 0)
 }
 
 // ===== uart client 库(打印/读取经 IPC + SHM 到 uart_server)=====

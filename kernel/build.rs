@@ -2,9 +2,9 @@
 // 相对路径(-Tkernel/linker.ld)依赖 cargo 工作目录,从子目录
 // 或 IDE 构建会解析失败;CARGO_MANIFEST_DIR 保证任意调用方式一致。
 //
-// M3 T1/T2:额外编译用户程序(user/ 独立 crate,lib + hello + uart_server
-// 两 bin),产物拷入 OUT_DIR 供 kernel `include_bytes!` 内嵌(方案 A,见
-// M3-DESIGN §3.5)。
+// M3 T1/T2 + M3-3:额外编译用户程序(user/ 独立 crate,lib + hello +
+// uart_server + memory_server + mem_client 四 bin),产物拷入 OUT_DIR 供
+// kernel `include_bytes!` 内嵌(方案 A,见 M3-DESIGN §3.5)。
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -19,8 +19,8 @@ fn main() {
     build_user_elf(&dir);
 }
 
-/// M3 T1/T2:编译 user/ 独立 crate → `$OUT_DIR/hello.elf` + `$OUT_DIR/
-/// uart_server.elf`(kernel include_bytes!)。
+/// M3 T1/T2 + M3-3:编译 user/ 独立 crate → `$OUT_DIR/*.elf`(hello /
+/// uart_server / memory_server / mem_client,kernel include_bytes!)。
 ///
 /// 方案 A(cargo-in-cargo):env `CARGO_TARGET_DIR=$OUT_DIR/user-target`
 /// 隔离内层 cargo 的 target 目录,规避 cargo-in-cargo 锁冲突;外层 cargo
@@ -65,8 +65,8 @@ fn build_user_elf(kernel_dir: &str) {
     let status = cmd.status().expect("failed to run cargo for user program");
     assert!(status.success(), "user program (ignium-user) build failed");
 
-    // 拷入两个 bin 的 ELF(include_bytes! 内嵌;boot_elf_test 用 hello.elf,
-    // M3-2 T1 用 uart_server.elf)。
+    // 拷入全部 bin 的 ELF(include_bytes! 内嵌):hello(boot_elf_test)、
+    // uart_server(M3-2 T1)、memory_server + mem_client(M3-3 服务/客户端)。
     let release_dir = target_dir
         .join("riscv64gc-unknown-none-elf")
         .join("release");
@@ -77,4 +77,14 @@ fn build_user_elf(kernel_dir: &str) {
         out_dir.join("uart_server.elf"),
     )
     .expect("copy uart_server ELF into OUT_DIR for include_bytes!");
+    std::fs::copy(
+        release_dir.join("memory_server"),
+        out_dir.join("memory_server.elf"),
+    )
+    .expect("copy memory_server ELF into OUT_DIR for include_bytes!");
+    std::fs::copy(
+        release_dir.join("mem_client"),
+        out_dir.join("mem_client.elf"),
+    )
+    .expect("copy mem_client ELF into OUT_DIR for include_bytes!");
 }
