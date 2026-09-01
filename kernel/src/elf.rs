@@ -220,6 +220,17 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, ElfError> {
         if p_vaddr >= USER_VA_LIMIT {
             return Err(ElfError::AddressTooHigh);
         }
+        // B4(M3 收尾审查):**段上界**校验 —— `p_vaddr + p_memsz` 须落在
+        // Sv39 用户区内。此前只校验下界,恶意 ELF 可令 `vaddr+memsz` 逼近
+        // usize::MAX:段重叠检查的 `a.vaddr + a.memsz`(未 checked)与
+        // map_segment 的 `align_up(x)`(`x+4095`)都会溢出 → overflow-checks
+        // 下内核 panic 停机。此处一次性消除两处未检算术的溢出面。
+        if p_vaddr
+            .checked_add(p_memsz)
+            .is_none_or(|end| end > USER_VA_LIMIT)
+        {
+            return Err(ElfError::AddressTooHigh);
+        }
         // bss:内存长度 ≥ 文件长度(尾部零填充)。
         if p_memsz < p_filesz {
             return Err(ElfError::BadSegment);

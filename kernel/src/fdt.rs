@@ -27,6 +27,9 @@ pub struct BoardParams {
     pub ram_size: usize,
     pub timebase_freq: usize,
     pub uart_base: usize,
+    /// D21:UART 节点参考时钟(clock-frequency 属性,如 QEMU virt = 3.6864
+    /// MHz)。用于按波特率计算 NS16550 分频器;0 = 未解析,调用方回退默认。
+    pub uart_clock: usize,
     /// ISA 字符串(由 riscv,isa 属性解析,如 "rv64imafdch")。
     pub isa_string: &'static str,
     /// D8:CPU 节点数(cpu@* 数 = 在线 hart 数;无则 0,调用方回退 1)。
@@ -43,6 +46,7 @@ impl BoardParams {
             ram_size: 0,
             timebase_freq: 0,
             uart_base: 0,
+            uart_clock: 0,
             isa_string: "",
             cpu_count: 0,
             reserved: [(0, 0); 8],
@@ -324,6 +328,20 @@ impl Fdt {
                 if prop_len >= 4 {
                     params.timebase_freq =
                         unsafe { be32(struct_ptr as usize + val_start) } as usize;
+                }
+            }
+            // D21:UART 节点参考时钟(如 QEMU virt uart 节点
+            // clock-frequency = <0x384000> = 3.6864MHz)。与 uart_base
+            // 同一节点判定(compatible/reg 分支),0 = 未解析回退默认。
+            "clock-frequency"
+                if (node == b"uart"
+                    || node.starts_with(b"uart@")
+                    || node == b"serial"
+                    || node.starts_with(b"serial@"))
+                    && params.uart_clock == 0 =>
+            {
+                if prop_len >= 4 {
+                    params.uart_clock = unsafe { be32(struct_ptr as usize + val_start) } as usize;
                 }
             }
             "compatible" => {

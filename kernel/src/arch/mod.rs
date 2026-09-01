@@ -5,7 +5,7 @@
 //! - `cpu_state` —— 诊断用寄存器快照
 //! - `sanitize_csr` —— 启动时清洗中断/保护相关 CSR
 //! - `irq_disable` / `irq_enable` —— 关/开全局中断
-//! - `enable_timer` / `get_time` / `TIMER_INTERVAL` —— 周期定时器
+//! - `enable_timer` / `get_time` / `timer_interval` —— 周期定时器
 //! - `wait_for_interrupt` / `halt` —— 空闲等待 / 停机
 //! - `CpuState` —— 快照数据结构(repr(C),与汇编 ABI 对齐)
 //!

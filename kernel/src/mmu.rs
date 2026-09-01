@@ -199,9 +199,13 @@ pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Res
     }
     // M2 用户映射默认叶子需 U 位;调用方可传已含 PTE_U 的 flags。
     pte_write(l0_t, l0, pte(paddr, flags | PTE_U));
-    // TLB 冲刷:映射后立即可见(首次访问前无陈旧项,防护用途)。
+    // TLB 冲刷(2026-09-01,P4 收尾):用单地址 sfence.vma(vaddr,x0) 取代
+    // 全量冲刷。正确性:本函数拒绝覆盖已有 PTE(上行),本地址唯一可能残留
+    // 陈旧 TLB 项的路径是先前 unmap —— unmap_4k 已用单地址 sfence,故
+    // 单地址冲刷保证正确。收益:建进程/ELF 映射/mmap_share 不再清空整条
+    // TLB(高频 IPC 路径受益于更少全量冲刷)。
     unsafe {
-        asm!("sfence.vma zero, zero", options(nostack));
+        asm!("sfence.vma {}, zero", in(reg) vaddr, options(nostack));
     }
     Ok(())
 }
@@ -541,6 +545,15 @@ fn map_region_4k(root: usize, start: usize, end: usize, flags: u64) {
 /// 写 PTE 后立即冲刷 TLB,确保后续访问观察到新映射。
 /// 仅对已用 4KB 页映射的区域有效(超页需先拆分)。
 pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
+    // B3(M3 收尾审查):先只读走查叶子。中间级缺失/叶子不存在(0)→
+    // 无映射可撤,直接 Ok,**不调用 ensure_table 分配页表页**。此前对
+    // 未映射地址调用会静默新建 1-2 个清零页表页并留在根表中(destroy_root
+    // 时才回收)—— 掩蔽调用方错误、属预期外分配(shm_revoke 对已销毁/复用
+    // 槽的根表、elf::rollback 部分失败回退均可能命中)。超页叶子 → leaf_pte
+    // 非零,仍走 ensure_table 报 Err(需先拆分,语义不变)。
+    if leaf_pte(root, vaddr) == 0 {
+        return Ok(());
+    }
     let l2 = (vaddr >> 30) & 0x1FF;
     let l1 = (vaddr >> 21) & 0x1FF;
     let l0 = (vaddr >> 12) & 0x1FF;

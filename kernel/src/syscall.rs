@@ -85,8 +85,12 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
                 }
                 Ok(crate::ipc::SendBlock::NoPeer) => {
                     // 已登记 pending,立即阻塞(无调度点,配对不丢)。
-                    // 不返回:配对方写入 a0/a1-a5/sepc+4 后经帧恢复回本点。
+                    // 正常路径不返回:配对方写入 a0/a1-a5/sepc+4 后经帧恢复
+                    // 回本点。B1:若配对方在本线程阻塞前已配对(待消费唤醒),
+                    // 本调用把结果写入活帧并返回 false → 落到下面,由 trap
+                    // 恢复 sret 回用户,消息即达(不切走)。
                     unsafe { crate::sched::block_user_from_trap(frame) };
+                    false
                 }
                 Err(code) => {
                     unsafe { *frame.add(GPR_A0) = code };
@@ -107,7 +111,10 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
                     false
                 }
                 Ok(crate::ipc::RecvBlock::NoPeer) => {
+                    // B1:同 send —— 待消费唤醒命中时本调用写活帧并返回
+                    // false,此处 sret 回用户取到消息;否则正常阻塞不返回。
                     unsafe { crate::sched::block_user_from_trap(frame) };
+                    false
                 }
                 Err(code) => {
                     unsafe { *frame.add(GPR_A0) = code };
@@ -219,8 +226,26 @@ fn sys_write(frame: *mut usize) {
                 return;
             }
         };
+        // 整数守卫:`buf + len` 在 buf 近 usize::MAX 时回绕,令 `last` 回绕到
+        // 小地址 → `while va <= last` 整体跳过 → 逐页校验被绕过,SUM=1 拷贝
+        // 即读非规范地址 → S 模式 load page fault → **用户态一次 syscall
+        // 可停机**(M3 收尾审查发现)。checked_add + USER_VA_LIMIT 双守卫,
+        // 越界一律 -EFAULT(与逐页校验失败同码)。
+        let end = match buf.checked_add(len) {
+            Some(e) => e,
+            None => {
+                unsafe { *frame.add(GPR_A0) = SYS_ERR_EFAULT };
+                unsafe { *frame.add(FRAME_SEPC) += 4 };
+                return;
+            }
+        };
+        if end > crate::mmu::USER_VA_LIMIT {
+            unsafe { *frame.add(GPR_A0) = SYS_ERR_EFAULT };
+            unsafe { *frame.add(FRAME_SEPC) += 4 };
+            return;
+        }
         let first = buf & !0xfff;
-        let last = buf + len - 1;
+        let last = end - 1;
         let mut va = first;
         while va <= last {
             if !crate::mmu::is_user_mapped(root, va) {
@@ -235,13 +260,21 @@ fn sys_write(frame: *mut usize) {
     // SUM**(RISC-V:无 SUM 时 S 模式对 U 页访问立即故障,实测 scause=0xd);
     // trap 恢复路径写回入口保存的 sstatus,临时置位不泄漏;SIE=0 无抢占。
     let mut kbuf = [0u8; MAX_WRITE_LEN];
+    // B2(M3 收尾审查):拷贝期间持 SHM 表锁,阻断对端核并发
+    // `cap_revoke → shm_revoke` 在「校验后、拷贝完成前」撤映射/释放页
+    // (TOCTOU)。否则 SUM=1 直读已释放共享页 → S 模式页故障 → 内核停机
+    // (用户一次 syscall DoS)。SHM 锁为独立叶子锁,本路径不持其它锁,无
+    // 锁序问题;SIE=0 下本核无抢占,持锁安全。
+    let _shm = crate::shm::lock_guard();
     crate::arch::set_sum();
     for (i, slot) in kbuf.iter_mut().take(len).enumerate() {
         // SAFETY:buf 已逐页校验为当前进程根表的 U 页,且 SUM=1 使 S 模式
-        // 可读;len ≤ MAX_WRITE_LEN 防栈缓冲越界。
+        // 可读;len ≤ MAX_WRITE_LEN 防栈缓冲越界。SHM 锁(若为共享页)阻断
+        // 对端核撤映射,校验与拷贝间页保持映射。
         *slot = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
     }
     crate::arch::clear_sum();
+    drop(_shm);
     crate::uart::write_bytes(&kbuf[..len]);
     unsafe { *frame.add(GPR_A0) = len };
     unsafe { *frame.add(FRAME_SEPC) += 4 };

@@ -17,6 +17,10 @@ const DEFAULT_RAM_SIZE: usize = 128 * 1024 * 1024;
 /// 默认 UART 基址(QEMU virt)。
 const DEFAULT_UART_BASE: usize = 0x1000_0000;
 
+/// D21:默认 UART 参考时钟(HZ):QEMU virt uart 节点 clock-frequency =
+/// 3.6864 MHz(经典 NS16550 参考时钟 1.8432MHz 的 2 倍)。
+const DEFAULT_UART_CLOCK: usize = 3_686_400;
+
 /// 默认 mtimer 频率(HZ):QEMU virt = 10 MHz。
 const DEFAULT_TIMER_FREQ: usize = 10_000_000;
 
@@ -24,6 +28,7 @@ const DEFAULT_TIMER_FREQ: usize = 10_000_000;
 static BOARD_RAM_START: AtomicUsize = AtomicUsize::new(0);
 static BOARD_RAM_SIZE: AtomicUsize = AtomicUsize::new(0);
 static BOARD_UART_BASE: AtomicUsize = AtomicUsize::new(0);
+static BOARD_UART_CLOCK: AtomicUsize = AtomicUsize::new(0);
 static BOARD_TIMER_FREQ: AtomicUsize = AtomicUsize::new(0);
 /// D8:在线核数(FDT cpu@* 节点数;0 = 未解析,调用方回退 1)。
 static BOARD_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -108,6 +113,13 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     } else {
         DEFAULT_TIMER_FREQ
     };
+    // D21:UART 参考时钟(HZ)。合理性区间 1MHz..100MHz(超出即 FDT 异常
+    // 或非 uart 节点误匹配,回退默认)。仅用于波特率分频计算。
+    let uart_clock = if params.uart_clock >= 1_000_000 && params.uart_clock <= 100_000_000 {
+        params.uart_clock
+    } else {
+        DEFAULT_UART_CLOCK
+    };
     // D8:CPU 数(FDT cpu@* 节点数)。0(无 FDT/未解析)回退 1;超上限的
     // 部分在 wake_secondaries 用 min(MAX_HARTS) 截断(超限 hart 仍停 park)。
     let cpu_count = if params.cpu_count >= 1 {
@@ -118,6 +130,7 @@ pub fn init_from_fdt(params: &fdt::BoardParams) {
     BOARD_RAM_START.store(ram_start, Ordering::Relaxed);
     BOARD_RAM_SIZE.store(ram_size, Ordering::Relaxed);
     BOARD_UART_BASE.store(uart_base, Ordering::Relaxed);
+    BOARD_UART_CLOCK.store(uart_clock, Ordering::Relaxed);
     BOARD_TIMER_FREQ.store(timer_freq, Ordering::Relaxed);
     BOARD_CPU_COUNT.store(cpu_count, Ordering::Relaxed);
 }
@@ -176,6 +189,17 @@ pub fn uart_base() -> usize {
         v
     } else {
         DEFAULT_UART_BASE
+    }
+}
+
+/// D21:UART 参考时钟(HZ)。uart.rs 据此计算 NS16550 波特率分频器。
+#[inline]
+pub fn uart_clock() -> usize {
+    let v = BOARD_UART_CLOCK.load(Ordering::Relaxed);
+    if v != 0 {
+        v
+    } else {
+        DEFAULT_UART_CLOCK
     }
 }
 

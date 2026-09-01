@@ -23,7 +23,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::sync::SpinLock;
+use crate::sync::{SpinLock, SpinLockGuard};
 
 /// 共享页固定虚拟地址(两个进程地址空间的同一 VA,映射同一物理页)。
 /// 与既有用户测试 VA 0x4000_0000 段(Sv39 L2=1)同 L2 不同 L1,不重叠。
@@ -50,6 +50,26 @@ struct SharedPage {
 struct ShmTable {
     shms: Vec<SharedPage>,
     free: VecDeque<usize>,
+}
+
+/// 注册表单例。
+/// B2(M3 收尾审查):`sys_write` 拷贝期间持有 SHM 表锁的**公开守卫**。
+///
+/// 背景:`sys_write` 先逐页校验缓冲为用户页、再 SUM=1 直读拷贝。若缓冲
+/// 指向共享页,对端核可并发 `cap_revoke → shm_revoke` 在「校验后、拷贝
+/// 完成前」撤映射并释放物理页 → S 模式读已释放页 → 页故障停机(用户
+/// 一次 syscall DoS 内核)。持本锁使 `shm_revoke`(取同一锁)在拷贝期间
+/// 无法撤映射。SHM 锁为独立叶子锁(契约:不与 IPC/SCHED 同持),sys_write
+/// 拷贝路径不持任何其它锁,无锁序问题。
+///
+/// 私有 `ShmTable` 不可跨模块泄漏,故以本包装守卫公开(内部字段隐藏)。
+pub struct ShmCopyGuard {
+    _guard: SpinLockGuard<'static, ShmTable>,
+}
+
+/// 获取 B2 拷贝守卫(内部 `SHM.lock()`)。
+pub fn lock_guard() -> ShmCopyGuard {
+    ShmCopyGuard { _guard: SHM.lock() }
 }
 
 /// 注册表单例。

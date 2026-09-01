@@ -92,6 +92,20 @@ enum ThreadState {
     Exited,
 }
 
+/// B1(M3 收尾审查):**待消费 IPC 唤醒**载荷。
+///
+/// 跨核配对方在目标线程"登记 pending、尚未阻塞"(target state != Blocked)
+/// 期间配对时,`ipc_wake_with_msg`/`ipc_wake_with_err` 把唤醒结果存于此,
+/// 由目标线程的阻塞点(`block_current` 内核线程 / `block_user_from_trap`
+/// 用户线程)在置 Blocked 前消费并**跳过阻塞** —— 防"先唤醒、后阻塞"
+/// 竞态把已写结果覆盖、线程落入 Blocked+就绪队列死锁。
+enum IpcWake {
+    /// 配对完成:消息字(用户线程写 a0=0 + a1..a5;内核线程经 ipc_msg 读)。
+    Msg([usize; crate::ipc::MSG_WORDS]),
+    /// 对端已亡:错误码(用户线程写 a0=code;内核线程经 ipc_msg 读)。
+    Err(usize),
+}
+
 /// 内核线程控制块。
 struct Thread {
     prio: u8,
@@ -122,6 +136,11 @@ struct Thread {
     /// `block_current` 恢复(ctx,读不到帧)—— 由本字段中转,
     /// `take_ipc_msg()` 读取即清。None = 无待取消息。
     ipc_msg: Option<[usize; crate::ipc::MSG_WORDS]>,
+    /// B1(M3 收尾审查):阻塞前到达的 IPC 唤醒(见 `IpcWake` 文档)。
+    /// 仅由 `ipc_wake_with_msg`/`ipc_wake_with_err` 在目标
+    /// `state != Blocked` 时置位;由 `block_current` /
+    /// `block_user_from_trap` 消费清零(消费后跳过阻塞)。None = 无。
+    ipc_wake: Option<IpcWake>,
     /// M2 T1.5:所属进程(None = 内核线程,运行于内核根表)。
     /// M2 T2a:IPC 能力查表经 `current_proc()` 读取。
     proc: Option<usize>,
@@ -136,7 +155,6 @@ struct Thread {
     /// 线程入口(thread_entry 经 id 查表调用)。
     entry: fn(),
     /// 线程栈(Box:栈内存来自内核堆)。
-    #[allow(dead_code)]
     stack: Option<KernelStack>,
 }
 
@@ -714,6 +732,7 @@ impl Scheduler {
             entry,
             stack: Some(stack),
             ipc_msg: None,
+            ipc_wake: None,
         };
         if id < self.threads.len() {
             // 复用已退出线程的槽
@@ -803,6 +822,7 @@ impl Scheduler {
             // 用户线程无内核栈(其 trap 用全局陷阱栈)。
             stack: None,
             ipc_msg: None,
+            ipc_wake: None,
         };
         if id < self.threads.len() {
             self.threads[id] = t;
@@ -945,6 +965,7 @@ pub fn init() {
             entry: idle_entry,
             stack: Some(stack),
             ipc_msg: None,
+            ipc_wake: None,
         });
         s.current[h] = idle_id;
         s.idle[h] = idle_id;
@@ -1089,6 +1110,19 @@ pub fn block_current() {
         let mut s = SCHED.lock();
         let h = arch::hartid();
         let cur = s.current[h];
+        // B1(M3 收尾审查):阻塞前命中待消费 IPC 唤醒(跨核配对方在
+        // `ipc_wake_with_msg`/`ipc_wake_with_err` 于目标阻塞前配对时
+        // 置位)。消费并跳过阻塞 —— 消息/错误已在 ipc_msg,随后的
+        // `take_ipc_msg()` 读取。与 woken 协议同构但 IPC 专用:不污染
+        // woken 的互斥/条件语义,且配对已完成、消息不丢。撤销捐赠
+        // (donate_on_block 已在本线程阻塞前登记,配对完成即失效)。
+        if s.threads[cur].ipc_wake.take().is_some() {
+            s.threads[cur].state = ThreadState::Running;
+            s.revoke_donations(cur);
+            drop(s);
+            arch::irq_restore(irq);
+            return;
+        }
         if s.threads[cur].state == ThreadState::Ready {
             // 已被唤醒(队列中):撤销本次入队,继续运行。
             s.remove_from_ready(cur);
@@ -1169,10 +1203,31 @@ pub fn wake(id: usize) {
 /// 由 IPC pending 队列保证(配对方经 `block_user_from_trap` 已阻塞),避免
 /// 陈旧唤醒标志干扰后续 `block_current` 的消费时序。
 ///
+/// B1(M3 收尾审查):目标 `state != Blocked`(跨核配对方在目标阻塞前配对)
+/// 时**不写帧/不入队**(t.frame 尚非活帧,写了会被阻塞点覆盖;入队会造成
+/// Running+就绪队列双调度窗口),改存待消费唤醒 `ipc_wake` + `ipc_msg`,
+/// 由目标阻塞点(`block_current` / `block_user_from_trap`)消费并跳过阻塞。
+///
 /// 锁序:调用方须已持有 IPC 锁(IPC → SCHED);本函数内再取 SCHED。
 pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
     let irq = arch::irq_save();
     let mut s = SCHED.lock();
+    if s.threads[tid].state != ThreadState::Blocked {
+        // B1:目标未阻塞。存待消费唤醒;同时写 ipc_msg(内核线程阻塞点
+        // 消费 ipc_wake 后经 take_ipc_msg 读取)。不写帧、不入队。
+        let mut buf = [0usize; crate::ipc::MSG_WORDS];
+        if let Some(m) = msg {
+            let n = m.len().min(crate::ipc::MSG_WORDS);
+            for (i, w) in m.iter().take(n).enumerate() {
+                buf[i] = *w;
+            }
+        }
+        s.threads[tid].ipc_msg = Some(buf);
+        s.threads[tid].ipc_wake = Some(IpcWake::Msg(buf));
+        drop(s);
+        arch::irq_restore(irq);
+        return;
+    }
     {
         let t = &mut s.threads[tid];
         debug_assert!(
@@ -1195,6 +1250,8 @@ pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
             }
             buf
         });
+        // Blocked 线程不应有待消费唤醒;防御性清除(置位仅发生在阻塞前)。
+        t.ipc_wake = None;
     }
     s.enqueue(tid);
     // M2 T2b(PIP):配对完成,撤销本线程此前登记的全部捐赠(peer 回落)。
@@ -1214,6 +1271,15 @@ pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
 pub fn ipc_wake_with_err(tid: usize, code: usize) {
     let irq = arch::irq_save();
     let mut s = SCHED.lock();
+    if s.threads[tid].state != ThreadState::Blocked {
+        // B1:目标未阻塞(跨核 purge 在目标阻塞前配对)。存待消费唤醒,
+        // 不写帧/不入队;阻塞点消费并跳过阻塞,错误经 ipc_msg 中转。
+        s.threads[tid].ipc_msg = Some([code; crate::ipc::MSG_WORDS]);
+        s.threads[tid].ipc_wake = Some(IpcWake::Err(code));
+        drop(s);
+        arch::irq_restore(irq);
+        return;
+    }
     {
         let t = &mut s.threads[tid];
         debug_assert!(
@@ -1224,6 +1290,7 @@ pub fn ipc_wake_with_err(tid: usize, code: usize) {
         t.frame[FRAME_SEPC] += 4;
         // 内核线程读不到帧 → 错误码经 ipc_msg 中转(take_ipc_msg)。
         t.ipc_msg = Some([code; crate::ipc::MSG_WORDS]);
+        t.ipc_wake = None;
     }
     s.enqueue(tid);
     // M2 T2b(PIP):配对已不可能完成,撤销本线程登记的全部捐赠。
@@ -1650,7 +1717,7 @@ pub fn exit_from_trap() -> ! {
     arch::halt()
 }
 
-/// M2 T2a:从 trap 上下文阻塞当前**用户**线程(如 IPC 等待配对),永不返回。
+/// M2 T2a:从 trap 上下文阻塞当前**用户**线程(如 IPC 等待配对)。
 ///
 /// 与 `exit_from_trap` 同源(CPU 在陷阱栈上、sscratch 指向本帧底),不同点:
 /// 线程置 `Blocked` 而非退出 —— 当前帧**复制进 TCB**(配对方经
@@ -1660,12 +1727,46 @@ pub fn exit_from_trap() -> ! {
 /// # Safety
 /// `frame` 必须指向当前有效用户陷阱帧(trap_handler 传入、scause=8);
 /// 仅在用户线程的 syscall 上下文调用。
-pub unsafe fn block_user_from_trap(frame: *mut usize) -> ! {
+///
+/// # 返回值(B1,2026-09-01)
+/// 返回 `false` = 阻塞前消费了**待消费 IPC 唤醒**(`ipc_wake`,跨核配对方
+/// 在本线程登记 pending、尚未阻塞时配对)—— 唤醒结果已写入 `frame`,
+/// **未切走**,调用方应正常返回并 sret 回用户(消息即达)。返回 `true` /
+/// 不返回 = 正常阻塞路径:帧已复制进 TCB 并切走,醒来经 frame_restore
+/// sret,本函数不再返回。
+pub unsafe fn block_user_from_trap(frame: *mut usize) -> bool {
     let irq = arch::irq_save();
     let target = {
         let mut s = SCHED.lock();
         let h = arch::hartid();
         let cur = s.current[h];
+        // B1:阻塞前命中待消费 IPC 唤醒(跨核配对方先到,结果已存入
+        // `ipc_wake` + `ipc_msg`)。把结果应用到**活帧**并返回 false →
+        // 调用方 sret 回用户,消息即达,不切走。若此处照常复制活帧 → 置
+        // Blocked,会把 `ipc_wake_with_msg` 早先写入 t.frame 的结果覆盖,
+        // 线程落入 Blocked+就绪队列死锁(消息丢失)。撤销捐赠:配对已完成。
+        if let Some(w) = s.threads[cur].ipc_wake.take() {
+            s.threads[cur].state = ThreadState::Running;
+            s.revoke_donations(cur);
+            // SAFETY:frame 与复制路径同源(trap_handler 传入的有效用户
+            // 陷阱帧,FRAME_WORDS 长),本函数 Safety 约定已声明。
+            let f = unsafe { core::slice::from_raw_parts_mut(frame, FRAME_WORDS) };
+            match w {
+                IpcWake::Msg(m) => {
+                    f[crate::arch::gpr::X_A0] = 0;
+                    for (i, w) in m.iter().enumerate() {
+                        f[crate::arch::gpr::X_A1 + i] = *w;
+                    }
+                }
+                IpcWake::Err(code) => {
+                    f[crate::arch::gpr::X_A0] = code;
+                }
+            }
+            f[FRAME_SEPC] += 4;
+            drop(s);
+            arch::irq_restore(irq);
+            return false;
+        }
         // 当前帧复制进 TCB(与 on_tick 捕获同款)供恢复与配对写结果。
         s.threads[cur]
             .frame
@@ -1689,6 +1790,7 @@ pub unsafe fn block_user_from_trap(frame: *mut usize) -> ! {
     // 锁外切换(中断关闭保证原子性)。
     do_switch(&target);
     // 醒来经 frame_restore sret 回用户态,不会到达这里;防御性停机。
+    // (halts -> !,满足 bool 返回类型;正常路径永不返回。)
     arch::irq_restore(irq);
     arch::halt()
 }

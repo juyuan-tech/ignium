@@ -13,11 +13,12 @@
 | D15 | mmu 接口下沉 arch 层(现顶层 mmu.rs) | DESIGN 契约 | x86_64 移植(阶段 5) | 待办:接口形态见 mmu.rs 模块头;x86_64 移植时下沉为 arch::mmu |
 | D16 | RVA23 支持计划(见 docs/RVA23.md):P1 编译目标扩展+验证基线(M1.5)/ P2 Zicboz+Svpbmt+Zacas+Sstc(M2)/ P3 Svinval+Zicbom+V 上下文 | 用户提问 | P1=M1.5,P2=M2 | **P1 已实现**(审计 18 轮):Makefile test-rva23 目标 + CI rva23 job;cpu.rs 模块(ISA 诊断输出);扩展编译+`-cpu max` 冒烟通过。**P2 按 M2 收官决策延后 M2+**(Zicboz 页清零加速/Svpbmt 真机 MMIO/Zacas 原子,留待真机 bring-up 与后续里程碑评估),P3 仍 M2+ |
 | D18 | early_trap 最小诊断输出(真机 bring-up 期 UART 未就绪时静默停机,审计 17 轮 INFO-4;文档化为 bring-up 风险,真机适配时落实) | 审计 17 轮 INFO-4 | 真机 bring-up | 待办 |
-| D21 | UART 波特率分频按 FDT clock-frequency 计算 | 审计多轮 pro #6 | 真机 bring-up 前(不属 M1.5:M1.5 全部 QEMU 内) | 待办:当前固定分频 0x0C(QEMU 忽略);读串口节点 clock-frequency,分频 = clk/(16×波特率) |
+| D21 | UART 波特率分频按 FDT clock-frequency 计算 | 审计多轮 pro #6 | 真机 bring-up 前(不属 M1.5:M1.5 全部 QEMU 内) | **已实现(2026-09-01,M3 收尾)**:fdt.rs 解析 uart 节点 `clock-frequency` → BoardParams.uart_clock;board.rs 校验(1MHz..100MHz)并暴露 `uart_clock()`;uart.rs `uart_divisor()` 按 clk/(16×115200) 计算(DLL/DLM),异常回退 0x0C。见 uart.rs |
 | D23 | 早期 UART 用硬编码基址(V4 MED):uart::init 在 FDT 解析前写默认 0x10000000,真机若不在该址会误写无关 MMIO | 审计 V4 MED | 真机 bring-up 前 | 待办:真机须先解析 FDT(或经 SBI 调试控制台)再驱动 UART;reinit 对 QEMU 足够 |
 | D24 | FDT 多内存 bank / `#address-cells`/`#size-cells` 变体:当前只取首个 reg 对且仅 2-cell/1-cell | 自审(挑剔视角) | 真机 bring-up | 待办:M2 收官决策**延至真机 bring-up**(QEMU 单 bank 无触发条件);多 bank 需 buddy 支持不连续区间;`#cells` 变体(如 3-cell)需按 node 解析 cells 属性 |
 | D25 | SCHED 全局锁拆分(per-CPU 锁) | M3-DESIGN §7 | M4 | **M3-1 评估后延后 M4**:现状正确(D19);M3-1 已叠加跨核 kill/shootdown + ELF 两个高敏改动,拆分风险不可控;收益有限(QEMU 4 核 IPC 瓶颈是 current_id 取锁,非整锁带宽);成本高(跨核 enqueue 需按 hart 序取锁防死锁;on_tick/block/exit/yield 全部重审)。可选低风险子项(per-CPU `CURRENT_TID` 原子缓存)单独评估,不并入 M3-1 |
 | D26 | slab 空页水位扫描(定时/水位触发后台扫描) | M3-DESIGN §7 | M4 或真实内存压力 | **M3-1 评估后不做**:现状有界(非 head 空页下次任一档 grow 懒回收,head 保留作快复用缓存),内核堆用量几 KB 级 / RAM 128MB,收益 ≈ 0。M4 或真实内存压力出现时再评估 |
+| D28 | IPC syscall 路径 SCHED 锁三次顺序获取合并(current_id → donate_on_block → block_user_from_trap) | M3 收尾审查(perf agent) | M4(SCHED 锁缩放评估时一并) | **M3-1 评估后延后**:三次获取均**顺序、不嵌套**(trap 上下文 SIE=0,无重入/死锁风险),是纯性能微项;SCHED 锁在 syscall 路径无竞争,收益 ≈ 0;合并需改 `block_user_from_trap` 签名与 donation/IPC-wake API 契约,触碰 B1 刚修改的最关键路径,风险 >> 收益。留待 M4 与 D25(SCHED 锁缩放)一并评估 |
 
 ## 已实现(落地)
 

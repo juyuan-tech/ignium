@@ -457,7 +457,6 @@ pub fn alloc_pages(order: usize) -> Option<usize> {
 ///
 /// 对 order=12(16 MiB)清零 4096 页较慢,仅用于真正必要的交接
 /// (用户栈/页表/敏感缓冲),并应优先用 order=0/小阶。
-#[allow(dead_code)] // M2 用户空间启用
 pub fn alloc_pages_zeroed(order: usize) -> Option<usize> {
     let block = alloc_pages(order)?;
     for i in 0..(1usize << order) {

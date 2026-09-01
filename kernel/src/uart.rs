@@ -16,11 +16,11 @@
 //! 可能重排对不同 MMIO 地址的写入,破坏 DLAB 时序。关键写之间
 //! 插入 `fence iorw, iorw`(pro 审计 #10)。
 //!
-//! # 平台依赖(已知限制)
+//! # 平台依赖(D21 已解决)
 //! 基址 0x1000_0000 为 QEMU virt 约定;M1.5 已支持 FDT 解析串口基址
-//! (兼容 uart@/serial@ 节点,从节点名或 reg 属性提取)。**分频值仍为
-//! 固定 0x0C**(QEMU 忽略波特率;真机须按实际 UART 参考时钟计算,
-//! FDT clock-frequency 解析待实现,pro 审计 #6/D21)。
+//! (兼容 uart@/serial@ 节点,从节点名或 reg 属性提取)。**D21(2026-09-01):
+//! 分频值按 FDT uart 节点 `clock-frequency` 计算**(divisor = clk/(16×波特率),
+//! 见 `uart_divisor`);QEMU 忽略波特率,真机按实际参考时钟即得正确波特率。
 //!
 //! # 健壮性
 //! 发送采用**有界等待**:真机上 TX 挂死时宁可丢字符(计数器记录)
@@ -137,6 +137,25 @@ fn is_transmit_empty() -> bool {
     unsafe { read_u8(uart_lsr()) & 0x20 != 0 }
 }
 
+/// 目标波特率(分频计算基准;QEMU 忽略,真机常用值)。
+const BAUD_RATE: usize = 115_200;
+
+/// D21:计算 NS16550 分频器值 = 参考时钟 / (16 × 波特率)。
+///
+/// board::uart_clock 源自 FDT uart 节点 `clock-frequency`;对 QEMU virt
+/// (3.6864MHz)得 3686400/(16×115200) = 2(DLL=0x02)。异常时回退旧固定值
+/// 0x0C(QEMU 忽略波特率,仅形式正确)。结果 clamp 到 16 位分频寄存器
+/// 有效范围 [1, 0xFFFF](除零/时钟过低防回绕)。
+#[inline]
+fn uart_divisor() -> u16 {
+    let clk = crate::board::uart_clock();
+    if clk == 0 {
+        return 0x0C;
+    }
+    let div = clk / (16 * BAUD_RATE);
+    div.clamp(1, 0xFFFF) as u16
+}
+
 /// 初始化串口为 8N1、FIFO 开启、关中断。
 ///
 /// 顺序敏感,见模块头"DLAB 陷阱"说明;关键写之间插入 MMIO fence:
@@ -144,10 +163,7 @@ fn is_transmit_empty() -> bool {
 /// 2. LCR=0x03(DLAB=0,8N1)→ fence → 写 IER=0(关中断)
 /// 3. FCR=0x07(开 FIFO 并清空)、MCR=0x03(RTS/DTR 置位)
 ///
-/// 分频值说明:分频 = 参考时钟 / (16 × 波特率)。QEMU virt 的虚拟
-/// 串口对波特率不敏感,此处数值仅为形式正确(经典 1.8432MHz 参考
-/// 时钟下为 9600 波特,与注释"115200"不符 —— 真机必须按实际时钟
-/// 计算,见模块头"平台依赖")。
+/// 分频值来源:见 `uart_divisor`(D21,FDT clock-frequency 计算)。
 ///
 /// 缓存 UART 基址,加速后续 putc 热路径。
 pub fn init() {
@@ -168,15 +184,17 @@ pub fn reinit() {
 /// # Safety
 /// 必须确保 UART_REG_BASE 已更新为正确基址(由 init/reinit 保证)。
 unsafe fn init_hw() {
+    // D21:分频 = FDT clock-frequency 计算值(DLL/DLM 16 位)。
+    let dll = uart_divisor();
     unsafe {
         write_u8(uart_lcr(), 0x80);
         mmio_fence();
-        write_u8(uart_dll(), 0x0C);
+        write_u8(uart_dll(), (dll & 0xFF) as u8);
         // 自审修复(真机健壮性):DLL/DLM 构成 16 位分频,DML 写入时
         // UART 锁存完整分频 —— 乱序核上若 DLM 先写会以旧 DLL 锁存,
         // 波特率错误。关键写之间必须有 fence。
         mmio_fence();
-        write_u8(uart_dlm(), 0x00);
+        write_u8(uart_dlm(), (dll >> 8) as u8);
         mmio_fence();
         write_u8(uart_lcr(), 0x03);
         mmio_fence();
