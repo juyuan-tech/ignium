@@ -87,13 +87,16 @@ VisionFive 2)→ 烧录 → 串口/调试器 bring-up → 按 board.rs 抽象换
 > **M3-2(2026-09-01)✓** —— uart_server 服务化落地(设计见 docs/M3-DESIGN.md §10,
 > 报告见 docs/reports/2026-09-01-m3-2-uart-server.md):设备页授予(`map_device` 号 12)+
 > 内核服务注册表(`service_register/connect` 号 10/11)+ `sys_write/read` 移除(打印/读取
-> 走 IPC)+ 跨核 IPC IPI 实测(T1/T2 banner)。**下一步:下表内存服务**
-> (内存服务 → ramfs → spawn 服务化)。
+> 走 IPC)+ 跨核 IPC IPI 实测(T1/T2 banner)。
+> **M3-3(2026-09-01)✓** —— 内存服务落地(设计见 docs/M3-DESIGN.md §11,报告见
+> docs/reports/2026-09-01-m3-3-memory-service.md):`Cap::Page` 能力 + 页注册表 +
+> `mem_grant/mem_map`(号 13/14)+ mem_server 用户态服务(**纯服务授权**:内核不暴露
+> 分配 syscall)+ T1/T2 测试。**下一步:ramfs**(内存服务 → ramfs → spawn 服务化)。
 
 | 任务 | 产出/验收 |
 |---|---|
 | ~~uart_server 进程独占 UART,打印走 IPC~~ | **✓(M3-2)**:uart_server 独占 UART,内核不再直碰(设备页 U 映射 + IPC WRITE/READ);读取经用户态库 `uart_read` |
-| 内存服务:cap 发页 + IPC 申请/释放 | 用户进程可申请页 |
+| ~~内存服务:cap 发页 + IPC 申请/释放~~ | **✓(M3-3)**:用户进程可经 mem_server 服务申请/映射/归还物理页(`Cap::Page`,mem_grant/mem_map 号 13/14;纯服务授权) |
 | ramfs 文件系统服务(open/read/write/close) | IPC 客户端可读写删文件 |
 | virtio-blk 驱动服务 + 持久文件系统 | 重启数据仍在 |
 | spawn 服务化 + init 进程 + shell | shell 跑通 echo/cat 重定向 |

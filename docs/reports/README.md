@@ -8,6 +8,7 @@
 
 | 报告 | 摘要 |
 |---|---|
+| [2026-09-01-m3-3-memory-service.md](2026-09-01-m3-3-memory-service.md) | **M3-3:内存服务(Cap::Page 纯服务授权)**:`Cap::Page` 能力 + 页注册表 + mem_grant/mem_map(号 13/14)+ mem_server 用户态服务(内核不暴露分配 syscall,避免 ambient 授权)+ 客户端经 IPC 申请/映射/归还页 + T1/T2(含跨核 Cap::Page 移交) |
 | [2026-09-01-m3-2-uart-server.md](2026-09-01-m3-2-uart-server.md) | **M3-2:uart_server 服务化**:设备页授予(号 12)+ 内核服务注册表(号 10/11)+ sys_write/read 移除(打印/读取走 IPC)+ 跨核 IPC IPI 实测(T1/T2);accept-any 空槽监听语义 + build.rs 跨环境缓存修复 |
 | [2026-09-01-m3-winddown-audit.md](2026-09-01-m3-winddown-audit.md) | **M3 收尾全面审查 + 修复**:B1 跨核 IPC 唤醒竞态 / B2 sys_write 共享页 TOCTOU / B3 unmap 静默分配 / B4 ELF 段上界溢出 / sys_write 回绕 / P2 单地址 sfence + 文档体系规整 |
 | [2026-09-01-m3-entry.md](2026-09-01-m3-entry.md) | **M3 入口**:ELF 加载器(M3 T1)+ 跨核 IPI 停核/Running 线程回收/跨核 TLB shootdown(M3 T2)+ 内核线程栈守护页(M3 T3) |

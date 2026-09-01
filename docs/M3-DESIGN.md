@@ -399,12 +399,13 @@ M3-2 已交付 uart_server 服务化(打印/读取走 IPC)。阶段 3 的第二�
 - `PageRegistry { pages: Vec<PageRecord>, free: VecDeque<usize> }`,`MAX_PAGES=64`,
   `static PAGES: SpinLock`,`init()` 在 boot 期 `reserve(MAX_PAGES)`(仿 shm.rs)。
 - `PageRecord { id, paddr, owner: pid, map_va: Option<usize> }`(id = 槽索引;revoke 后
-  `paddr=0` 防陈旧,仿 SharedPage)。`owner` = 当前持有者(防御性不变量);`map_va` =
-  单映射 VA(revoke 时定位 unmap)。
+  `id=usize::MAX` 失效防陈旧,仿 SharedPage)。`owner` = 当前持有者(防御性不变量);
+  `map_va` = 单映射 VA(revoke/移交时定位 unmap)。
 - 函数:`alloc(owner) -> Result<usize, usize>`(`alloc_pages(0)`,表满 → -ENOMEM +
-  回滚 free_pages)、`revoke(id) -> Result<(), ()>`(free_pages + 失效 + 入 free 池)、
-  `grant(id, to_pid)`(owner 移交)、`map(id, pid, va)`(map_va 置位,已映射 → -EEXIST)、
-  `unmap(id, pid, va)`(map_va 清除)。
+  回滚 free_pages)、`revoke(id) -> Result<(), ()>`(unmap→free→失效入池)、
+  `grant(id, to_pid)`(owner 移交,**隐含解除发送方映射**,见 §11.4)、
+  `map(id, va)`(map_va 置位,已映射 → Err)、`paddr(id)`/`is_mapped(id)`(mem_map
+  预检)。**无 unmap-without-free**:解除映射只经 revoke/grant 两条路径(登记 D34)。
 - 锁序:`TABLE → PAGES`(destroy 持 TABLE 取 PAGES,同 `TABLE → SHM`,不逆序)。
 
 ### 11.3 纯服务授权:页池由引导编排注入
@@ -418,11 +419,17 @@ M3-2 已交付 uart_server 服务化(打印/读取走 IPC)。阶段 3 的第二�
 - 签名:`mem_grant(a0=src_slot, a1=peer_slot, a2=dst_slot)`。
 - 语义:**move** Cap::Page(调用方 src_slot → peer 的 dst_slot);清调用方 src_slot
   (单引用,防双持)。
-- 门禁:调用方 src_slot 持 `Cap::Page(id)`(否则 -EACCES);peer_slot 持 `Cap::Proc(peer)`
-  (否则 -EACCES)——**只能移交给已连接(持 Cap::Proc)的进程**,无 ambient 移交;页
-  未映射(map_va None,否则 -EINVAL);dst_slot 空(否则 -EEXIST,防静默丢 cap);
-  peer 存活。成功:`grant_typed_cap(peer, dst_slot, Cap::Page(id))` +
-  `clear_cap(caller, src_slot)` + `PageRecord.owner = peer_pid`。
+- 门禁:调用方 src_slot 持 `Cap::Page(id)`(空槽 → -EACCES / 非 Page → -EINVAL);
+  peer_slot 持 `Cap::Proc(peer)`(空槽 → -EACCES / 非 Proc → -EINVAL)——
+  **只能移交给已连接(持 Cap::Proc)的进程**,无 ambient 移交;peer 存活(→ -EACCES);
+  dst_slot 越界(→ -EINVAL)/ 非空(→ -EEXIST,防静默丢 cap)。
+- **移交隐含解除发送方映射(设计调整,报告 F2 / DEFERRED D34)**:页已映射不拒绝 ——
+  `pages::grant` 锁内 `map_va.take()`,锁外从旧持有者(调用方)根表 unmap。归还协议
+  必然性:客户端归还给 mem_server 时页已映射,而系统无 unmap-without-free syscall;
+  `mem_map`/`grant` 为页映射状态唯一变更点,状态机封闭。门禁不放松:接收方仍须持
+  `Cap::Proc`,无 ambient 移交。
+- 成功:`grant_typed_cap(peer, dst_slot, Cap::Page(id))` + `clear_cap(caller, src_slot)`
+  + `PageRecord.owner = peer_pid`(grant_typed_cap 失败 → owner 回滚,不落半状态)。
 - 安全:接收方同意 = 其经 IPC 请求里声明的 dst_slot;发送方经 Cap::Proc 绑定对端。
 
 ### 11.5 `mem_map`(号 14)+ cap_revoke 兼任释放 + cap_dup 禁页
