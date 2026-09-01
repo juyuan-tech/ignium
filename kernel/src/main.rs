@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 mod arch;
 mod board;
 mod cpu;
+mod device;
 mod elf;
 mod fdt;
 mod heap;

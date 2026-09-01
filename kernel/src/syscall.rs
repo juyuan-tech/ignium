@@ -19,6 +19,9 @@ pub const SYSCALL_CAP_DUP: usize = 7;
 pub const SYSCALL_WRITE: usize = 8;
 /// M3 T1:`sys_read` 占位(本轮返回 -ENOSYS,号保留,见 SYSCALLS.md)。
 pub const SYSCALL_READ: usize = 9;
+/// M3-2:`map_device(dev_id, va)` —— 白名单设备 MMIO 页以 U 权限映射进
+/// 调用进程(排他 claim;见 device.rs 与 M3-DESIGN §10.2)。
+pub const SYSCALL_MAP_DEVICE: usize = 12;
 
 /// 负 errno 的 usize 编码(与 L1 ABI 一致,见 M2-DESIGN §4.1)。
 /// 统一存放本模块:ipc.rs 的 `IPC_ERR_*` 与其别名,process::cap_errno
@@ -31,6 +34,9 @@ pub const SYS_ERR_ENOMEM: usize = usize::MAX - 3;
 pub const SYS_ERR_EBADF: usize = usize::MAX - 4;
 /// M3 T1:缓冲越界/不可访问(随 sys_write;SYSCALLS.md §错误码)。
 pub const SYS_ERR_EFAULT: usize = usize::MAX - 5;
+/// M3-2:服务 id 已注册 / 设备已被他进程 claim(随 service_register /
+/// map_device;SYSCALLS.md §错误码)。
+pub const SYS_ERR_EEXIST: usize = usize::MAX - 6;
 /// 未实现/未知号(与 -EINVAL 同编码 usize::MAX,语义靠上下文区分)。
 pub const SYS_ERR_ENOSYS: usize = usize::MAX;
 
@@ -183,6 +189,24 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
             unsafe { *frame.add(GPR_A0) = SYS_ERR_ENOSYS };
             unsafe { *frame.add(FRAME_SEPC) += 4 };
             false
+        }
+        SYSCALL_MAP_DEVICE => {
+            // a0=dev_id, a1=va;成功 a0=0,失败负 errno。
+            // 白名单/排他 claim 见 device.rs(锁序 TABLE → DEVICES)。
+            let dev_id = unsafe { *frame.add(GPR_A0) };
+            let va = unsafe { *frame.add(GPR_A1) };
+            match crate::device::map(crate::sched::current_proc(), dev_id, va) {
+                Ok(()) => {
+                    unsafe { *frame.add(GPR_A0) = 0 };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(code) => {
+                    unsafe { *frame.add(GPR_A0) = code };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
         }
         _ => {
             // 未知 syscall:-ENOSYS,返回到用户。

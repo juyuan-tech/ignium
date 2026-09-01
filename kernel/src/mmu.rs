@@ -210,6 +210,46 @@ pub fn map_user_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Res
     Ok(())
 }
 
+/// 映射**设备 MMIO 页**(M3-2,`map_device` syscall 用)。
+///
+/// 与 `map_user_page` 同构(U 权限、拒覆盖、单地址 sfence),唯一区别是
+/// **跳过 `page_in_range` 检查**:设备 MMIO(如 UART 0x1000_0000)在 buddy
+/// 分配区之外,`map_user_page` 的 S1 加固会拒绝。**白名单由调用方
+/// (device.rs)校验** —— 本接口不得用于映射任意物理页。
+///
+/// # 安全契约
+/// 调用方(device.rs `map`)必须保证 `paddr` 是**白名单设备**的 MMIO 地址。
+/// 用本接口映射任意 paddr 会把内核物理内存(或无关 MMIO)以 U 权限暴露给
+/// 用户态,一次调用方失误即内核完全失守(与 `map_user_page` 的 S1 加固
+/// 同等级安全前提)。
+///
+/// # 契约
+/// - `vaddr < USER_VA_LIMIT` 且页对齐;
+/// - 若 vaddr 处已有有效 PTE(**拒绝覆盖**)→ Err;
+/// - 中间表指针仅 V 位;叶子带 U 位;
+/// - 映射后单地址 `sfence.vma {vaddr}, zero`(P4:不清空整条 TLB)。
+pub fn map_device_page(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
+    // 用户区上界 + paddr 页对齐(ppn 掩掉低 12 位会映射错页)。
+    if vaddr >= USER_VA_LIMIT || !paddr.is_multiple_of(4096) {
+        return Err(());
+    }
+    let l2 = (vaddr >> 30) & 0x1FF;
+    let l1 = (vaddr >> 21) & 0x1FF;
+    let l0 = (vaddr >> 12) & 0x1FF;
+    let root_t = root as *const u64;
+    let l1_t = unsafe { ensure_table_user(root_t, l2)? };
+    let l0_t = unsafe { ensure_table_user(l1_t, l1)? };
+    // 拒绝覆盖:目标 L0 PTE 必须为空(防误覆盖内核/其它用户映射)。
+    if pte_read(l0_t, l0) & PTE_V != 0 {
+        return Err(());
+    }
+    pte_write(l0_t, l0, pte(paddr, flags | PTE_U));
+    unsafe {
+        asm!("sfence.vma {}, zero", in(reg) vaddr, options(nostack));
+    }
+    Ok(())
+}
+
 /// 映射 2MB 超页(叶子在 L1)。
 fn map_super(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
     let l2 = (vaddr >> 30) & 0x1FF;
@@ -457,9 +497,16 @@ pub fn destroy_root(root: usize) {
                     continue;
                 }
                 if e0 & PTE_U != 0 {
-                    // 用户叶子页:进程自有(order-0),归还 buddy。
+                    // 用户叶子页:进程自有(order-0)。
+                    // M3-2 设备页(map_device_page 白名单 MMIO)同为 U 叶子,
+                    // 但**不在 buddy 分配区** —— 只 unmap 不 free。当前唯一
+                    // 产生非分配器 U 叶子的路径是 device.rs(白名单),查
+                    // page_in_range 放行分配器页、跳过非分配器页,杜绝
+                    // free_pages 对 MMIO/固件区误 free → buddy 损坏。
                     let pa = (((e0 >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as usize;
-                    mem::free_pages(pa).expect("destroy_root: free user page");
+                    if crate::mem::page_in_range(pa) {
+                        mem::free_pages(pa).expect("destroy_root: free user page");
+                    }
                 }
                 // U=0 叶子 = 内核区 4KB 页,归内核共享,跳过。
             }

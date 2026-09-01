@@ -371,6 +371,10 @@ pub fn destroy(pid: usize) {
                     let root = p.root;
                     p.id = usize::MAX;
                     p.caps = [None; MAX_CAPS];
+                    // M3-2:进程销毁时清设备 claim(设备页生命周期随进程)。
+                    // 锁序 TABLE → DEVICES(与 device::map 一致,不逆序);
+                    // 映射不在此解除,随 destroy_root(非分配器页只 unmap)。
+                    crate::device::release_all(pid);
                     t.free.push_back(pid);
                     Some(root)
                 }
