@@ -91,13 +91,19 @@ VisionFive 2)→ 烧录 → 串口/调试器 bring-up → 按 board.rs 抽象换
 > **M3-3(2026-09-01)✓** —— 内存服务落地(设计见 docs/M3-DESIGN.md §11,报告见
 > docs/reports/2026-09-01-m3-3-memory-service.md):`Cap::Page` 能力 + 页注册表 +
 > `mem_grant/mem_map`(号 13/14)+ mem_server 用户态服务(**纯服务授权**:内核不暴露
-> 分配 syscall)+ T1/T2 测试。**下一步:ramfs**(内存服务 → ramfs → spawn 服务化)。
+> 分配 syscall)+ T1/T2 测试。
+> **M3-4(2026-09-01)✓** —— ramfs 文件系统服务落地(设计见 docs/M3-DESIGN.md §12,
+> 报告见 docs/reports/2026-09-01-m3-4-ramfs.md):**一切皆能力** —— 内核**零新
+> syscall/零新 Cap**(保持 Proc/Shm/Page);数据面 = 客户端自建 SHM 窗(Cap::Shm),
+> 存储面 = mem_server 服务链(文件页经 IPC 申请 `Cap::Page`);fd 绑定连接,无全局
+> 命名空间;open/read/write/close/unlink 全链 + 跨核往返(T1/T2 banner)。
+> **下一步:virtio-blk 驱动服务 + 持久文件系统**(内存服务 → ramfs → 持久化)。
 
 | 任务 | 产出/验收 |
 |---|---|
 | ~~uart_server 进程独占 UART,打印走 IPC~~ | **✓(M3-2)**:uart_server 独占 UART,内核不再直碰(设备页 U 映射 + IPC WRITE/READ);读取经用户态库 `uart_read` |
 | ~~内存服务:cap 发页 + IPC 申请/释放~~ | **✓(M3-3)**:用户进程可经 mem_server 服务申请/映射/归还物理页(`Cap::Page`,mem_grant/mem_map 号 13/14;纯服务授权) |
-| ramfs 文件系统服务(open/read/write/close) | IPC 客户端可读写删文件 |
+| ~~ramfs 文件系统服务(open/read/write/close)~~ | **✓(M3-4)**:纯用户态 ramfs_server(open/read/write/close/unlink),客户端经 SHM 窗数据面 + mem_server 服务链存储页;内核零新 syscall/零新 Cap,fd 绑定连接 |
 | virtio-blk 驱动服务 + 持久文件系统 | 重启数据仍在 |
 | spawn 服务化 + init 进程 + shell | shell 跑通 echo/cat 重定向 |
 | **musl 移植 + busybox 跑通(L2)** | busybox 常用命令可用 |
