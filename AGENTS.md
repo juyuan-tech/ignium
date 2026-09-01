@@ -5,8 +5,16 @@
 
 ## 环境
 
-- 开发在 **WSL2 (Ubuntu 24.04)** 中执行:编译、QEMU 测试、审计。
-- Windows 侧仅做文件编辑与 git;不要尝试在 Windows 直接构建。
+支持两套开发环境(内容等价,工具链一致):
+
+- **WSL2 (Ubuntu 24.04)**(原标准环境):编译、QEMU 测试、审计。
+  Windows 侧仅做文件编辑与 git;不要尝试在 Windows 直接构建。
+- **Arch Linux 主机 + Docker 容器**(当前实测环境):宿主编译内核(cargo 直出
+  `riscv64gc`),QEMU 门禁在容器 `ignium-dev:1.97.1` 内执行:
+  `docker run --rm -v $PWD:/work -w /work ignium-dev:1.97.1 make test[-smp|-rva23]`
+  (容器自带 rustc 1.97.1 + qemu;宿主无 qemu 时必须在容器内跑门禁)。
+
+共同约束:
 - 工具链锁定 Rust **1.97.1**(rust-toolchain.toml 与 CI 同步,改版本两处一起改)。
 
 ## 构建与验证(每次改动后必跑)

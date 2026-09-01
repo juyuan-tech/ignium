@@ -187,4 +187,4 @@ revoke → 槽原子失效 → `mmu::destroy_root` 回收进程自有页);用户
 ## 关联登记
 
 - DEFERRED:D1/D7/D8/D9/D10/D12/D19/D20/D22/D23/D24(已实现项状态已同步)。
-- docs/ROADMAP.md「阶段 2」(✅ 已完成,v0.1.0-M2)。
+- ROADMAP.md「阶段 2」(✅ 已完成,v0.1.0-M2)。

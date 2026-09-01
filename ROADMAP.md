@@ -14,7 +14,7 @@
 |---|---|
 | WSL2:rustup + riscv64gc-unknown-none-elf + qemu-system-riscv64 + gdb-multiarch + llvm-tools | ✅ 工具链可用 |
 | 仓库 + Apache-2.0 LICENSE + README + CI(编译 + QEMU 启动冒烟) | ✅ CI 绿 |
-| 调研 LiteOS-A 的 POSIX 子集/系统调用清单,确定 L1 兼容基线 | ✅ docs/compat-baseline 见 DESIGN |
+| 调研 LiteOS-A 的 POSIX 子集/系统调用清单,确定 L1 兼容基线 | ✅ 见 docs/DESIGN.md §铁律(接口对齐 LiteOS-A,兼容代码零进内核,内核只认 IPC) |
 | 最小内核:启动 + 串口输出 | ✅ M0 ✓ |
 
 ## 阶段 1:内核核心原语(第 3~8 周)✅ 全部完成(M1)

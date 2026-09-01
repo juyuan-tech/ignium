@@ -51,8 +51,10 @@
 ## 优化方向登记
 
 - **D1**:中断快速路径(仅保存调用者保存寄存器)—— 定时器 ISR 全帧
-  保存(~288 B)是主成本;**已按 M2 决策延后 M3 评估**(asm ABI 重构风险与本轮
-  "安全"目标冲突;SSTC 已避开每 tick SBI ecall)。
+  保存(~288 B)是主成本;**M3-1 评估后不做**(见 docs/DEFERRED.md D1):asm ABI
+  重构(仅存 caller-saved)需在切换点把 s0-s11 从陷阱栈搬进 TCB(on_tick/block/
+  force_kill 全改),TRAP_FRAME 索引是跨 4 文件单一事实来源;收益 <5%(SSTC 已
+  移除每 tick SBI ecall)。
 - **定时器**:SSTC 直写已避开每 tick SBI ecall(D17);context switch
   成本主要来自 SCHED 锁(pick_next/队列扫描)。
 - **阶段 4 扩充**:剩余基线(大消息、锁吞吐、页表操作)在阶段 4 补测。

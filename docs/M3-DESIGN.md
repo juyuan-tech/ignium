@@ -133,19 +133,26 @@ M2-DESIGN §7 仅提纲,本轮固化:**解析 + 校验 + 映射 + 用户栈 + ar
 **sys_write 语义(本轮)**:fd=1 → `uart::write_bytes(buf)`(NS16550,多核安全);
 fd≠1 → `-EBADF`(新 `SYS_ERR_EBADF = MAX-4`)。**逐页**校验 buf 在当前进程根表
 映射为**用户页**(`mmu::is_user_mapped`,限 U 位 —— 防跨页越界,亦防放行内核区
-页泄漏内核内存),len 上限 4096,越界 → `-EFAULT`(新 `SYS_ERR_EFAULT = MAX-5`)。
+页泄漏内核内存),`len > 4096` → `-EINVAL`(与 SYSCALLS.md/code 一致;`-EFAULT` 仅
+保留给"任一页未映射/缓冲不可访问")。
 拷贝须置 `sstatus.SUM=1`(S 模式直读 U 页;trap 恢复路径写回原值,临时置位
 不泄漏;SIE=0 无抢占)—— M3-T1 实测首版缺 SUM 时 S 模式对 U 页立即
 `scause=0xd`,此处为修复记录。
 
 ## 6. 跨核 IPI 停核 + Running 线程回收 + 跨核 TLB shootdown
 
-### 6.1 问题(现状)
+### 6.1 问题(现状)→ M3 T2 已解决
 
-- `kill_current_process`(sched.rs:1180)对其它核 `state==Running` 线程
-  `continue`(sched.rs:1208-1211):栈不回收 / TCB 槽不复用 / 状态不改 —— 泄漏,
+> **实现状态(2026-09-01)**:本节问题已由本轮 M3 T2 修复。`kill_current_process`
+> 现为薄封装,公共核心 `kill_process(pid)`(sched.rs:1511);SSIP handler
+> (riscv64.rs)经 `REMOTE_REQ` 位图分发 TLB_FLUSH/FORCE_KILL,`force_kill_current`
+> 回收其它核 Running 线程(栈→reaper、槽→free_slots、状态→Exited);shm revoke
+> 经 `tlb_shootdown_remote` 跨核失效。行号随重构漂移,以下为历史动机记录。
+
+- `kill_current_process`(原 sched.rs:1180)对其它核 `state==Running` 线程
+  `continue`(原 sched.rs:1208-1211):栈不回收 / TCB 槽不复用 / 状态不改 —— 泄漏,
   依赖其下次用户访存故障自愈。
-- `mmu::tlb_flush()`(mmu.rs:542)只刷当前核;shm revoke 的 TLB 失效只对当前核
+- `mmu::tlb_flush()`(原 mmu.rs:542)只刷当前核;shm revoke 的 TLB 失效只对当前核
   生效 —— 其它核读共享页仍命中陈旧 TLB。
 
 ### 6.2 设计
@@ -165,7 +172,7 @@ fd≠1 → `-EBADF`(新 `SYS_ERR_EBADF = MAX-4`)。**逐页**校验 buf 在当�
 5. `switch_root(kernel_root)` → `process::destroy(pid)` → `exit_from_trap`。
 `kill_current_process` 变薄封装(仅处理本核 Running)。
 
-**SSIP handler 改造(riscv64.rs:534)**:
+**SSIP handler 改造(riscv64.rs:555,`trap_handler` 内 CAUSE_SUPERVISOR_SOFTWARE 分支)**:
 - `csrc sip, SSIP` → `REMOTE_REQ[h].swap(0)`:
   - bit0(TLB_FLUSH)→ 本核 `sfence.vma zero, zero`;
   - bit1(FORCE_KILL)→ `return sched::force_kill_current(frame, h)`。
@@ -231,4 +238,4 @@ ISR 内零分配零日志,只取 SCHED 锁,不碰 TABLE/IPC):
 - DEFERRED:M1(ELF 延至 M3)→ **本轮落地**;跨核 Running 线程回收/D20 内核栈
   守护页 → **本轮落地**;SCHED 缩放 / D1 / slab → 评估后延后(§7 移入)。
 - docs/DESIGN.md 已知限制(§):跨核 shootdown/内核栈守护页 → 本轮消项。
-- docs/ROADMAP.md 阶段 3:ELF 加载器 M3-1 勾选。
+- ROADMAP.md 阶段 3:ELF 加载器 M3-1 勾选。

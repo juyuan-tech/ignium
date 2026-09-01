@@ -94,12 +94,13 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 │   │   ├── uart.rs         # NS16550 驱动(DLAB 陷阱注释 + MMIO fence + 有界发送)
 │   │   ├── sbi.rs          # SBI 调用封装(ecall:TIME 扩展定时器)
 │   │   ├── mem.rs          # buddy 物理内存分配器(order 0-12 + FDT 刻蚀 + 自检)
-│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ M2 用户映射 + 每进程根表(create_user_root/switch_root/is_mapped/destroy_root)
+│   │   ├── mmu.rs          # Sv39 页表 + 内核身份映射(段级权限拆分)+ 用户映射 + 每进程根表(create_user_root/switch_root/is_mapped/destroy_root)+ 内核栈守护页(split_superpage/unmap_kernel_4k)
+│   │   ├── elf.rs          # M3 T1:ELF 加载器(校验 magic/class/EM_RISCV + 逐段映射 + 无任意物理地址,恶意 ELF 逐段溢出守卫)
 │   │   ├── heap.rs         # 内核堆(slab 16B..2KB + buddy 页路径,#[global_allocator])
-│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程 + 每进程 satp 切换 + D12 杀进程 kill_current_process/捐赠双向清理)
-│   │   ├── syscall.rs      # 用户态系统调用分发(M2 全量:a7 传号、a0 返回,EXIT/GET_TICKS/IPC_SEND/IPC_RECV/SHM_MAP/CAP_REVOKE/CAP_DUP + -errno)
+│   │   ├── sched.rs        # 线程调度器(协作+抢占/时间片/优先级/idle/退出,含 spawn_user 用户线程 + 每进程 satp 切换 + D12 杀进程 + M3 T2 跨核 IPI 停核 kill_process/force_kill_current + 捐赠双向清理)
+│   │   ├── syscall.rs      # 用户态系统调用分发(M2 全量 + M3 T1 sys_write(号 8)/sys_read 占位(号 9):a7 传号、a0 返回 + -errno)
 │   │   ├── sync.rs         # 同步原语(SpinLock/阻塞式 Mutex/Condvar)
-│   │   ├── tests.rs        # M2 引导期冒烟测试(用户线程 ecall + 地址空间隔离 + 同步 IPC/压力 + 共享内存/能力 + 用户故障恢复 + IPC 延迟基准)
+│   │   ├── tests.rs        # M2 引导期冒烟测试 + M3 T1 ELF 用户程序测试(boot_elf_test:user ELF 跑通 + 负面用例 + 守护页断言)
 │   │   └── arch/           # 架构隔离层(riscv64.rs + riscv64.S:陷阱向量/sret/context_switch)
 │   ├── build.rs            # 链接脚本绝对路径传递(CARGO_MANIFEST_DIR)
 │   ├── Cargo.toml
@@ -109,11 +110,13 @@ IGNIUM_AUDIT_KEY=sk-xxx python3 scripts/ai_audit.py
 ├── docs/
 │   ├── DESIGN.md           # 架构设计原则
 │   ├── M2-DESIGN.md        # M2 设计(U/S 切换/ecall ABI/IPC/能力/每进程地址空间)
+│   ├── M3-DESIGN.md        # M3 设计(ELF 加载器/用户态服务/sys_write/跨核停核/栈守护页)
+│   ├── SYSCALLS.md         # L1 syscall ABI 唯一来源(号 + errno + 语义)
 │   ├── DEFERRED.md         # 延迟项注册表(含触发条件与状态)
 │   ├── RVA23.md            # RVA23 兼容性差距与分阶段支持计划
 │   ├── benchmarks.md       # 性能基线(M1.5 + M2 IPC 延迟/LTO 对比)
-│   ├── reports/            # 详尽报告(每次修复/更新必写)
-│   └── audit-reports/      # 外部 AI 审计留档
+│   ├── reports/            # 详尽报告(每次修复/更新必写;索引见 reports/README.md)
+│   └── audit-reports/      # 外部 AI 审计留档(历史归档;说明见 audit-reports/README.md)
 ├── ROADMAP.md              # 里程碑路线图(阶段 0→5 + 每步验收)
 ├── .github/                # CI + Issue/PR 模板
 ├── AGENTS.md               # AI 协作者与团队执行规范(红线 + 报告规范)
