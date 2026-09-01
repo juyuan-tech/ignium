@@ -68,7 +68,7 @@ VisionFive 2)→ 烧录 → 串口/调试器 bring-up → 按 board.rs 抽象换
 | U/S 特权级 + 每进程地址空间 | ✅ 完成:U/S 特权级(T1:用户线程 U 模式取指、ecall 往返、sys_get_ticks/sys_exit);**每进程独立地址空间(T1.5:独立 satp 根表 + 切换 + 双进程同 VA 隔离)** + **用户栈守护页(D20)** |
 | 系统调用机制 + **L1 ABI 定义(对齐 LiteOS-A 风格)** | ✅ a7 传 syscall 号、a0 返回值(L1 占位:sys_get_ticks/sys_exit),sys_write/open 待实现 |
 | 进程管理:创建/退出/wait | ✅ spawn_user(用户态线程创建)+ exit_from_trap(用户线程退出,正确帧切换);**进程销毁/页回收(M2 D12)** |
-| ELF 加载器(RISC-V) | 独立编译程序可运行 | ⏳ **延至 M3**(M2 决策:独立编译程序 + ELF 解析属 M3 用户态服务前置,见 DEFERRED 关联) |
+| ELF 加载器(RISC-V) | 独立编译程序可运行 | ✅ **M3 T1 完成**:独立 `user/` crate 编译真 ELF,内核 `elf.rs` 解析/校验/逐段映射(无任意物理地址),U 模式运行回写结果;`sys_write(fd=1)` 占位 + `sys_read` 保留。见 docs/M3-DESIGN.md §3 与 docs/SYSCALLS.md |
 | **IPC 设计**:同步 IPC + 注册发送 + 阻塞/唤醒 + 优先级继承(依赖 D22 woken 抢占,见 M2-DESIGN §5.1) | A→B 消息往返正确 | ✅ **T2a ✓**(同步 IPC 核心:寄存器消息 + 阻塞配对 + 简化能力表 + D22 woken 抢占,引导期往返测试通过);**T2b ✓**(优先级继承 PIP:按进程捐赠表 + 有效优先级,on_tick 用有效优先级判抢占;IPC 压力测试:内核线程 send/recv 环 1000 次,无丢失无损坏) |
 | IPC 性能:寄存器小消息 + 共享内存大消息 | 延迟可测并记录 | ✅ 寄存器小消息(T2a)+ **共享内存大消息(T3c)**;延迟基准 ~4 µs/往返(见 benchmarks.md 与报告) |
 | 能力模型简化版:未授权 IPC 被拒 | 拒绝测试用例 | ✅ T2a:未授权 cap → `-EACCES` 拒绝测试通过;T3c:cap dup/revoke + Shm 能力 |
@@ -78,6 +78,13 @@ VisionFive 2)→ 烧录 → 串口/调试器 bring-up → 按 board.rs 抽象换
 **M2 完成**(分水岭,务必在此处停下验收)。
 
 ## 阶段 3:用户态服务 + L2 兼容(第 5~8 个月)
+
+> **M3 入口(2026-09-01)✓** —— 设计先行(`docs/M3-DESIGN.md` + `docs/SYSCALLS.md`)→
+> **T1 ELF 加载器 ✓** / **T2 跨核 IPI 停核 + Running 线程回收 + 跨核 TLB
+> shootdown ✓** / **T3 内核线程栈守护页 ✓**。M2 两条已知限制(守护页、跨核
+> shootdown)已消项(见 docs/DESIGN.md);SCHED 锁拆分 / D1 快速路径 / slab
+> 水位扫描评估后延后(见 docs/DEFERRED.md)。**下一步:下表用户态服务**
+> (uart_server → 内存服务 → ramfs → spawn 服务化)。
 
 | 任务 | 产出/验收 |
 |---|---|

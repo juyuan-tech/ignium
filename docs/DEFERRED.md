@@ -31,7 +31,8 @@
 | D10 | 用户页交接前清零(防信息泄漏) | 审计 M4(mem.rs) | M2 用户态 | mem::alloc_pages_zeroed(整块清零);用户页交接(T1 boot 测试)已调用 |
 | D11 | ISR 内分配安全(与 D3 配套,防死锁) | 优化报告遗留风险 | 调度器里程碑 | 就绪队列/reaper/线程 Vec 容量预留(MAX_THREADS=64),ISR 路径零分配;调度器临界区 irq_save/restore |
 | D17 | 无 SSTC 平台检测与 SBI 定时器回退(读 FDT riscv,isa) | 审计 14 轮 HIGH-2 | M1.5(FDT 解析已落地) | riscv64.rs 增 USE_SSTC 标志 + arm_timer 双路径;enable_timer 首次用 SBI(不怕 trap),cpu::init_from_fdt 检测 isa 含 sstc 则切 stimecmp |
-| D20 | 线程栈守护页(**用户态部分**) | 审计 V3 M1 | M2(每进程地址空间) | 每进程地址空间(M2 T1.5):用户栈下 4KB 守护页(分配不映射,`mmu::is_mapped` 结构性校验);**内核线程栈(堆分配 16KB)守护页仍无,属遗留风险**(见 reports/2026-08-28-m2-t15-addrspace.md) |
+| D20 | 线程栈守护页(**用户态 + 内核态**) | 审计 V3 M1 | M2(每进程地址空间) | 每进程地址空间(M2 T1.5):用户栈下 4KB 守护页(分配不映射,`mmu::is_mapped` 结构性校验);**内核线程栈守护页(M3 T3)补齐**:堆栈布局改 20KB(16KB 栈体 + 4KB 守护页),分配后 unmap、归还前先 remap 恢复身份映射再 dealloc;mmu.rs 增 `split_superpage`/`unmap_kernel_4k`/`map_kernel_4k`/`remap_kernel_4k`。见 reports/2026-09-01-m3-entry.md |
+| D27 | 带 proc 内核线程的栈守卫(跨根表拆分传播):内核线程栈守护页当前仅在 `kernel_root` unmap;若内核线程带进程根表运行,其内核栈守卫页须在该根表也有效,需 split_superpage 跨根表传播 | M3-DESIGN §9 风险表 | 带 proc 内核线程落地 / M4 | 待办:当前内核线程均 proc=None 运行于 kernel_root,守卫生效;引入带 proc 内核线程时须在 M3-DESIGN 风险表记录的基础上落实跨根表传播 |
 | D22 | woken 高优先级线程的抢占(V4 审计 HIGH):on_tick 只认 frame_valid,被唤醒线程(ctx_valid-only)无法被定时器抢占 → 低优忙循环可长时间饿死高优 | 审计 V4 HIGH | M2(IPC 依赖 wake 驱动抢占) | sched.rs(M2 T2a):on_tick/pick_next(false) 候选谓词放宽为 `frame_valid \|\| (ctx_valid && woken)`;被唤醒 ctx 线程经 `expand_ctx_to_frame` 展开为 S 模式帧再 frame_restore(sepc=ctx.ra、SPP=1),同步消费 woken。IPC 阻塞唤醒后即可抢占忙循环;PIP(T2b)依赖此基础 |
 | D7 | per-hart 陷阱栈数组(现全局单栈) | 审计 11 轮 H1 | 多核唤醒前(M2) | sched.rs/entry.S(M2 T3a):陷阱栈按 hartid 数组,sscratch 指向 per-hart 栈顶;副核唤醒后各自初始化 |
 | D8 | 副核唤醒与多核 bring-up | 自审/ROADMAP | M2+ | entry.S/sched.rs(M2 T3a):引导者仲裁赢家经 SBI IPI/HSM 唤醒副核;副核从 park 进入内核,初始化 per-hart 陷阱栈后加入调度 |
