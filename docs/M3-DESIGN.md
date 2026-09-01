@@ -514,6 +514,127 @@ M3-2 已交付 uart_server 服务化(打印/读取走 IPC)。阶段 3 的第二�
 - MAX_PAGES=64 / 服务池 4 页的有界配额。
 - destroy 持 TABLE→PAGES 锁序,不破坏 TABLE→SERVICES→DEVICES→IPC→SCHED。
 
+## 12. M3-4:ramfs 文件系统服务(一切皆能力)—— 本轮
+
+### 12.0 概览与用户决策
+
+ROADMAP 阶段 3 的第三步 = **ramfs 文件系统服务**(open/read/write/close),验收:IPC
+客户端可读写删文件。引入用户态 **ramfs_server**;文件/目录/名字全是**服务内资源**。
+
+**用户已拍板(AskUserQuestion)**:
+- **数据面 = 共享内存窗口**:客户端经 `shm_map`(号 5)与 ramfs_server 共享 4KB 缓冲,
+  读写载荷经 `SHM_VA`,控制面(op+fd+len)走 5 字 IPC;
+- **存储面 = mem_server 服务链**:ramfs_server 是 mem_server 客户端,经 IPC 申请
+  `Cap::Page` 做文件数据页;
+- **方向强调"更符合一切皆能力"** → 内核**零新 syscall 号、零新 `Cap` 变体**(保持
+  Proc/Shm/Page);fd 绑定连接(专用连接槽),无全局命名空间;数据窗/存储页皆由能力链取得。
+
+架构(能力流):
+
+```
+test(client) ──connect(3)──▶ ramfs_server ──connect(2)──▶ mem_server
+  │  [OP_FS_*] 5字IPC             │ [OP_ALLOC/OP_FREE]         │ 池 1..=4
+  │  SHM 窗 0x5000_0000           │ mem_map(RAMFS_VA+fd*4K)    │ Cap::Page
+```
+
+### 12.1 数据面:客户端自建共享内存窗口(Cap::Shm)
+
+- client 建立窗口 3 步:connect(RAMFS, 2, 0) → cap_dup(2→3) → shm_map(3,
+  server_slot=1, 4096);ramfs_server 槽 1 = `Cap::Shm`。读写载荷经 `SHM_VA[0..n]`
+  (256B/1KB 完全覆盖),控制经 IPC —— 复用 uart_server 已验证的 `[op,len]+SHM_VA`
+  模式(见 §10.4 uart_init)。
+- 能力从客户端流向服务端(client 自持 Cap::Shm,服务端因被授予而访问),无 ambient 缓冲。
+- 单窗 + 单连接槽 → 1 并发 client(承接 D30,登记 D36)。
+
+### 12.2 存储面:mem_server 服务链(Cap::Page 经 IPC 申请)
+
+- ramfs_server 是 mem_server(服务 2)客户端:open 建文件 → `send(2,[OP_ALLOC,收页槽])`
+  → mem_server `mem_grant` `Cap::Page` 进文件页槽 → `mem_map` 到 `RAMFS_VA+fd*4096`;
+  unlink → `send(2,[OP_FREE,page_slot])` → 收 recv_slot → `mem_grant(page_slot,
+  peer=2, recv_slot)` 归还(mem_grant 隐含解除发送方映射,见 §11.4/D34)。
+- 链:测试注入池 → mem_server → ramfs_server → ramfs_client;页面能力全程经服务 IPC
+  流动,无 ambient 分配。ramfs 依赖 mem_server 存活(登记 D42)。
+
+### 12.3 一切皆能力:零新 syscall、零新 Cap、fd 绑定连接
+
+- **零新 syscall 号**:全部复用 register(10)/connect(11)/ipc(3,4)/shm_map(5)/
+  cap_dup(7)/mem_grant(13)/mem_map(14)/exit(1)。
+- **零新 `Cap` 变体**:内核能力仍为 Proc/Shm/Page;文件句柄是**服务内**资源。
+- **fd 绑定连接**:ramfs_server 槽 0 收请求(启动时空槽 = accept-any;client connect 后
+  变特定接收,只收持 `Cap::Proc(ramfs_server)` 的 sender)—— 连接即能力,fd 无全局
+  命名空间。
+
+### 12.4 ramfs_server 用户态服务(user/src/bin/ramfs_server.rs)
+
+- 槽位:`0`=连接槽(收发 IPC)、`1`=SHM 窗(Cap::Shm)、`2`=mem_server IPC + mem_grant
+  peer(Cap::Proc(mem_server))、`3..=6`=文件页槽(**fd = 槽-3**,Cap::Page)、`7` 备用。
+- 启动:`service_register(RAMFS_SERVICE_ID=3)` → `service_connect(MEMORY_SERVICE_ID=2,
+  2, 0)` → 文件表 4 项全 Free → `loop { recv(0); 按 op 分派; send(0, reply) }`。
+- 文件表:`FileEntry { state: Free|Open|Closed, name:[u8;24], name_len, size }`,
+  MAX_FILES=4。**create-or-reopen**:open 不存在名 → 建(经 mem_server 分配页);存在且
+  Closed → 重开(同 fd);Open → EEXIST。**close 保槽(Open→Closed),unlink 按 fd 释放页
+  + 清表**(close 后仍可 unlink,D40)。
+- 五 op 协议(请求 `[op,arg1,arg2,arg3,arg4]`,回复首字 `op|0x80`、次字 status=0/负 errno):
+
+| op | arg1 | arg2 | arg3 | arg4 | 回复 arg2 |
+|---|---|---|---|---|---|
+| OP_FS_OPEN 0x06 | name_len(≤24) | name[0..8) | name[8..16) | name[16..24) | fd |
+| OP_FS_READ 0x07 | fd | offset | len | 0 | bytes_read(EOF→0) |
+| OP_FS_WRITE 0x08 | fd | offset | len | 0 | bytes_written |
+| OP_FS_CLOSE 0x09 | fd | 0 | 0 | 0 | 0 |
+| OP_FS_UNLINK 0x0A | fd | 0 | 0 | 0 | 0 |
+
+- errno:坏 fd / Free / Closed → **USER_ERR_EBADF = MAX-4**(复活保留隙,仅用户协议层,
+  内核不复用,登记 D39);offset 越界(≥4KB 或 off+len>4KB)→ EINVAL;重复 open → EEXIST;
+  表满 / 池空 → ENOMEM;未知 op → PROTO_ERR;name_len 0/>24 → EINVAL。读 EOF:
+  offset ≥ size → 回 0 字节(非错误);否则 `n = min(len, size-offset)` 截断。
+- 名字内联 IPC 3 字 = 24B;lib.rs 提供 `name_to_words`/`name_from_words` 共享助手(防
+  端序错配;长名登记 D38)。
+
+### 12.5 ramfs_client(user/src/bin/ramfs_client.rs)
+
+connect(RAMFS, 2, 0) → cap_dup(2, 3) → shm_map(3, 1, 4096) → OPEN "test.txt"(收 fd) →
+内联负面(EOF 空文件读 0 字节 / 重复 open → EEXIST / 坏 fd=99 → EBADF / 越界写
+off=4095,len=2 → EINVAL)→ WRITE "hello ramfs"(11B 经窗,校验 written=11)→ READ 回读
+与载荷比对 → CLOSE → UNLINK → 写 marker `0xC0DE_0000|argc`(0x4000_2000)→ exit。
+任一断言失败 → 提前 exit,marker 不到 → 测试侧 guard 超时断言失败(mem_client 同款)。
+
+### 12.6 测试与 banner
+
+- **T1** `boot_ramfs_test`(boot_tests 插 boot_memory_service_test 后):spawn
+  mem_server → yield 至 is_blocked → spawn ramfs_server → yield 至 is_blocked(已注册
+  + 已连 mem_server + 阻塞首 recv)→ 注入页池(pages::alloc×4 + grant_typed_cap 槽
+  1..=4)→ 断言 `lookup(SERVICE_RAMFS)` → spawn ramfs_client(marker 页)→ 轮询 marker
+  `0xC0DE_0000|1`(guard<500_000)→ 内核侧负面(connect id=5 → ENOENT;self-connect →
+  EACCES)→ 清理(kill ramfs_server → kill mem_server → destroy client → drain_reaper)
+  + `free_page_count` 复原(文件页归还 mem_server 池 + mem_server 撤池全回 buddy)。
+  banner `M3-4 T1: ramfs service ok`。
+- **T2** `smp_ramfs_ipc_test`(smp 阶段):mem_server + ramfs_server 亲和副核 A、client
+  亲和副核 B,完整 open→write→read→unlink 跨核往返(SHM 窗数据面 + Cap::Page 经服务
+  链跨核);单核退化仍打 banner `M3-4 T2: cross-core fs IPC ok ({n} harts)`。
+- **新 banner 同步 6 处 grep**(AGENTS.md 纪律):Makefile test/smp/rva23 + ci.yml
+  build/smp/rva23。
+
+### 12.7 提交切分(每提交过五门禁 + 6 grep 一致)
+
+1. `docs: M3-4 设计`(本节 + SYSCALLS 登记 ramfs 协议/EBADF + DEFERRED D36+);
+2. `feat: ramfs_server/client 服务`(两 bin + lib 常量/助手 + services.rs SERVICE_RAMFS
+   + build.rs 两 copy + elf.rs 两 const `#[expect(dead_code)]`);
+3. `feat: M3-4 测试 + 两 banner + 6 grep`(T1/T2 + 去 expect + 6 grep);
+4. `docs: M3-4 收官`(报告 + ROADMAP 勾选)。
+
+### 12.8 风险与遗留(登记 DEFERRED D36-42)
+
+- **D36** 单并发 client(SHM 单窗 + 单连接槽;多客户端需每连接窗/槽,承接 D30)。
+- **D37** 每文件单页上限(≤4KB;大文件需页链表/多页)。
+- **D38** 名字内联 IPC ≤24B(长名改走 SHM 窗)。
+- **D39** EBADF 仅用户协议层复活(MAX-4);内核 syscall 级保留空档不复用。
+- **D40** close 保槽 / unlink 按 fd(非 POSIX by-name;多 fd 同名与 by-name unlink 延后)。
+- **D41** 无目录树/seek/权限/持久化(平面名空间 + 带 offset 顺序读写)。
+- **D42** ramfs 依赖 mem_server 存活(服务链;承接 D32 看门狗)。
+- 兜底:未 unlink 的文件页经 `process::destroy` 钩子(revoke-before-destroy_root)回收,
+  不泄漏、无 double-free。
+
 ## 关联登记
 
 - DEFERRED:M1(ELF 延至 M3)→ M3-1 落地;跨核 Running 线程回收/D20 内核栈
@@ -522,7 +643,9 @@ M3-2 已交付 uart_server 服务化(打印/读取走 IPC)。阶段 3 的第二�
   崩溃看门狗)→ 登记 DEFERRED 待办(M3-3+ 触发)。
   M3-3 遗留(页池注入依赖引导编排/页无 unmap-without-free/归还乐观置位)→
   登记 DEFERRED 待办(D33-35,§11.11)。
+  M3-4 遗留(ramfs 单 client/每文件单页/名字内联上限/EBADF 协议层复活/close 保槽/
+  平面名空间/依赖 mem_server)→ 登记 DEFERRED 待办(D36-42,§12.8)。
 - docs/DESIGN.md 已知限制(§):跨核 shootdown/内核栈守护页 → M3-1 消项;
   「物理页发配」能力化 → M3-3 落地(`Cap::Page`)。
 - ROADMAP.md 阶段 3:ELF 加载器 M3-1 勾选;uart_server 服务化 M3-2 勾选;
-  内存服务 M3-3 勾选(本轮)。
+  内存服务 M3-3 勾选;ramfs 服务 M3-4 勾选(本轮)。

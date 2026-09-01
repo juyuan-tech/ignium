@@ -41,7 +41,7 @@ a0-a5  = 参数(按各调用定义)
 | `SYS_ERR_EACCES` | `usize::MAX - 1` | 未授权(空槽/非目标 cap/服务连接自身) |
 | `SYS_ERR_ENOENT` | `usize::MAX - 2` | 不存在(服务 id 未注册) |
 | `SYS_ERR_ENOMEM` | `usize::MAX - 3` | 内存不足 |
-| `SYS_ERR_EBADF` | `usize::MAX - 4` | ~~非法 fd~~(**M3-2 随 sys_write 移除**,号值保留不复用) |
+| `SYS_ERR_EBADF` | `usize::MAX - 4` | ~~非法 fd~~(**M3-2 随 sys_write 移除**,号值保留;内核不复用。**M3-4 起 ramfs 服务协议在用户态层复活为 `USER_ERR_EBADF`**,仅协议状态,不触碰内核编码,见 §ramfs 服务消息协议) |
 | `SYS_ERR_EFAULT` | `usize::MAX - 5` | ~~缓冲越界/不可访问~~(**M3-2 随 sys_write 移除**,号值保留不复用) |
 | `SYS_ERR_EEXIST` | `usize::MAX - 6` | **M3-2 新增**:服务 id 已注册 / 设备已被他进程 claim |
 | `-ENOSYS`(未知号) | `usize::MAX` | 未定义 syscall 号 |
@@ -104,6 +104,33 @@ a0-a5  = 参数(按各调用定义)
 (arg1=client_page_slot,归还页槽)。回复 `[op|0x80, status, recv_slot, 0, 0]`
 (ALLOC 成功 recv_slot=0;FREE 成功 recv_slot = 服务端归还接收槽)。详见
 M3-DESIGN §11.8。
+
+## ramfs 服务消息协议(用户态,SHM_VA + 5 字 IPC,M3-4 新增)
+
+**零新 syscall 号、零新 Cap 变体**(一切皆能力:文件/目录/名字全是 ramfs_server
+服务内资源;fd 绑定连接,无全局命名空间)。控制面经 5 字 IPC(号 3/4),数据面经共享
+窗口 `SHM_VA`(号 5),存储页经 mem_server 服务链(号 13/14)。
+
+请求 `[op, arg1, arg2, arg3, arg4]`,回复首字 `op|0x80`、次字 status(0 成功 / 负 errno):
+
+| op | arg1 | arg2 | arg3 | arg4 | 回复 arg2 |
+|---|---|---|---|---|---|
+| `OP_FS_OPEN` 0x06 | name_len(≤24) | name[0..8) | name[8..16) | name[16..24) | fd |
+| `OP_FS_READ` 0x07 | fd | offset | len | 0 | bytes_read(EOF→0) |
+| `OP_FS_WRITE` 0x08 | fd | offset | len | 0 | bytes_written |
+| `OP_FS_CLOSE` 0x09 | fd | 0 | 0 | 0 | 0 |
+| `OP_FS_UNLINK` 0x0A | fd | 0 | 0 | 0 | 0 |
+
+- **op 编码**:`OP_REPLY_FLAG=0x80` 置入回复首字;op 号 0x06..0x0A 承接 0x01..0x05
+  (uart 0x01-0x03 / mem 0x04-0x05)。
+- **errno(用户协议层)**:坏 fd/Free/Closed → `USER_ERR_EBADF=MAX-4`(复活保留隙,仅
+  协议状态,内核不复用);offset 越界(≥4KB 或 off+len>4KB)→ EINVAL;重复 open → EEXIST;
+  表满/池空 → ENOMEM;未知 op → PROTO_ERR;name_len 0/>24 → EINVAL。读 EOF:
+  offset ≥ size → 0 字节(非错误);否则 `n = min(len, size-offset)` 截断。
+- **create-or-reopen**:open 不存在名 → 建(经 mem_server 分配页);存在且 Closed → 重开
+  (同 fd);Open → EEXIST。close 保槽(Open→Closed),unlink 按 fd 释放页 + 清表。
+- 名字内联 IPC 3 字 = 24B(长名延后 D38)。数据载荷:WRITE 客户端写 `SHM_VA[0..len]`,
+  READ 服务端写 `SHM_VA[0..n]` 客户端回读。详见 M3-DESIGN §12.4。
 
 ## uart 服务消息协议(用户态,SHM_VA + 5 字 IPC)
 

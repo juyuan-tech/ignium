@@ -26,6 +26,13 @@
 | D33 | 页池注入依赖引导编排:mem_server 页池由测试(T1/T2)在 spawn 后经内核侧 `pages::alloc` + `grant_typed_cap` 注入;正式 spawn/init 服务落地前无「引导期自动授予」通道 | M3-3 设计(§11.3) | spawn 服务化落地 | 待办:纯服务授权设计使然(无公开分配 syscall);spawn 服务落地后改为引导期授予 |
 | D34 | 页无 unmap-without-free / remap:`cap_revoke`(号 6)对 Cap::Page 语义即「释放」(先 unmap 再 free_pages);页重定位需先 revoke 再重分配 | M3-3 设计(§11.5) | 需要页重定位/内存整理 | 待办:内存整理(compact)里程碑统一设计 |
 | D35 | OP_FREE 归还乐观置位:memory_server 回填池位前假定客户端必归还;客户端在归还 mem_grant 前崩溃 → 池位空但服务误判可用(mem_grant 失败可优雅降级 -EACCES) | M3-3 设计(§11.7) | 服务崩溃恢复里程碑 | 待办:客户端消亡检测 + 池位重扫 |
+| D36 | ramfs 单并发 client:SHM 单窗(4KB,恰两 owner)+ 单连接槽 → 服务端同时只能接待 1 客户端 | M3-4 设计(§12.1) | 多进程交互(init/shell) | 待办:多 SHM VA + 服务端槽池,承接 D30 |
+| D37 | ramfs 每文件单页上限:文件数据 ≤ 4096B(一页),无页链表/多页管理 | M3-4 设计(§12.2) | 大文件/虚拟块设备 | 待办:文件页链表或多页编帧 |
+| D38 | ramfs 名字内联 IPC ≤ 24B(NAME_MAX=24):长文件名无法表达 | M3-4 设计(§12.4) | 长路径名 | 待办:名字改走 SHM 窗或扩展消息帧 |
+| D39 | EBADF 仅用户协议层复活(USER_ERR_EBADF=MAX-4):内核 syscall 级 MAX-4 仍保留空档不复用,编码统一待定 | M3-4 设计(§12.4) | 用户协议扩展 / 内核级 fd 编码统一 | 待办:本轮内核不复用,防未来冲突 |
+| D40 | ramfs close 保槽 / unlink 按 fd:close 不释放文件槽(Open→Closed),unlink 按 fd 而非 by-name;多 fd 同名与 POSIX by-name unlink 语义延后 | M3-4 设计(§12.4) | POSIX 语义完整化 | 待办:close-然后-unlink 依赖保槽;by-name 需名字索引 |
+| D41 | ramfs 无目录树/seek/权限/持久化:平面名空间 + 带 offset 顺序读写 | M3-4 设计(§12.4) | 树形目录/权限/持久 FS | 待办:后续 FS 里程碑统一设计 |
+| D42 | ramfs 依赖 mem_server 存活:存储页经服务链申请,mem_server 崩溃 → ramfs 无法分配/归还 | M3-4 设计(§12.2) | 服务崩溃恢复里程碑 | 待办:承接 D32 看门狗;服务链崩溃传播统一设计 |
 
 ## 已实现(落地)
 
