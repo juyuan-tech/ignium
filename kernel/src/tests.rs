@@ -36,6 +36,7 @@ pub fn boot_tests() {
     boot_elf_test();
     boot_uart_service_test();
     boot_memory_service_test();
+    boot_ramfs_test();
     boot_ipc_latency_bench();
 }
 
@@ -1156,6 +1157,164 @@ fn boot_memory_service_test() {
     info!("M3-3 T1: memory service ok");
 }
 
+/// M3-4 T1:ramfs 文件系统服务冒烟(单核,引导期协作式)。
+///
+/// 验证链路:建 mem_server 进程 + **注入页池** → 建 ramfs_server 进程(注册
+/// `SERVICE_RAMFS` + 经服务链连接 mem_server + 阻塞首 recv)→ 断言
+/// `services::lookup(SERVICE_RAMFS)` → 建 ramfs_client 进程(marker 页)→
+/// 用户态 connect + 建 SHM 窗 + OPEN"test.txt" → 内联负面(EOF/EEXIST/EBADF/
+/// EINVAL)→ WRITE(经 SHM 窗)→ READ 回读比对 → CLOSE → UNLINK → 写 marker
+/// → 轮询断言(证明完整往返,否则 client 阻塞 recv 永不到)→ 内核侧负面
+/// (重复注册 EEXIST / connect 未注册 id ENOENT / 服务自连 EACCES)→ 清理
+/// (kill_process 收两服务阻塞线程)+ `free_page_count` 复原(文件页已由 client
+/// unlink 归还 mem_server 池,撤池 4 页全回 buddy,无泄漏/无 double-free)。
+/// banner:`M3-4 T1: ramfs service ok`(6 处 grep 同步)。
+fn boot_ramfs_test() {
+    // 1) 建 mem_server 进程(存储面服务链的页源)+ 等 accept-any 阻塞。
+    let mem_pid = crate::process::create().expect("m34t1: create memory_server process");
+    let mem_info =
+        crate::elf::parse(crate::elf::MEMORY_SERVER_ELF).expect("m34t1: parse memory_server");
+    assert!(
+        mem_info.entry != 0,
+        "m34t1: memory_server entry must be non-zero"
+    );
+    let loaded_mem = crate::elf::load(mem_pid, crate::elf::MEMORY_SERVER_ELF, &[])
+        .expect("m34t1: load memory_server");
+    let mem_tid = crate::sched::spawn_user_args(
+        mem_pid,
+        loaded_mem.entry,
+        loaded_mem.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_mem.argc,
+        loaded_mem.argv,
+    );
+    let mut guard = 0;
+    while !crate::sched::is_blocked(mem_tid) {
+        assert!(
+            guard < 200_000,
+            "m34t1: memory_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 2) 注入页池:pages::alloc×4 → grant_typed_cap 写服务槽 1..=4(D33 引导
+    //    编排;与 M3-3 T1 同款)。
+    for slot in SERVER_POOL_START..=SERVER_POOL_END {
+        let id = crate::pages::alloc(mem_pid).expect("m34t1: pool alloc");
+        crate::process::grant_typed_cap(mem_pid, slot, crate::process::Cap::Page(id))
+            .expect("m34t1: pool grant");
+    }
+    // 3) 建 ramfs_server 进程 + 校验/加载 ELF(空 argv:服务不打印自身信息)。
+    let fs_pid = crate::process::create().expect("m34t1: create ramfs_server process");
+    let fs_info =
+        crate::elf::parse(crate::elf::RAMFS_SERVER_ELF).expect("m34t1: parse ramfs_server");
+    assert!(
+        fs_info.entry != 0,
+        "m34t1: ramfs_server entry must be non-zero"
+    );
+    //    ramfs_client ELF 亦在此校验(本测试运行;去除 elf.rs 的 expect)。
+    let cli_info =
+        crate::elf::parse(crate::elf::RAMFS_CLIENT_ELF).expect("m34t1: parse ramfs_client");
+    assert!(
+        cli_info.entry != 0,
+        "m34t1: ramfs_client entry must be non-zero"
+    );
+    let loaded_fs = crate::elf::load(fs_pid, crate::elf::RAMFS_SERVER_ELF, &[])
+        .expect("m34t1: load ramfs_server");
+    let fs_tid = crate::sched::spawn_user_args(
+        fs_pid,
+        loaded_fs.entry,
+        loaded_fs.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_fs.argc,
+        loaded_fs.argv,
+    );
+    // 4) yield 至 ramfs_server 阻塞首 recv(register + connect mem_server 均
+    //    已发生;此后槽 0 持 Cap::Proc(client) 待 client connect 授入)。
+    guard = 0;
+    while !crate::sched::is_blocked(fs_tid) {
+        assert!(
+            guard < 200_000,
+            "m34t1: ramfs_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 5) 内核侧断言:ramfs 服务已注册(客户端经 connect 定位)。
+    assert!(
+        crate::services::lookup(crate::services::SERVICE_RAMFS).is_some(),
+        "m34t1: ramfs service must be registered"
+    );
+    // 6) 建 ramfs_client 进程:marker 页 + 加载 + spawn。
+    let client_pid = crate::process::create().expect("m34t1: create client process");
+    let client_root = crate::process::root(client_pid);
+    let marker_pa = crate::mem::alloc_pages_zeroed(0).expect("m34t1: marker page");
+    assert!(
+        crate::mmu::map_user_page(client_root, ELF_MARKER_VA, marker_pa, 0xC7).is_ok(),
+        "m34t1: map client marker page"
+    );
+    let args: [&[u8]; 1] = [b"ramfs_client"];
+    let loaded_client = crate::elf::load(client_pid, crate::elf::RAMFS_CLIENT_ELF, &args)
+        .expect("m34t1: load client");
+    crate::sched::spawn_user_args(
+        client_pid,
+        loaded_client.entry,
+        loaded_client.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_client.argc,
+        loaded_client.argv,
+    );
+    // 7) 轮询 client marker:open→写→读→关→删 全链往返完成即写(否则 client
+    //    阻塞 recv,marker 永不到 → 断言失败)。
+    let marker = marker_pa as *const usize;
+    let expect = 0xC0DE_0000 | args.len();
+    guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(marker) };
+        if v == expect {
+            break;
+        }
+        assert!(
+            guard < 500_000,
+            "m34t1: client never completed ramfs roundtrip (value={v:#x}, expect={expect:#x})"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 8) 负面用例(服务仍注册、服务存活;内核侧直调)。
+    assert_eq!(
+        crate::process::register_service(fs_pid, crate::services::SERVICE_RAMFS),
+        Err(crate::syscall::SYS_ERR_EEXIST),
+        "m34t1: duplicate service_register must be -EEXIST"
+    );
+    assert_eq!(
+        crate::services::connect(fs_pid, 5, 0, 0),
+        Err(crate::syscall::SYS_ERR_ENOENT),
+        "m34t1: connect unregistered id must be -ENOENT"
+    );
+    assert_eq!(
+        crate::services::connect(fs_pid, crate::services::SERVICE_RAMFS, 0, 0),
+        Err(crate::syscall::SYS_ERR_EACCES),
+        "m34t1: server connecting to its own service must be -EACCES"
+    );
+    // 9) 清理:kill_process 收两服务阻塞线程(ramfs_server 含 SHM 窗与连接;
+    //    mem_server 含 4 池页;文件页已由 client unlink 归还池),destroy 收
+    //    client(线程已 sys_exit)。drain_reaper 后断言页不泄漏 —— 池 4 页
+    //    全回 buddy,无 double-free。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    let free_before = crate::mem::free_page_count();
+    let _in_fs = crate::sched::kill_process(fs_pid);
+    let _in_mem = crate::sched::kill_process(mem_pid);
+    crate::process::destroy(client_pid);
+    crate::sched::drain_reaper();
+    let free_after = crate::mem::free_page_count();
+    assert!(
+        free_after >= free_before,
+        "m34t1: ramfs pool not reclaimed (free {free_after} < {free_before})"
+    );
+    info!("M3-4 T1: ramfs service ok");
+}
+
 /// M3-3 T1 负面用例(mem_server 存活时内核侧直调;mem_grant/mem_map/
 /// cap_dup/cap_revoke 语义 + destroy 钩子回收)。
 fn mem_negative_cases(server_pid: usize) {
@@ -1965,4 +2124,125 @@ pub fn smp_memory_ipc_test() {
     crate::process::destroy(client_pid);
     crate::sched::drain_reaper();
     info!("M3-3 T2: cross-core mem IPC ok ({n} harts)");
+}
+
+/// M3-4 T2:跨核 ramfs 服务 IPC 冒烟(irq_enable 后、smp_memory_ipc_test 之后
+/// 调用)。**跨核完整 fs 往返:open→write→read→unlink 经 SHM 窗 + 服务链**。
+///
+/// mem_server + ramfs_server 亲和**副核 A**(页池注入 + register + 连 mem_server
+/// 并阻塞首 recv),ramfs_client 亲和**副核 B**(A ≠ B):client 的 OPEN send 经
+/// D6 IPI 唤醒副核 A 阻塞中的 ramfs_server → ramfs_server 经服务链向同核
+/// mem_server 申请页(Cap::Page 移交)→ 回复经 D6 IPI 唤醒副核 B 阻塞中的
+/// client → WRITE/READ 经 SHM 窗数据面 → CLOSE/UNLINK → marker 完成。
+/// **双向跨核即时配对**(非定时器轮询)。核选择同 smp_memory_ipc_test。
+/// banner:`M3-4 T2: cross-core fs IPC ok (N harts)`(6 处 grep 同步)。
+pub fn smp_ramfs_ipc_test() {
+    let n = crate::board::cpu_count().min(crate::arch::MAX_HARTS);
+    let (server_hart, client_hart) = if n >= 3 {
+        (1, 2)
+    } else if n == 2 {
+        (1, 0)
+    } else {
+        (0, 0)
+    };
+    // 1) mem_server 进程(亲和 server_hart;存储面服务链的页源)。
+    let mem_pid = crate::process::create().expect("m34t2: create memory_server process");
+    let loaded_mem = crate::elf::load(mem_pid, crate::elf::MEMORY_SERVER_ELF, &[])
+        .expect("m34t2: load memory_server");
+    let mem_tid = crate::sched::spawn_user_args(
+        mem_pid,
+        loaded_mem.entry,
+        loaded_mem.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_mem.argc,
+        loaded_mem.argv,
+    );
+    crate::sched::set_affinity(mem_tid, server_hart);
+    let mut guard = 0;
+    while !crate::sched::is_blocked(mem_tid) {
+        assert!(
+            guard < 500_000,
+            "m34t2: memory_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 2) 注入页池(同 T1)。
+    for slot in SERVER_POOL_START..=SERVER_POOL_END {
+        let id = crate::pages::alloc(mem_pid).expect("m34t2: pool alloc");
+        crate::process::grant_typed_cap(mem_pid, slot, crate::process::Cap::Page(id))
+            .expect("m34t2: pool grant");
+    }
+    // 3) ramfs_server 进程(亲和 server_hart;服务链:连接 mem_server)。
+    let fs_pid = crate::process::create().expect("m34t2: create ramfs_server process");
+    let loaded_fs = crate::elf::load(fs_pid, crate::elf::RAMFS_SERVER_ELF, &[])
+        .expect("m34t2: load ramfs_server");
+    let fs_tid = crate::sched::spawn_user_args(
+        fs_pid,
+        loaded_fs.entry,
+        loaded_fs.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_fs.argc,
+        loaded_fs.argv,
+    );
+    crate::sched::set_affinity(fs_tid, server_hart);
+    // 4) 等 ramfs_server 阻塞首 recv(register + connect mem_server 均完成)。
+    guard = 0;
+    while !crate::sched::is_blocked(fs_tid) {
+        assert!(
+            guard < 500_000,
+            "m34t2: ramfs_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    assert!(
+        crate::services::lookup(crate::services::SERVICE_RAMFS).is_some(),
+        "m34t2: ramfs service must be registered"
+    );
+    // 5) ramfs_client 进程(亲和 client_hart):marker 页 + 加载 + spawn。
+    let client_pid = crate::process::create().expect("m34t2: create client process");
+    let client_root = crate::process::root(client_pid);
+    let marker_pa = crate::mem::alloc_pages_zeroed(0).expect("m34t2: marker page");
+    assert!(
+        crate::mmu::map_user_page(client_root, ELF_MARKER_VA, marker_pa, 0xC7).is_ok(),
+        "m34t2: map client marker page"
+    );
+    let args: [&[u8]; 1] = [b"ramfs_client"];
+    let loaded_client = crate::elf::load(client_pid, crate::elf::RAMFS_CLIENT_ELF, &args)
+        .expect("m34t2: load client");
+    let client_tid = crate::sched::spawn_user_args(
+        client_pid,
+        loaded_client.entry,
+        loaded_client.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_client.argc,
+        loaded_client.argv,
+    );
+    crate::sched::set_affinity(client_tid, client_hart);
+    // 6) 轮询 client marker(跨核完整 fs 往返完成的证明:client 阻塞 recv,
+    //    marker 到 = 跨核 open→write→read→close→unlink 全链成功)。
+    let marker = marker_pa as *const usize;
+    let expect = 0xC0DE_0000 | args.len();
+    guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(marker) };
+        if v == expect {
+            break;
+        }
+        assert!(
+            guard < 1_000_000,
+            "m34t2: cross-core client never completed ramfs roundtrip (value={v:#x})"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 7) 清理:kill_process 收两服务阻塞线程,destroy 收客户端(线程已
+    //    sys_exit);同 T1 的页回收语义。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    let _in_fs = crate::sched::kill_process(fs_pid);
+    let _in_mem = crate::sched::kill_process(mem_pid);
+    crate::process::destroy(client_pid);
+    crate::sched::drain_reaper();
+    info!("M3-4 T2: cross-core fs IPC ok ({n} harts)");
 }

@@ -220,6 +220,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     // M3-3 T2:跨核 mem_server 服务 IPC + Cap::Page 移交(跨核场景;单核退化
     // 仍打印 banner)。定义见 tests.rs。
     tests::smp_memory_ipc_test();
+    // M3-4 T2:跨核 ramfs 文件服务 IPC(服务链:client → ramfs_server →
+    // mem_server,数据面 SHM 窗;跨核场景;单核退化仍打印 banner)。
+    tests::smp_ramfs_ipc_test();
     // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
     // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。
     // LOW-3(审计 17 轮):idle 无 yield 路径,退出线程的栈在此回收

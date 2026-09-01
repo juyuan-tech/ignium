@@ -35,9 +35,7 @@ pub const SERVICE_MEMORY: usize = 2;
 /// M3-4 ramfs 文件系统服务 id(M3-4 第三个用户态服务 = ramfs_server 进程;
 /// 纯用户态文件服务,一切皆能力:零新 syscall/Cap,存储页经 mem_server
 /// 服务链申请 —— 见 M3-DESIGN §12;与 `user/src/lib.rs` 的
-/// `RAMFS_SERVICE_ID` 一致,须保持同步)。本提交暂无消费方,
-/// `#[expect(dead_code)]`(M3-4 测试提交引用后移除)。
-#[expect(dead_code)]
+/// `RAMFS_SERVICE_ID` 一致,须保持同步)。
 pub const SERVICE_RAMFS: usize = 3;
 
 /// 服务注册表槽:索引 = 服务 id(1 基);None = 未注册。

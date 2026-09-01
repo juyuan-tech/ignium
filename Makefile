@@ -76,6 +76,8 @@ test: build
 		&& grep -q "M3-2 T2: cross-core IPC ok" /tmp/ignium-test.log \
 		&& grep -q "M3-3 T1: memory service ok" /tmp/ignium-test.log \
 		&& grep -q "M3-3 T2: cross-core mem IPC ok" /tmp/ignium-test.log \
+		&& grep -q "M3-4 T1: ramfs service ok" /tmp/ignium-test.log \
+		&& grep -q "M3-4 T2: cross-core fs IPC ok" /tmp/ignium-test.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-test.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-test.log \
 		&& echo "TEST PASS" || (echo "TEST FAIL"; cat /tmp/ignium-test.log; exit 1)
@@ -101,6 +103,8 @@ test-smp:
 		&& grep -q "M3-2 T2: cross-core IPC ok" /tmp/ignium-smp.log \
 		&& grep -q "M3-3 T1: memory service ok" /tmp/ignium-smp.log \
 		&& grep -q "M3-3 T2: cross-core mem IPC ok" /tmp/ignium-smp.log \
+		&& grep -q "M3-4 T1: ramfs service ok" /tmp/ignium-smp.log \
+		&& grep -q "M3-4 T2: cross-core fs IPC ok" /tmp/ignium-smp.log \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log \
 		&& echo "SMP TEST PASS" || (echo "SMP TEST FAIL"; cat /tmp/ignium-smp.log; exit 1)
 
@@ -141,6 +145,8 @@ test-rva23: build-rva23
 		&& grep -q "M3-2 T2: cross-core IPC ok" /tmp/ignium-rva23.log \
 		&& grep -q "M3-3 T1: memory service ok" /tmp/ignium-rva23.log \
 		&& grep -q "M3-3 T2: cross-core mem IPC ok" /tmp/ignium-rva23.log \
+		&& grep -q "M3-4 T1: ramfs service ok" /tmp/ignium-rva23.log \
+		&& grep -q "M3-4 T2: cross-core fs IPC ok" /tmp/ignium-rva23.log \
 		&& test "$$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2 \
 		&& ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log \
 		&& echo "RVA23 TEST PASS" || (echo "RVA23 TEST FAIL"; cat /tmp/ignium-rva23.log; exit 1)
