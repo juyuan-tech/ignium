@@ -1166,6 +1166,28 @@ pub fn block_current() {
     arch::irq_restore(irq);
 }
 
+/// 跨核 SBI IPI 发送失败的告警日志去重:仅首败打印一次,此后静默降级
+/// (最长 1 tick 的唤醒延迟,定时器仍会唤醒 wfi 并重 pick,不破坏正确性)。
+/// `wake` / `ipc_wake_with_msg` / `ipc_wake_with_err` 三处共用(D6)。
+static IPI_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// 跨核唤醒补 IPI(D6):目标线程已入其亲和核队列后,若目标核 idle 且非
+/// 本核,发 SBI IPI 唤醒目标核 wfi 中的 idle。
+///
+/// 判定与发 IPI 同在 SCHED 锁临界区,与目标核"查空 → wfi"的临界区互斥
+/// → 无丢失唤醒窗口(D19 同款,已证安全:目标核 SSIP handler 自旋等
+/// SCHED 锁)。IPI 失败仅降级为最长一个 tick 的唤醒延迟,不破坏正确性。
+#[inline]
+fn ipi_wake_cross_hart(s: &mut Scheduler, tid: usize, my_hart: usize) {
+    let tgt = s.threads[tid].hart;
+    if tgt != my_hart && s.current[tgt] == s.idle[tgt] {
+        let rc = crate::sbi::send_ipi(1u64 << tgt, 0);
+        if rc != 0 && !IPI_FAILED_LOGGED.swap(true, Ordering::Relaxed) {
+            warn!("SBI send_ipi(hart {tgt}) failed (rc=0x{rc:x}); wakeup via timer only");
+        }
+    }
+}
+
 /// 唤醒指定线程:无条件记录唤醒标志(C5 —— 唤醒可能发生在目标
 /// 线程"登记之后、阻塞之前",此时其 state 尚非 Blocked,靠标志
 /// 兜底,block_current 会消费它),若已阻塞则入队。
@@ -1181,15 +1203,8 @@ pub fn wake(id: usize) {
     if id < s.threads.len() {
         s.threads[id].woken = true;
         if s.threads[id].state == ThreadState::Blocked {
-            let tgt = s.threads[id].hart;
             s.enqueue(id);
-            if tgt != my_hart && s.current[tgt] == s.idle[tgt] {
-                static IPI_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
-                let rc = crate::sbi::send_ipi(1u64 << tgt, 0);
-                if rc != 0 && !IPI_FAILED_LOGGED.swap(true, Ordering::Relaxed) {
-                    warn!("SBI send_ipi(hart {tgt}) failed (rc=0x{rc:x}); wakeup via timer only");
-                }
-            }
+            ipi_wake_cross_hart(&mut s, id, my_hart);
         }
     }
     drop(s);
@@ -1254,6 +1269,11 @@ pub fn ipc_wake_with_msg(tid: usize, msg: Option<&[usize]>) {
         t.ipc_wake = None;
     }
     s.enqueue(tid);
+    // D6(M3-2):跨核唤醒 —— 目标线程已入其亲和核队列,若目标核 idle 且非
+    // 本核,发 SBI IPI 唤醒其 wfi(判定与发 IPI 同在 SCHED 锁临界区,与目标
+    // 核"查空→wfi"互斥 → 无丢失窗口)。否则目标核靠定时器 tick 唤醒,延迟
+    // ≤ 1 tick。B1 未阻塞分支不在此(目标在阻塞点消费,不切走,无需 IPI)。
+    ipi_wake_cross_hart(&mut s, tid, arch::hartid());
     // M2 T2b(PIP):配对完成,撤销本线程此前登记的全部捐赠(peer 回落)。
     s.revoke_donations(tid);
     drop(s);
@@ -1293,6 +1313,9 @@ pub fn ipc_wake_with_err(tid: usize, code: usize) {
         t.ipc_wake = None;
     }
     s.enqueue(tid);
+    // D6(M3-2):跨核唤醒,同 ipc_wake_with_msg —— 目标核 idle 且非本核时
+    // 发 SBI IPI(判定与发 IPI 同在 SCHED 锁临界区,无丢失唤醒窗口)。
+    ipi_wake_cross_hart(&mut s, tid, arch::hartid());
     // M2 T2b(PIP):配对已不可能完成,撤销本线程登记的全部捐赠。
     s.revoke_donations(tid);
     drop(s);

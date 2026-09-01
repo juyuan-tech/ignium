@@ -23,6 +23,10 @@ use crate::sync::SpinLock;
 /// 服务 id 合法域上界(槽式:索引 0 保留,合法 id = `1..MAX_SERVICES`)。
 pub const MAX_SERVICES: usize = 8;
 
+/// UART 服务 id(M3-2 首个用户态服务 = uart_server 进程;与
+/// `user/src/lib.rs` 的 `UART_SERVICE_ID` 一致,须保持同步)。
+pub const SERVICE_UART: usize = 1;
+
 /// 服务注册表槽:索引 = 服务 id(1 基);None = 未注册。
 ///
 /// `id` 字段与槽索引一致(冗余,`lookup` 作防御性失效标记校验,防槽位
@@ -85,8 +89,9 @@ pub fn unregister_all_locked(pid: usize) {
     crate::arch::irq_restore(irq);
 }
 
-/// 按 id 查注册表,返回服务进程 pid(未注册 → None)。供 connect。
-fn lookup(id: usize) -> Option<usize> {
+/// 按 id 查注册表,返回服务进程 pid(未注册 → None)。供 connect 与
+/// M3-2 测试断言(pub(crate):tests.rs 校验服务注册后断言注册表)。
+pub(crate) fn lookup(id: usize) -> Option<usize> {
     let irq = crate::arch::irq_save();
     let r = {
         let t = SERVICES.lock();

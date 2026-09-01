@@ -21,18 +21,14 @@ const MARKER_VA: usize = 0x4000_2000;
 /// 用户入口:内核加载器 `elf::load` 建初始帧,a0=argc、a1=argv 经 sret 到达。
 #[no_mangle]
 pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
-    // 1) 写共享标记页:证明 ELF 已映射 + U 模式执行 + argc 经 ABI 到达。
-    unsafe {
-        core::ptr::write_volatile(MARKER_VA as *mut usize, 0xC0DE_0000 | argc);
-    }
-    // 2) 经 uart_server 服务打印(连接失败 = 服务未注册,静默跳过 —— marker
-    //    已写,断言不受影响)。
+    // 1) 经 uart_server 服务打印(连接失败 = 服务未注册,静默跳过 —— 测试
+    //    不依赖 UART 输出)。
     if uart_init() == 0 {
         let _ = uart_write(b"hello, ignium!\n");
         let _ = uart_write(b"argc=");
         write_dec(argc);
         let _ = uart_write(b"\n");
-        // 3) argv[0](如有):读指针数组首项 → 逐字节输出其字符串。
+        // argv[0](如有):读指针数组首项 → 逐字节输出其字符串。
         if argv != 0 {
             let s0 = unsafe { core::ptr::read_volatile(argv as *const usize) };
             if s0 != 0 {
@@ -49,6 +45,14 @@ pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
                 let _ = uart_write(b"\n");
             }
         }
+    }
+    // 2) 写共享标记页:证明 ELF 已映射 + U 模式执行 + argc 经 ABI 到达。
+    //    **置于打印完成后**:M3-2 T1 以它作为"客户端已完成全部服务 IPC
+    //    往返(connect/send/recv + uart_server TX)"的完成信号(内核测试
+    //    轮询断言;boot_elf_test 在服务未注册时连接 -ENOENT 静默跳过,
+    //    marker 仍写,断言不受影响)。
+    unsafe {
+        core::ptr::write_volatile(MARKER_VA as *mut usize, 0xC0DE_0000 | argc);
     }
     sys_exit();
 }

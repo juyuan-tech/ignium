@@ -8,6 +8,10 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // 链接参数依赖 CARGO_MANIFEST_DIR(输出含其绝对路径)。显式声明环境依赖,
+    // 防主机构建与容器构建(`/work`)跨环境复用同一 target/ 下的陈旧输出
+    // (同 user/build.rs;否则容器内会拿主机路径找链接脚本而失败)。
+    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     println!("cargo:rustc-link-arg=-T{dir}/linker.ld");
     // 变更链接脚本时重跑(否则增量构建可能不重新链接)。

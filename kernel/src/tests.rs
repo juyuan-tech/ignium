@@ -34,6 +34,7 @@ pub fn boot_tests() {
     boot_cap_test();
     boot_fault_recovery_test();
     boot_elf_test();
+    boot_uart_service_test();
     boot_ipc_latency_bench();
 }
 
@@ -803,6 +804,11 @@ fn boot_fault_recovery_test() {
 /// 一致;且在 hello ELF 段映射范围之外(下方以 parse 结果断言 max_end)。
 const ELF_MARKER_VA: usize = 0x4000_2000;
 
+/// UART 设备页映射 VA:须与 `user/src/lib.rs` 的 `UART_MMIO_VA`(0x6000_0000)
+/// 一致(uart_server 经 `map_device(0, UART_MMIO_VA)` 排他 claim)。此处供
+/// M3-2 T1/T2 负面用例以内核侧直调验证 UART claim 状态。
+const UART_MMIO_VA: usize = 0x6000_0000;
+
 /// M3 T1:ELF 加载器冒烟(主交付)。
 ///
 /// 验证链路:建进程 → `elf::parse`(校验 + 段不侵占 marker 页)→
@@ -896,6 +902,138 @@ fn boot_elf_test() {
         "elf: address space not reclaimed (free {free_after} < {free_before})"
     );
     info!("M3 T1: ELF loader ok (user ELF ran)");
+}
+
+/// M3-2 T1:uart_server 服务化冒烟(单核,引导期协作式)。
+///
+/// 验证链路:建 uart_server 进程 → `elf::load`(UART_SERVER_ELF)+ spawn →
+/// 用户态 `map_device(0, UART_MMIO_VA)` + `service_register(1)` → 阻塞在
+/// **accept-any recv**(M3-2 ipc.rs 空槽监听:客户端 connect 之前即可挂起)
+/// → 建 client(hello)进程 → 用户态 `service_connect` + SHM 写 + IPC WRITE
+/// → uart_server 跨进程 TX(`\n→\r\n`)并回复 → client 收回复写 marker →
+/// 轮询断言(证明完整往返,否则 client 阻塞 recv 永不到)→ 负面用例
+/// (-EEXIST/-ENOENT/-EACCES/-EINVAL)→ 清理(kill_process 收阻塞线程)+
+/// `free_page_count`(设备页非分配器只 unmap 不 free、无 double-free)。
+/// banner:`M3-2 T1: uart_server service ok`(6 处 grep 同步)。
+fn boot_uart_service_test() {
+    // 1) 建 uart_server 进程 + 校验/加载 ELF(空 argv:服务不打印自身信息)。
+    let server_pid = crate::process::create().expect("m32t1: create uart_server process");
+    let server_info =
+        crate::elf::parse(crate::elf::UART_SERVER_ELF).expect("m32t1: parse uart_server");
+    assert!(
+        server_info.entry != 0,
+        "m32t1: uart_server entry must be non-zero"
+    );
+    let loaded =
+        crate::elf::load(server_pid, crate::elf::UART_SERVER_ELF, &[]).expect("m32t1: load server");
+    let server_tid = crate::sched::spawn_user_args(
+        server_pid,
+        loaded.entry,
+        loaded.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded.argc,
+        loaded.argv,
+    );
+    // 2) 协作式 yield 至 uart_server 阻塞在 accept-any recv(map_device +
+    //    service_register 均已发生)。
+    let mut guard = 0;
+    while !crate::sched::is_blocked(server_tid) {
+        assert!(
+            guard < 200_000,
+            "m32t1: uart_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 3) 内核侧断言:服务已注册 + UART 已被 server 排他 claim。
+    assert!(
+        crate::services::lookup(crate::services::SERVICE_UART).is_some(),
+        "m32t1: uart service must be registered"
+    );
+    // 4) 建 client(hello)进程:marker 页 + 加载 + spawn。
+    let client_pid = crate::process::create().expect("m32t1: create client process");
+    let client_root = crate::process::root(client_pid);
+    let marker_pa = crate::mem::alloc_pages_zeroed(0).expect("m32t1: marker page");
+    assert!(
+        crate::mmu::map_user_page(client_root, ELF_MARKER_VA, marker_pa, 0xC7).is_ok(),
+        "m32t1: map client marker page"
+    );
+    let args: [&[u8]; 1] = [b"hello"];
+    let loaded_client =
+        crate::elf::load(client_pid, crate::elf::HELLO_ELF, &args).expect("m32t1: load client");
+    crate::sched::spawn_user_args(
+        client_pid,
+        loaded_client.entry,
+        loaded_client.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_client.argc,
+        loaded_client.argv,
+    );
+    // 5) 轮询 client marker:service_connect + WRITE IPC 往返完成即 uart_server
+    //    已 TX 并回复(否则 client 阻塞 recv,marker 永不到 → 断言失败)。
+    let marker = marker_pa as *const usize;
+    let expect = 0xC0DE_0000 | args.len();
+    guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(marker) };
+        if v == expect {
+            break;
+        }
+        assert!(
+            guard < 500_000,
+            "m32t1: client never completed service IPC (value={v:#x}, expect={expect:#x})"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 6) 负面用例(服务仍注册、UART 仍被 server claim;内核侧直调)。
+    //    注册重复 → -EEXIST;连接未注册 id → -ENOENT;服务连自身 → -EACCES;
+    //    他进程 claim UART → -EEXIST;非法 va / 未知 dev_id → -EINVAL。
+    assert_eq!(
+        crate::process::register_service(server_pid, crate::services::SERVICE_UART),
+        Err(crate::syscall::SYS_ERR_EEXIST),
+        "m32t1: duplicate service_register must be -EEXIST"
+    );
+    assert_eq!(
+        crate::services::connect(server_pid, 5, 0, 0),
+        Err(crate::syscall::SYS_ERR_ENOENT),
+        "m32t1: connect unregistered id must be -ENOENT"
+    );
+    assert_eq!(
+        crate::services::connect(server_pid, crate::services::SERVICE_UART, 0, 0),
+        Err(crate::syscall::SYS_ERR_EACCES),
+        "m32t1: server connecting to its own service must be -EACCES"
+    );
+    assert_eq!(
+        crate::device::map(client_pid, 0, UART_MMIO_VA),
+        Err(crate::syscall::SYS_ERR_EEXIST),
+        "m32t1: second UART claim must be -EEXIST"
+    );
+    assert_eq!(
+        crate::device::map(client_pid, 0, 0x4000_0001),
+        Err(crate::syscall::SYS_ERR_EINVAL),
+        "m32t1: unaligned device va must be -EINVAL"
+    );
+    assert_eq!(
+        crate::device::map(client_pid, 99, UART_MMIO_VA),
+        Err(crate::syscall::SYS_ERR_EINVAL),
+        "m32t1: unknown dev_id must be -EINVAL"
+    );
+    // 7) 清理:kill_process 收 uart_server(阻塞线程栈 + pending recv 一并
+    //    回收,内部含 ipc::purge_process + process::destroy);destroy 收
+    //    client(线程已 sys_exit)。drain_reaper 后断言页不泄漏 —— 设备页
+    //    非分配器,U 映射只 unmap 不 free → 无 double-free(buddy 不坏)。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    let free_before = crate::mem::free_page_count();
+    let _in_server = crate::sched::kill_process(server_pid);
+    crate::process::destroy(client_pid);
+    crate::sched::drain_reaper();
+    let free_after = crate::mem::free_page_count();
+    assert!(
+        free_after >= free_before,
+        "m32t1: address space not reclaimed (free {free_after} < {free_before})"
+    );
+    info!("M3-2 T1: uart_server service ok");
 }
 
 /// 构造最小合法 ELF64(1 个 PT_LOAD),供负面用例逐字段破坏。
@@ -1402,4 +1540,95 @@ pub fn smp_crosscore_test() {
     smp_kill_phase(n);
     smp_shootdown_phase(n);
     info!("M3 T2: cross-core kill/shootdown ok ({n} harts)");
+}
+
+/// M3-2 T2:跨核 uart_server 服务 IPC 冒烟(irq_enable 后、smp_crosscore_test
+/// 之后调用)。**D6 跨核 IPI 实测**(B1 审计点名"跨核分支落地后实测")。
+///
+/// uart_server 亲和**副核 A**(map_device + register 后阻塞 accept-any recv,
+/// 副核 A 进入 idle/wfi),client(hello)亲和**副核 B**(A ≠ B):client 的
+/// send 经 D6 IPI 唤醒副核 A 阻塞中的 uart_server,回复再经 D6 IPI 唤醒
+/// 副核 B 阻塞中的 client —— 双向跨核即时配对(非定时器轮询)。
+///
+/// 核选择:n≥3 用副核 1/2(两核均非 boot 核,client 阻塞后该核 idle → 双向
+/// 均走 IPI);n==2 用副核 1 + boot 核 0(server→client 方向可能经测试轮询
+/// yield,仍跨核);n==1 同一核退化(协作式 + 抢占均验证)。
+/// banner:`M3-2 T2: cross-core IPC ok (N harts)`(6 处 grep 同步)。
+pub fn smp_uart_ipc_test() {
+    let n = crate::board::cpu_count().min(crate::arch::MAX_HARTS);
+    let (server_hart, client_hart) = if n >= 3 {
+        (1, 2)
+    } else if n == 2 {
+        (1, 0)
+    } else {
+        (0, 0)
+    };
+    // 1) uart_server 进程(亲和 server_hart)。
+    let server_pid = crate::process::create().expect("m32t2: create uart_server process");
+    let loaded =
+        crate::elf::load(server_pid, crate::elf::UART_SERVER_ELF, &[]).expect("m32t2: load server");
+    let server_tid = crate::sched::spawn_user_args(
+        server_pid,
+        loaded.entry,
+        loaded.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded.argc,
+        loaded.argv,
+    );
+    crate::sched::set_affinity(server_tid, server_hart);
+    // 2) 等 uart_server 阻塞 accept-any recv(已注册;防 client 先跑连不上
+    //    服务 —— 确定性建立"服务端就绪"后再 spawn 客户端)。
+    let mut guard = 0;
+    while !crate::sched::is_blocked(server_tid) {
+        assert!(
+            guard < 500_000,
+            "m32t2: uart_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 3) client(hello)进程:marker 页 + 加载 + spawn(亲和 client_hart)。
+    let client_pid = crate::process::create().expect("m32t2: create client process");
+    let client_root = crate::process::root(client_pid);
+    let marker_pa = crate::mem::alloc_pages_zeroed(0).expect("m32t2: marker page");
+    assert!(
+        crate::mmu::map_user_page(client_root, ELF_MARKER_VA, marker_pa, 0xC7).is_ok(),
+        "m32t2: map client marker page"
+    );
+    let args: [&[u8]; 1] = [b"hello"];
+    let loaded_client =
+        crate::elf::load(client_pid, crate::elf::HELLO_ELF, &args).expect("m32t2: load client");
+    let client_tid = crate::sched::spawn_user_args(
+        client_pid,
+        loaded_client.entry,
+        loaded_client.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_client.argc,
+        loaded_client.argv,
+    );
+    crate::sched::set_affinity(client_tid, client_hart);
+    // 4) 轮询 client marker(跨核双向 IPC 完成的证明:client 阻塞 recv 等
+    //    回复,marker 到 = uart_server 跨核处理并回复成功)。
+    let marker = marker_pa as *const usize;
+    let expect = 0xC0DE_0000 | args.len();
+    guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(marker) };
+        if v == expect {
+            break;
+        }
+        assert!(
+            guard < 1_000_000,
+            "m32t2: cross-core client never completed service IPC (value={v:#x})"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 5) 清理:kill_process 收阻塞服务端线程(含 pending recv),destroy 收
+    //    客户端(线程已 sys_exit);同 T1 的页回收语义。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    let _in_server = crate::sched::kill_process(server_pid);
+    crate::process::destroy(client_pid);
+    crate::sched::drain_reaper();
+    info!("M3-2 T2: cross-core IPC ok ({n} harts)");
 }

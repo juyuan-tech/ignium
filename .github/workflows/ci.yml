@@ -50,6 +50,8 @@ jobs:
           grep -q "M2: IPC latency ok" /tmp/ignium-ci.log
           grep -q "M3 T1: ELF loader ok (user ELF ran)" /tmp/ignium-ci.log
           grep -q "M3 T2: cross-core kill/shootdown ok" /tmp/ignium-ci.log
+          grep -q "M3-2 T1: uart_server service ok" /tmp/ignium-ci.log
+          grep -q "M3-2 T2: cross-core IPC ok" /tmp/ignium-ci.log
           test "$(grep -c 'uptime:' /tmp/ignium-ci.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-ci.log
       # V3 审计 #11:多核引导仲裁回归测试纳入 CI。
@@ -69,6 +71,8 @@ jobs:
           grep -q "M2: IPC latency ok" /tmp/ignium-smp.log
           grep -q "M3 T1: ELF loader ok (user ELF ran)" /tmp/ignium-smp.log
           grep -q "M3 T2: cross-core kill/shootdown ok" /tmp/ignium-smp.log
+          grep -q "M3-2 T1: uart_server service ok" /tmp/ignium-smp.log
+          grep -q "M3-2 T2: cross-core IPC ok" /tmp/ignium-smp.log
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-smp.log
 
   rva23:
@@ -111,5 +115,7 @@ jobs:
           grep -q "M2: IPC latency ok" /tmp/ignium-rva23.log
           grep -q "M3 T1: ELF loader ok (user ELF ran)" /tmp/ignium-rva23.log
           grep -q "M3 T2: cross-core kill/shootdown ok" /tmp/ignium-rva23.log
+          grep -q "M3-2 T1: uart_server service ok" /tmp/ignium-rva23.log
+          grep -q "M3-2 T2: cross-core IPC ok" /tmp/ignium-rva23.log
           test "$(grep -c 'uptime:' /tmp/ignium-rva23.log)" -ge 2
           ! grep -qE "KERNEL PANIC|TRAP:" /tmp/ignium-rva23.log

@@ -211,6 +211,9 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     // M3 T2:跨核 IPI 停核 + Running 线程回收 + 跨核 TLB shootdown 冒烟
     // (跨核场景;单核退化为 N=1 仍打印 banner)。定义见 tests.rs。
     tests::smp_crosscore_test();
+    // M3-2 T2:跨核 uart_server 服务 IPC(D6 跨核 IPI 实测;uart_server 亲和
+    // 副核 A、client 亲和副核 B,双向即时配对)。定义见 tests.rs。
+    tests::smp_uart_ipc_test();
     // 空闲线程体:当前上下文(调度器初始化后)即 idle 线程。
     // wfi 被定时器中断唤醒;抢占由 on_tick 在 ISR 中决策。
     // LOW-3(审计 17 轮):idle 无 yield 路径,退出线程的栈在此回收
