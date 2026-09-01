@@ -8,6 +8,7 @@
 
 | 报告 | 摘要 |
 |---|---|
+| [2026-09-01-m3-2-uart-server.md](2026-09-01-m3-2-uart-server.md) | **M3-2:uart_server 服务化**:设备页授予(号 12)+ 内核服务注册表(号 10/11)+ sys_write/read 移除(打印/读取走 IPC)+ 跨核 IPC IPI 实测(T1/T2);accept-any 空槽监听语义 + build.rs 跨环境缓存修复 |
 | [2026-09-01-m3-winddown-audit.md](2026-09-01-m3-winddown-audit.md) | **M3 收尾全面审查 + 修复**:B1 跨核 IPC 唤醒竞态 / B2 sys_write 共享页 TOCTOU / B3 unmap 静默分配 / B4 ELF 段上界溢出 / sys_write 回绕 / P2 单地址 sfence + 文档体系规整 |
 | [2026-09-01-m3-entry.md](2026-09-01-m3-entry.md) | **M3 入口**:ELF 加载器(M3 T1)+ 跨核 IPI 停核/Running 线程回收/跨核 TLB shootdown(M3 T2)+ 内核线程栈守护页(M3 T3) |
 | [2026-08-20-m2-t1.md](2026-08-20-m2-t1.md) | **M2 T1**:用户态线程 + ecall 系统调用 |

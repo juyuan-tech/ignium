@@ -83,12 +83,16 @@ VisionFive 2)→ 烧录 → 串口/调试器 bring-up → 按 board.rs 抽象换
 > **T1 ELF 加载器 ✓** / **T2 跨核 IPI 停核 + Running 线程回收 + 跨核 TLB
 > shootdown ✓** / **T3 内核线程栈守护页 ✓**。M2 两条已知限制(守护页、跨核
 > shootdown)已消项(见 docs/DESIGN.md);SCHED 锁拆分 / D1 快速路径 / slab
-> 水位扫描评估后延后(见 docs/DEFERRED.md)。**下一步:下表用户态服务**
-> (uart_server → 内存服务 → ramfs → spawn 服务化)。
+> 水位扫描评估后延后(见 docs/DEFERRED.md)。
+> **M3-2(2026-09-01)✓** —— uart_server 服务化落地(设计见 docs/M3-DESIGN.md §10,
+> 报告见 docs/reports/2026-09-01-m3-2-uart-server.md):设备页授予(`map_device` 号 12)+
+> 内核服务注册表(`service_register/connect` 号 10/11)+ `sys_write/read` 移除(打印/读取
+> 走 IPC)+ 跨核 IPC IPI 实测(T1/T2 banner)。**下一步:下表内存服务**
+> (内存服务 → ramfs → spawn 服务化)。
 
 | 任务 | 产出/验收 |
 |---|---|
-| uart_server 进程独占 UART,打印走 IPC | 内核不再直碰 UART |
+| ~~uart_server 进程独占 UART,打印走 IPC~~ | **✓(M3-2)**:uart_server 独占 UART,内核不再直碰(设备页 U 映射 + IPC WRITE/READ);读取经用户态库 `uart_read` |
 | 内存服务:cap 发页 + IPC 申请/释放 | 用户进程可申请页 |
 | ramfs 文件系统服务(open/read/write/close) | IPC 客户端可读写删文件 |
 | virtio-blk 驱动服务 + 持久文件系统 | 重启数据仍在 |
