@@ -27,6 +27,13 @@ pub const SYSCALL_SERVICE_CONNECT: usize = 11;
 /// M3-2:`map_device(dev_id, va)` —— 白名单设备 MMIO 页以 U 权限映射进
 /// 调用进程(排他 claim;见 device.rs 与 M3-DESIGN §10.2)。
 pub const SYSCALL_MAP_DEVICE: usize = 12;
+/// M3-3:`mem_grant(src_slot, peer_slot, dst_slot)` —— 受控跨进程页移交
+/// (**move** `Cap::Page`;只能移交给持 `Cap::Proc` 的已连接进程,见
+/// pages.rs 与 M3-DESIGN §11.4)。
+pub const SYSCALL_MEM_GRANT: usize = 13;
+/// M3-3:`mem_map(slot, va)` —— 把 `Cap::Page` 以 U RW 映射进调用进程根表
+/// (见 pages.rs 与 M3-DESIGN §11.5)。
+pub const SYSCALL_MEM_MAP: usize = 14;
 
 /// 负 errno 的 usize 编码(与 L1 ABI 一致,见 M2-DESIGN §4.1)。
 /// 统一存放本模块:ipc.rs 的 `IPC_ERR_*` 与其别名,process::cap_errno
@@ -225,6 +232,48 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
             let dev_id = unsafe { *frame.add(GPR_A0) };
             let va = unsafe { *frame.add(GPR_A1) };
             match crate::device::map(crate::sched::current_proc(), dev_id, va) {
+                Ok(()) => {
+                    unsafe { *frame.add(GPR_A0) = 0 };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(code) => {
+                    unsafe { *frame.add(GPR_A0) = code };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
+        }
+        SYSCALL_MEM_GRANT => {
+            // a0=源槽, a1=peer 槽, a2=对端目标槽;成功 a0=0,失败负 errno。
+            // move Cap::Page 见 pages::mem_grant(门禁与锁序见 M3-DESIGN §11.4)。
+            let src_slot = unsafe { *frame.add(GPR_A0) };
+            let peer_slot = unsafe { *frame.add(GPR_A1) };
+            let dst_slot = unsafe { *frame.add(GPR_A2) };
+            match crate::pages::mem_grant(
+                crate::sched::current_proc(),
+                src_slot,
+                peer_slot,
+                dst_slot,
+            ) {
+                Ok(()) => {
+                    unsafe { *frame.add(GPR_A0) = 0 };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(code) => {
+                    unsafe { *frame.add(GPR_A0) = code };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
+        }
+        SYSCALL_MEM_MAP => {
+            // a0=槽, a1=va;成功 a0=0,失败负 errno。
+            // U RW 映射见 pages::mem_map(单映射不变量见 M3-DESIGN §11.5)。
+            let slot = unsafe { *frame.add(GPR_A0) };
+            let va = unsafe { *frame.add(GPR_A1) };
+            match crate::pages::mem_map(crate::sched::current_proc(), slot, va) {
                 Ok(()) => {
                     unsafe { *frame.add(GPR_A0) = 0 };
                     unsafe { *frame.add(FRAME_SEPC) += 4 };

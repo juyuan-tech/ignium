@@ -92,6 +92,8 @@ pub fn mmap_share(caller: usize, a_slot: usize, b_slot: usize, len: usize) -> Re
     let peer = match crate::process::cap_target(caller, a_slot) {
         Ok(crate::process::Cap::Proc(p)) => p,
         Ok(crate::process::Cap::Shm(_)) => return Err(crate::syscall::SYS_ERR_EINVAL),
+        // M3-3 Cap::Page 不是 IPC 许可(无法定对端)→ 类型错误 -EINVAL。
+        Ok(crate::process::Cap::Page(_)) => return Err(crate::syscall::SYS_ERR_EINVAL),
         Err(e) => return Err(crate::process::cap_errno(e)),
     };
     if b_slot >= crate::process::MAX_CAPS {

@@ -28,6 +28,7 @@ mod ipc;
 mod logger;
 mod mem;
 mod mmu;
+mod pages;
 mod panic;
 mod process;
 mod sbi;
@@ -191,6 +192,8 @@ pub extern "C" fn kernel_main(hartid: usize, fdt: *const u8) -> ! {
     }
     // M2 T3c:共享页注册表容量预留(在 boot_tests 之前,引导期非 ISR 分配)。
     shm::init();
+    // M3-3:物理页能力注册表容量预留(Cap::Page;同样引导期非 ISR 分配)。
+    pages::init();
     // M2 引导期冒烟测试(T1 用户态 + T1.5 每进程地址空间 + T3c 共享内存,
     // 定义与说明见 tests.rs)。置于 irq_enable 之前,隔离定时器中断干扰。
     tests::boot_tests();

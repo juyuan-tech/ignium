@@ -9,10 +9,11 @@
 //!   VA 区(L2 索引 1,0x4000_0000 段)。
 //! - **切换**:调度器在切换线程时按线程所属进程切换 satp(见 sched.rs
 //!   的 `do_switch`/`on_tick` 调用 `mmu::switch_root`)。
-//! - **能力表(M2 T2a / T3c)**:每进程 `MAX_CAPS` 个能力槽;槽 → `Cap`
+//! - **能力表(M2 T2a / T3c / M3-3)**:每进程 `MAX_CAPS` 个能力槽;槽 → `Cap`
 //!   枚举值(空槽 = 未授权)。`Cap::Proc(pid)` = 对目标进程 IPC 的许可;
 //!   `Cap::Shm(id)` = 共享页所有权(T3c,`mmap_share` 改授,revoke 时
-//!   销毁整页)。`grant_cap`/`cap_target` 为 IPC 提供目标解析与授权
+//!   销毁整页);`Cap::Page(id)` = 物理页所有权(M3-3,`pages.rs`,**单引用**
+//!   禁 dup,revoke 时先 unmap 再 free)。`grant_cap`/`cap_target` 为 IPC
 //!   校验(未授权 → `CapError`)。销毁/页回收已实现(D12
 //!   `process::destroy`/`mmu::destroy_root`,共享页 cap 先 revoke 防
 //!   double-free);多核 Running 线程栈/槽不回收为已知局限(见
@@ -41,16 +42,20 @@ pub const MAX_PROCESSES: usize = 32;
 /// 测试/服务约定入口,其余槽由授权方自行约定。
 pub const MAX_CAPS: usize = 8;
 
-/// 能力值(M2 T2a/T3c)。
+/// 能力值(M2 T2a/T3c/M3-3)。
 ///
 /// - `Proc(pid)`:对目标进程发起 IPC(send/recv)的许可(T2a,经
 ///   `grant_cap` 授予);`ipc.rs` 只接受本变体。
 /// - `Shm(id)`:共享页所有权(T3c,经 `grant_shm_cap` 由 `mmap_share`
 ///   改授);持有者可经 revoke 销毁整页(M2-DESIGN"能力即所有权")。
+/// - `Page(id)`:物理页所有权(M3-3,经 `pages.rs` 注册表分配;**单引用**,
+///   `cap_duplicate` 拒绝复制、`mem_grant`(号 13)move 移交、`cap_revoke`
+///   (号 6)释放)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cap {
     Proc(usize),
     Shm(usize),
+    Page(usize),
 }
 
 /// 进程:独立地址空间根表 + 简化能力表。
@@ -157,6 +162,8 @@ pub enum CapError {
     WrongType,
     /// 能力指向的共享页已不存在(已被 revoke)→ `-ENOENT`。
     ShmNotFound,
+    /// 能力指向的物理页已不存在(已被 revoke/移交出本进程)→ `-ENOENT`。
+    PageNotFound,
 }
 
 /// 能力错误 → 负 errno(usize 编码,与 L1 ABI 一致)。
@@ -168,7 +175,7 @@ pub fn cap_errno(err: CapError) -> usize {
     match err {
         CapError::InvalidSlot | CapError::WrongType => crate::syscall::SYS_ERR_EINVAL,
         CapError::NotFound => crate::syscall::SYS_ERR_EACCES,
-        CapError::ShmNotFound => crate::syscall::SYS_ERR_ENOENT,
+        CapError::ShmNotFound | CapError::PageNotFound => crate::syscall::SYS_ERR_ENOENT,
     }
 }
 
@@ -239,8 +246,11 @@ pub fn cap_target(pid: usize, slot: usize) -> Result<Cap, CapError> {
 
 /// 复制能力:把进程 `pid` 的 `from` 槽值复制到 `to` 槽。
 ///
-/// T3c(syscall 7 `CAP_DUP`):能力可复制(共享所有权不变,槽位增引用)。
-/// 源槽空 → `NotFound`;任一端越界 → `InvalidSlot`;进程不存在 → `NotFound`。
+/// T3c(syscall 7 `CAP_DUP`):`Cap::Proc`/`Cap::Shm` 可复制(共享所有权不变,
+/// 槽位增引用)。**`Cap::Page` 拒绝复制 → `WrongType`(-EINVAL)**:物理页
+/// **单引用不变量**(M3-3,D1)—— 复制产生双持,破坏 owner 一致性并引
+/// double-free。源槽空 → `NotFound`;任一端越界 → `InvalidSlot`;进程不
+/// 存在 → `NotFound`。
 pub fn cap_duplicate(pid: usize, from: usize, to: usize) -> Result<(), CapError> {
     if from >= MAX_CAPS || to >= MAX_CAPS {
         return Err(CapError::InvalidSlot);
@@ -250,10 +260,13 @@ pub fn cap_duplicate(pid: usize, from: usize, to: usize) -> Result<(), CapError>
         let mut t = TABLE.lock();
         match t.slots.get_mut(pid).filter(|p| p.id == pid) {
             Some(p) => match p.caps[from] {
-                Some(cap) => {
-                    p.caps[to] = Some(cap);
-                    Ok(())
-                }
+                Some(cap) => match cap {
+                    Cap::Page(_) => Err(CapError::WrongType),
+                    _ => {
+                        p.caps[to] = Some(cap);
+                        Ok(())
+                    }
+                },
                 None => Err(CapError::NotFound),
             },
             None => Err(CapError::NotFound),
@@ -268,7 +281,10 @@ pub fn cap_duplicate(pid: usize, from: usize, to: usize) -> Result<(), CapError>
 /// T3c(syscall 6 `CAP_REVOKE`)语义按能力类型分派:
 /// - `Cap::Shm(id)` → **整页撤销**(`shm::shm_revoke`:撤双方映射、回收
 ///   物理页、清双方槽、注册表出列);共享页销毁,能力即失效;
-/// - `Cap::Proc(_)` → 仅清本进程该槽(IPC 许可撤销)。
+/// - `Cap::Proc(_)` → 仅清本进程该槽(IPC 许可撤销);
+/// - `Cap::Page(id)` → **释放物理页**(M3-3,`pages::revoke`:若已映射先
+///   `unmap_4k`、`free_pages` 归还 buddy、注册表出列),随后 `clear_cap`
+///   清本槽 —— 页唯一引用被释放,能力即失效(revoke = M3-3 释放路径)。
 ///
 /// 空槽 → `NotFound`;槽越界 → `InvalidSlot`;进程不存在 → `NotFound`。
 pub fn cap_revoke(pid: usize, slot: usize) -> Result<(), CapError> {
@@ -279,6 +295,10 @@ pub fn cap_revoke(pid: usize, slot: usize) -> Result<(), CapError> {
     match cap_target(pid, slot)? {
         Cap::Shm(id) => crate::shm::shm_revoke(id).map_err(|_| CapError::ShmNotFound),
         Cap::Proc(_) => clear_cap(pid, slot),
+        Cap::Page(id) => {
+            crate::pages::revoke(id).map_err(|_| CapError::PageNotFound)?;
+            clear_cap(pid, slot)
+        }
     }
 }
 
@@ -342,13 +362,13 @@ pub fn pid_root(pid: usize) -> Option<usize> {
     r
 }
 
-/// 销毁进程(M2 D12):revoke 全部 Shm cap → 原子失效槽 → 回收地址空间。
+/// 销毁进程(M2 D12):revoke 全部 Shm/Page cap → 原子失效槽 → 回收地址空间。
 ///
 /// 顺序:
-/// 1. **先 revoke 本进程全部 `Cap::Shm`**(TABLE 锁内收集、锁外逐个经
-///    `shm_revoke`:撤双方映射、清双方槽、释放共享页、注册表出列)—— 必须
-///    在地址空间释放之前完成:若共享页仍 U 映射,`destroy_root` 会对其
-///    double-free;
+/// 1. **先 revoke 本进程全部 `Cap::Shm` 与 `Cap::Page`**(TABLE 锁内收集、
+///    锁外逐个 revoke:撤映射、清槽、释放物理页、注册表出列)—— 必须
+///    在地址空间释放之前完成:若共享/物理页仍 U 映射,`destroy_root` 会对
+///    其 double-free(M3-3 `Cap::Page` 同纪律,M3-DESIGN §11.6);
 /// 2. **锁内"捕获 root + 原子失效槽"**(`id = usize::MAX` + 入 `free` 池):
 ///    并发 destroy(多核自愈路径)在此串行化 —— 先到者失效,后到者
 ///    `filter(id == pid)` 失败即返回,杜绝同一根表双释放;
@@ -360,21 +380,26 @@ pub fn pid_root(pid: usize) -> Option<usize> {
 /// 调用方须已 `switch_root(kernel_root())`(见 `mmu::destroy_root` 前提)。
 /// 重复调用(pid 已销毁)→ 无操作(幂等)。
 pub fn destroy(pid: usize) {
-    // 1) 收集并 revoke 全部 Shm cap。TABLE 锁内收集、锁外逐个 revoke:
-    //    shm_revoke 内部取 SHM 与 TABLE 锁,不得与本锁重叠。
-    let shm_ids: Vec<usize> = {
+    // 1) 收集并 revoke 全部 Shm + Page cap。TABLE 锁内收集、锁外逐个
+    //    revoke:shm_revoke/pages::revoke 内部取 SHM/PAGES 与 TABLE 锁,
+    //    不得与本锁重叠(TABLE → SHM / TABLE → PAGES,不逆序)。
+    let (shm_ids, page_ids): (Vec<usize>, Vec<usize>) = {
         let irq = crate::arch::irq_save();
         let ids = {
             let t = TABLE.lock();
             match t.slots.get(pid).filter(|p| p.id == pid) {
-                Some(p) => p
-                    .caps
-                    .iter()
-                    .filter_map(|c| match c {
-                        Some(Cap::Shm(id)) => Some(*id),
-                        _ => None,
-                    })
-                    .collect(),
+                Some(p) => {
+                    let mut shm = Vec::new();
+                    let mut pages = Vec::new();
+                    for c in p.caps.iter() {
+                        match c {
+                            Some(Cap::Shm(id)) => shm.push(*id),
+                            Some(Cap::Page(id)) => pages.push(*id),
+                            _ => {}
+                        }
+                    }
+                    (shm, pages)
+                }
                 None => return, // 已销毁/不存在:幂等无操作
             }
         }; // TABLE 锁在此释放
@@ -384,6 +409,12 @@ pub fn destroy(pid: usize) {
     for id in shm_ids {
         // 重复 revoke(并发 destroy / 用户已 revoke)幂等返回 Err,无害。
         let _ = crate::shm::shm_revoke(id);
+    }
+    for id in page_ids {
+        // M3-3 Cap::Page:先 revoke 再 destroy_root(页 U 映射若未 revoke,
+        // destroy_root 会对其 double-free —— 同 Cap::Shm 纪律)。重复 revoke
+        // 幂等返回 Err,无害。
+        let _ = crate::pages::revoke(id);
     }
     // 2) 捕获 root + 原子失效槽(并发 destroy 在此串行化,防双释放)。
     let root = {

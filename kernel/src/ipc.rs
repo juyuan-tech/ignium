@@ -132,6 +132,12 @@ pub fn send(pid: usize, slot: usize, msg: [usize; MSG_WORDS]) -> Result<SendBloc
                 crate::process::CapError::WrongType,
             ))
         }
+        // M3-3 Cap::Page 对 IPC 也是类型错误 → -EINVAL(页能力不是通信许可)。
+        Ok(Cap::Page(_)) => {
+            return Err(crate::process::cap_errno(
+                crate::process::CapError::WrongType,
+            ))
+        }
         Err(e) => return Err(crate::process::cap_errno(e)),
     };
     // 2) 取当前线程 id(SCHED 锁短暂获取、已释放)再取 IPC 锁 ——
@@ -234,6 +240,12 @@ pub fn recv(pid: usize, slot: usize) -> Result<RecvBlock, usize> {
         Ok(Cap::Proc(s)) => s,
         // Cap::Shm 对 IPC 是类型错误 → -EINVAL(经 cap_errno(WrongType) 编码)。
         Ok(Cap::Shm(_)) => {
+            return Err(crate::process::cap_errno(
+                crate::process::CapError::WrongType,
+            ))
+        }
+        // M3-3 Cap::Page 对 IPC 也是类型错误 → -EINVAL(页能力不是通信许可)。
+        Ok(Cap::Page(_)) => {
             return Err(crate::process::cap_errno(
                 crate::process::CapError::WrongType,
             ))
