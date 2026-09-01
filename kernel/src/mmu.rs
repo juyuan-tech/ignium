@@ -568,15 +568,6 @@ pub fn is_mapped(root: usize, vaddr: usize) -> bool {
     leaf_pte(root, vaddr) & PTE_V != 0
 }
 
-/// 只读检查 `vaddr` 在 `root` 下映射为**用户页**(叶子 PTE 含 U 位)。
-///
-/// M3 T1:`sys_write` 逐页校验用户缓冲用 —— 仅 V 位不足以区分用户页与
-/// 内核区页(进程根表含内核区映射);S 模式拷贝(SUM=1)若放行内核页会
-/// 泄漏内核内存,故须限定 U 页。
-pub fn is_user_mapped(root: usize, vaddr: usize) -> bool {
-    leaf_pte(root, vaddr) & (PTE_V | PTE_U) == PTE_V | PTE_U
-}
-
 /// 映射 [start, end) 4KB 对齐区域,每页调用 map_4k。
 fn map_region_4k(root: usize, start: usize, end: usize, flags: u64) {
     assert!(start.is_multiple_of(4096));

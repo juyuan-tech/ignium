@@ -15,10 +15,9 @@ pub const SYSCALL_IPC_RECV: usize = 4;
 pub const SYSCALL_SHM_MAP: usize = 5;
 pub const SYSCALL_CAP_REVOKE: usize = 6;
 pub const SYSCALL_CAP_DUP: usize = 7;
-/// M3 T1:`sys_write`(fd=1 → UART 过渡占位,M3-2 uart_server 落地后删除)。
-pub const SYSCALL_WRITE: usize = 8;
-/// M3 T1:`sys_read` 占位(本轮返回 -ENOSYS,号保留,见 SYSCALLS.md)。
-pub const SYSCALL_READ: usize = 9;
+/// 号 8/9(sys_write / sys_read)M3-2 已移除(号保留,见 SYSCALLS.md):
+/// 打印 / 读取改走 uart_server 服务(IPC + SHM),内核不再直碰 UART。
+/// 误用 → `_` 兜底 -ENOSYS。
 /// M3-2:`service_register(id)` —— 服务进程自报注册(见 services.rs 与
 /// M3-DESIGN §10.3)。
 pub const SYSCALL_SERVICE_REGISTER: usize = 10;
@@ -36,18 +35,11 @@ pub const SYS_ERR_EINVAL: usize = usize::MAX;
 pub const SYS_ERR_EACCES: usize = usize::MAX - 1;
 pub const SYS_ERR_ENOENT: usize = usize::MAX - 2;
 pub const SYS_ERR_ENOMEM: usize = usize::MAX - 3;
-/// M3 T1:非法 fd(随 sys_write;SYSCALLS.md §错误码)。
-pub const SYS_ERR_EBADF: usize = usize::MAX - 4;
-/// M3 T1:缓冲越界/不可访问(随 sys_write;SYSCALLS.md §错误码)。
-pub const SYS_ERR_EFAULT: usize = usize::MAX - 5;
 /// M3-2:服务 id 已注册 / 设备已被他进程 claim(随 service_register /
 /// map_device;SYSCALLS.md §错误码)。
 pub const SYS_ERR_EEXIST: usize = usize::MAX - 6;
 /// 未实现/未知号(与 -EINVAL 同编码 usize::MAX,语义靠上下文区分)。
 pub const SYS_ERR_ENOSYS: usize = usize::MAX;
-
-/// `sys_write` 单次写入长度上限(4KB,与内核栈缓冲/逐页校验匹配)。
-const MAX_WRITE_LEN: usize = 4096;
 
 /// 帧 GPR 槽位(arch::gpr 索引别名;x(n+1),如 A0=x10)。
 const GPR_A0: usize = crate::arch::gpr::X_A0; // x10
@@ -186,16 +178,6 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
                 }
             }
         }
-        SYSCALL_WRITE => {
-            sys_write(frame);
-            false
-        }
-        SYSCALL_READ => {
-            // 本轮占位:返回 -ENOSYS(SYSCALLS.md 登记;9 号 READ 保留)。
-            unsafe { *frame.add(GPR_A0) = SYS_ERR_ENOSYS };
-            unsafe { *frame.add(FRAME_SEPC) += 4 };
-            false
-        }
         SYSCALL_SERVICE_REGISTER => {
             // a0=服务 id;成功 a0=0,失败负 errno(EINVAL/EEXIST/EACCES)。
             // 注册原子性见 process::register_service(TABLE → SERVICES)。
@@ -262,91 +244,4 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
             false
         }
     }
-}
-
-/// M3 T1:`sys_write`(号 8)。语义见 SYSCALLS.md §sys_write(唯一来源)。
-///
-/// a0=fd, a1=buf, a2=len;成功 a0=写入字节数,失败负 errno。结果写回帧,
-/// sepc 前移 4。当前地址空间即进程根表(syscall 上下文 satp 未切),
-/// 逐页 `mmu::is_user_mapped` 校验(U 页),拷贝置 SUM 后直读用户缓冲。
-fn sys_write(frame: *mut usize) {
-    let fd = unsafe { *frame.add(GPR_A0) };
-    let buf = unsafe { *frame.add(GPR_A1) };
-    let len = unsafe { *frame.add(GPR_A2) };
-    // 过渡占位(M3-1):仅 fd=1(stdout)→ UART;M3-2 uart_server 落地后
-    // 删除(见 M3-DESIGN §4,微内核"内核直碰 UART"临时例外)。
-    if fd != 1 {
-        unsafe { *frame.add(GPR_A0) = SYS_ERR_EBADF };
-        unsafe { *frame.add(FRAME_SEPC) += 4 };
-        return;
-    }
-    if len > MAX_WRITE_LEN {
-        unsafe { *frame.add(GPR_A0) = SYS_ERR_EINVAL };
-        unsafe { *frame.add(FRAME_SEPC) += 4 };
-        return;
-    }
-    if len > 0 {
-        // 逐页校验 buf 在当前进程根表映射为**用户页**(防跨页越界/未映射
-        // 缓冲 → -EFAULT;限定 U 页,防 S 模式拷贝放行内核区页泄漏内核内存)。
-        let root = match crate::process::pid_root(crate::sched::current_proc()) {
-            Some(r) => r,
-            // 进程销毁竞态:地址空间已失效,按不可访问处理。
-            None => {
-                unsafe { *frame.add(GPR_A0) = SYS_ERR_EFAULT };
-                unsafe { *frame.add(FRAME_SEPC) += 4 };
-                return;
-            }
-        };
-        // 整数守卫:`buf + len` 在 buf 近 usize::MAX 时回绕,令 `last` 回绕到
-        // 小地址 → `while va <= last` 整体跳过 → 逐页校验被绕过,SUM=1 拷贝
-        // 即读非规范地址 → S 模式 load page fault → **用户态一次 syscall
-        // 可停机**(M3 收尾审查发现)。checked_add + USER_VA_LIMIT 双守卫,
-        // 越界一律 -EFAULT(与逐页校验失败同码)。
-        let end = match buf.checked_add(len) {
-            Some(e) => e,
-            None => {
-                unsafe { *frame.add(GPR_A0) = SYS_ERR_EFAULT };
-                unsafe { *frame.add(FRAME_SEPC) += 4 };
-                return;
-            }
-        };
-        if end > crate::mmu::USER_VA_LIMIT {
-            unsafe { *frame.add(GPR_A0) = SYS_ERR_EFAULT };
-            unsafe { *frame.add(FRAME_SEPC) += 4 };
-            return;
-        }
-        let first = buf & !0xfff;
-        let last = end - 1;
-        let mut va = first;
-        while va <= last {
-            if !crate::mmu::is_user_mapped(root, va) {
-                unsafe { *frame.add(GPR_A0) = SYS_ERR_EFAULT };
-                unsafe { *frame.add(FRAME_SEPC) += 4 };
-                return;
-            }
-            va += 0x1000;
-        }
-    }
-    // 拷入内核栈缓冲(≤ 4096;当前 satp = 进程根表)。**S 模式读 U 页须置
-    // SUM**(RISC-V:无 SUM 时 S 模式对 U 页访问立即故障,实测 scause=0xd);
-    // trap 恢复路径写回入口保存的 sstatus,临时置位不泄漏;SIE=0 无抢占。
-    let mut kbuf = [0u8; MAX_WRITE_LEN];
-    // B2(M3 收尾审查):拷贝期间持 SHM 表锁,阻断对端核并发
-    // `cap_revoke → shm_revoke` 在「校验后、拷贝完成前」撤映射/释放页
-    // (TOCTOU)。否则 SUM=1 直读已释放共享页 → S 模式页故障 → 内核停机
-    // (用户一次 syscall DoS)。SHM 锁为独立叶子锁,本路径不持其它锁,无
-    // 锁序问题;SIE=0 下本核无抢占,持锁安全。
-    let _shm = crate::shm::lock_guard();
-    crate::arch::set_sum();
-    for (i, slot) in kbuf.iter_mut().take(len).enumerate() {
-        // SAFETY:buf 已逐页校验为当前进程根表的 U 页,且 SUM=1 使 S 模式
-        // 可读;len ≤ MAX_WRITE_LEN 防栈缓冲越界。SHM 锁(若为共享页)阻断
-        // 对端核撤映射,校验与拷贝间页保持映射。
-        *slot = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
-    }
-    crate::arch::clear_sum();
-    drop(_shm);
-    crate::uart::write_bytes(&kbuf[..len]);
-    unsafe { *frame.add(GPR_A0) = len };
-    unsafe { *frame.add(FRAME_SEPC) += 4 };
 }

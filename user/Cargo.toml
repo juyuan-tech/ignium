@@ -1,18 +1,23 @@
-# Ignium 用户态测试程序(M3 T1,独立 crate)。
+# Ignium 用户态共享库与测试程序(M3-2,独立 crate)。
 #
 # 非 workspace 成员(根 Cargo.toml `exclude = ["user"]`),由
 # `kernel/build.rs` 经 cargo-in-cargo 构建(env `CARGO_TARGET_DIR=$OUT_DIR/
-# user-target` 隔离 target 锁),产物拷入 `$OUT_DIR/hello.elf`,内核
-# `include_bytes!` 内嵌 —— 详见 M3-DESIGN §3.5(方案 A)。
+# user-target` 隔离 target 锁),产物拷入 `$OUT_DIR/hello.elf` 与
+# `$OUT_DIR/uart_server.elf`,内核 `include_bytes!` 内嵌 —— 详见
+# M3-DESIGN §3.5(方案 A)。
+#
+# 结构:`src/lib.rs` 共享 syscall helper / 常量 / panic handler / uart client
+# 库;`src/bin/hello`(M3 T1 冒烟,打印走服务)、`src/bin/uart_server`
+# (M3-2 UART 服务进程,独占 UART MMIO)。
 #
 # syscall 号常量与 `kernel/src/syscall.rs` 一致(注释"须与 kernel 一致",
 # 禁止在用户侧复制定义,见 docs/SYSCALLS.md 登记纪律)。
 
 [package]
-name = "ignium-user-hello"
+name = "ignium-user"
 version = "0.1.0"
 edition = "2021"
-description = "Ignium M3 T1 user test program (no_std ELF, loaded by kernel elf::load)"
+description = "Ignium M3 user shared lib + programs (no_std ELF, loaded by kernel elf::load)"
 license = "Apache-2.0"
 
 [profile.release]

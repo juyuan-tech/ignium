@@ -278,7 +278,7 @@ pub fn locked_line(f: impl FnOnce()) {
     f();
 }
 
-/// 输出任意字节序列(M3 T1 `sys_write` 用);`\n` 自动补 `\r\n`。
+/// 输出任意字节序列(内核日志控制台用);`\n` 自动补 `\r\n`。
 ///
 /// # 多核语义(D9)
 /// 与 `write_str` 同契约:正常路径 `try_lock` CONSOLE_LOCK,失败(panic

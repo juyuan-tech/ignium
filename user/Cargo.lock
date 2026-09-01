@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "ignium-user-hello"
+name = "ignium-user"
 version = "0.1.0"

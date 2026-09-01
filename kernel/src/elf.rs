@@ -44,6 +44,10 @@ const MAX_ARGS: usize = 16;
 
 /// 内嵌的用户测试程序 ELF(kernel/build.rs 编译 `user/` 拷入 OUT_DIR)。
 pub(crate) const HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
+/// 内嵌的 UART 服务进程 ELF(M3-2;同上,编译 `user/` 拷入 OUT_DIR)。
+/// `tests::boot_elf_test` 校验解析;M3-2 T1 经 spawn_user_args 加载运行。
+pub(crate) const UART_SERVER_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/uart_server.elf"));
 
 /// ELF 加载/校验错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

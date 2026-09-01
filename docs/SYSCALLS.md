@@ -39,8 +39,8 @@ a0-a5  = 参数(按各调用定义)
 | `SYS_ERR_EACCES` | `usize::MAX - 1` | 未授权(空槽/非目标 cap/服务连接自身) |
 | `SYS_ERR_ENOENT` | `usize::MAX - 2` | 不存在(服务 id 未注册) |
 | `SYS_ERR_ENOMEM` | `usize::MAX - 3` | 内存不足 |
-| `SYS_ERR_EBADF` | `usize::MAX - 4` | 非法 fd(保留,M3-1 sys_write 遗留;当前无调用方) |
-| `SYS_ERR_EFAULT` | `usize::MAX - 5` | 缓冲越界/不可访问(保留,M3-1 sys_write 遗留;当前无调用方) |
+| `SYS_ERR_EBADF` | `usize::MAX - 4` | ~~非法 fd~~(**M3-2 随 sys_write 移除**,号值保留不复用) |
+| `SYS_ERR_EFAULT` | `usize::MAX - 5` | ~~缓冲越界/不可访问~~(**M3-2 随 sys_write 移除**,号值保留不复用) |
 | `SYS_ERR_EEXIST` | `usize::MAX - 6` | **M3-2 新增**:服务 id 已注册 / 设备已被他进程 claim |
 | `-ENOSYS`(未知号) | `usize::MAX` | 未定义 syscall 号 |
 

@@ -799,7 +799,7 @@ fn boot_fault_recovery_test() {
 
 // ===== M3 T1:ELF 加载器(独立编译用户程序) =====
 
-/// 共享标记页 VA:须与 `user/src/main.rs` 的 `MARKER_VA`(0x4000_2000)
+/// 共享标记页 VA:须与 `user/src/bin/hello.rs` 的 `MARKER_VA`(0x4000_2000)
 /// 一致;且在 hello ELF 段映射范围之外(下方以 parse 结果断言 max_end)。
 const ELF_MARKER_VA: usize = 0x4000_2000;
 
@@ -818,6 +818,14 @@ fn boot_elf_test() {
     // 2) 校验内嵌 ELF:入口非零、段不侵占 marker 页(加载器与测试自洽)。
     let info = crate::elf::parse(crate::elf::HELLO_ELF).expect("elf: parse hello");
     assert!(info.entry != 0, "elf: entry must be non-zero");
+    // 2.5) 校验内嵌的 uart_server ELF(M3-2;此处解析亦使用 UART_SERVER_ELF
+    // 常量,spawn 运行留待 M3-2 T1)。
+    let server_info =
+        crate::elf::parse(crate::elf::UART_SERVER_ELF).expect("elf: parse uart_server");
+    assert!(
+        server_info.entry != 0,
+        "elf: uart_server entry must be non-zero"
+    );
     let max_end = info
         .segments
         .iter()
