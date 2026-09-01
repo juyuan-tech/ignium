@@ -19,6 +19,10 @@
 | D25 | SCHED 全局锁拆分(per-CPU 锁) | M3-DESIGN §7 | M4 | **M3-1 评估后延后 M4**:现状正确(D19);M3-1 已叠加跨核 kill/shootdown + ELF 两个高敏改动,拆分风险不可控;收益有限(QEMU 4 核 IPC 瓶颈是 current_id 取锁,非整锁带宽);成本高(跨核 enqueue 需按 hart 序取锁防死锁;on_tick/block/exit/yield 全部重审)。可选低风险子项(per-CPU `CURRENT_TID` 原子缓存)单独评估,不并入 M3-1 |
 | D26 | slab 空页水位扫描(定时/水位触发后台扫描) | M3-DESIGN §7 | M4 或真实内存压力 | **M3-1 评估后不做**:现状有界(非 head 空页下次任一档 grow 懒回收,head 保留作快复用缓存),内核堆用量几 KB 级 / RAM 128MB,收益 ≈ 0。M4 或真实内存压力出现时再评估 |
 | D28 | IPC syscall 路径 SCHED 锁三次顺序获取合并(current_id → donate_on_block → block_user_from_trap) | M3 收尾审查(perf agent) | M4(SCHED 锁缩放评估时一并) | **M3-1 评估后延后**:三次获取均**顺序、不嵌套**(trap 上下文 SIE=0,无重入/死锁风险),是纯性能微项;SCHED 锁在 syscall 路径无竞争,收益 ≈ 0;合并需改 `block_user_from_trap` 签名与 donation/IPC-wake API 契约,触碰 B1 刚修改的最关键路径,风险 >> 收益。留待 M4 与 D25(SCHED 锁缩放)一并评估 |
+| D29 | 服务端 client 消亡后的 recv 恢复:陈旧 `Cap::Proc(client)` 令 uart_server 的 recv 永久阻塞(无对端再配对) | M3-2 设计(§10.11) | M3-3(服务崩溃恢复里程碑) | 待办:M3-2 uart_server 面向 1 并发 client 且测试期无 client 消亡场景;`purge_process` 已可对阻塞 recv 投 -ENOENT,预留「cap_revoke + 重连协议」 |
+| D30 | 多并发 client 支持:accept 单槽 + SHM_VA 单页映射限制为 1 并发 client | M3-2 设计(§10.11) | M3-3(ramfs/init-shell 多进程交互) | 待办:需多 SHM VA + 服务端槽池;M3-2 明确面向单 client |
+| D31 | 设备页能力化:`Cap::Dev` + 手动 revoke + 特权授予(map_device 当前无特权校验,任何进程可 claim UART,靠引导序保证;设备页生命周期随进程不可单独 revoke) | M3-2 设计(§10.11) | M3-3(设备驱动服务化) | 待办:M3-2 靠「uart_server 先 spawn 先 claim」引导序保证;设备页非分配器,`destroy_root` 只 unmap 不 free |
+| D32 | uart_server 崩溃即 UART 卡死(无看门狗/服务重启) | M3-2 设计(§10.11) | M3-3+(服务崩溃恢复) | 待办:本轮无看门狗;崩溃恢复里程碑统一设计 |
 
 ## 已实现(落地)
 

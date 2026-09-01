@@ -2,32 +2,38 @@
 
 > 目标阶段:**M3**(用户态服务 + L2 兼容),承接 M2 收官(v0.1.0-M2)。
 > 本文为 M3 设计基线,先文档后代码(遵循 DESIGN.md「先读透 seL4/rCore,
-> 前 3 个月重文档轻代码」)。**M3-1(本轮)**:ELF 加载器 + 内核 `sys_write`
-> 过渡占位 + 跨核 IPI 停核/Running 线程回收 + 跨核 TLB shootdown + 内核线程
-> 栈守护页。M3-2 及以后:uart_server 服务化、内存服务、ramfs、virtio-blk、
+> 前 3 个月重文档轻代码」)。**M3-1(已落地,2026-09-01)**:ELF 加载器 +
+> 内核 `sys_write` 过渡占位 + 跨核 IPI 停核/Running 线程回收 + 跨核 TLB
+> shootdown + 内核线程栈守护页。**M3-2(本轮)**:uart_server 服务化(见 §10)
+> —— 设备页授予 + 内核服务注册表 + 移除 sys_write 占位 + sys_read 落地 +
+> 跨核 IPC 实测。M3-3 及以后:内存服务 Cap::Page、ramfs、virtio-blk、
 > spawn/init/shell、musl/busybox(L2)、服务崩溃恢复。
 
 ## 1. 目标与验收(对齐 ROADMAP 阶段 3)
 
-| 任务 | 验收 | 本轮(M3-1)处置 |
+| 任务 | 验收 | 处置 |
 |---|---|---|
-| uart_server 进程独占 UART,打印走 IPC | 内核不再直碰 UART | 定案:M3-1 内核 `sys_write(fd=1)` → UART 为**过渡占位**,标注 M3-2 uart_server 落地后删除(微内核"内核直碰 UART"临时例外,非兼容代码) |
-| 内存服务:cap 发页 + IPC 申请/释放 | 用户进程可申请页 | 设计延后(M3-2);M3-1 不引入 `Cap::Page`,ELF 映射由内核加载器直接完成 |
-| ramfs 文件系统服务(open/read/write/close) | IPC 客户端可读写删文件 | 延后 M3-2 |
-| virtio-blk 驱动服务 + 持久文件系统 | 重启数据仍在 | 延后 M3-2 |
-| spawn 服务化 + init 进程 + shell | shell 跑通 echo/cat 重定向 | 设计延后(M3-2);M3-1 只交付内核 `spawn_elf` 原语 |
-| **musl 移植 + busybox 跑通(L2)** | busybox 常用命令可用 | 延后 M3-2 |
-| 服务崩溃恢复:杀 FS 服务,系统存活可重启 | 故障注入测试通过 | 基础已具备(D12 杀进程 + 系统存活);跨核停核回收本轮补强(M3 T2) |
+| uart_server 进程独占 UART,打印走 IPC | 内核不再直碰 UART | **已落地(M3-2,§10)**:uart_server 独占 UART(设备页授予 U 映射),内核 `sys_write` 占位已删除;打印/读取走 IPC |
+| 内存服务:cap 发页 + IPC 申请/释放 | 用户进程可申请页 | 延后 M3-3(M3-2 定案:聚焦 uart_server;`Cap::Page` 单独一轮) |
+| ramfs 文件系统服务(open/read/write/close) | IPC 客户端可读写删文件 | 延后 M3-3 |
+| virtio-blk 驱动服务 + 持久文件系统 | 重启数据仍在 | 延后 M3-3 |
+| spawn 服务化 + init 进程 + shell | shell 跑通 echo/cat 重定向 | 延后 M3-3(M3-2 只落地**内核服务注册表** §10 D2) |
+| **musl 移植 + busybox 跑通(L2)** | busybox 常用命令可用 | 延后 M3-3 |
+| 服务崩溃恢复:杀 FS 服务,系统存活可重启 | 故障注入测试通过 | 延后 M3-3+;基础已具备(D12 杀进程 + 系统存活) |
 
-**M3-1 验收标准**:
-1. Rust 编译的 `riscv64gc-unknown-none-elf` 用户 ELF 被内核加载、映射到用户
-   地址空间、U 模式运行、回写结果(banner `M3 T1: ELF loader ok (user ELF ran)`)。
-2. 被杀进程 Running 于其它核的线程**立即回收**(栈→reaper、槽→free_slots、
-   状态→Exited),共享内存 revoke 跨核 TLB 失效(banner
-   `M3 T2: cross-core kill/shootdown ok (N harts)`)。
-3. 内核线程栈守护页落地(自检断言,不新增 banner)。
+**M3-1 验收标准(已满足,2026-09-01)**:①ELF 加载器(hello 跑通,`M3 T1` banner);
+②跨核 kill/shootdown(`M3 T2` banner);③内核线程栈守护页(自检断言);④五门禁全绿
++ dev/release 双 profile + 三配置 log 零字面 `KERNEL PANIC|TRAP:`。
+
+**M3-2 验收标准**:
+1. uart_server 用户进程独占 UART:客户端经 IPC 打印/读取,内核不再直碰 UART
+   (banner `M3-2 T1: uart_server service ok`)。
+2. 内核服务注册表:服务进程 `service_register` 自报,客户端 `service_connect`
+   获得双向 IPC 能力(cap 槽)。
+3. 跨核 IPC 实测:uart_server 亲和一核、client 亲和另一核阻塞配对即时成功
+   (验证 B1 跨核分支,banner `M3-2 T2: cross-core IPC ok (N harts)`)。
 4. 五门禁全绿 + dev/release 双 profile 可编 + 三配置 log 无字面
-   `KERNEL PANIC|TRAP:`。
+   `KERNEL PANIC|TRAP:`;既有全部 banner 不回归。
 
 ## 2. 文档空白处置决策(每项给"补/延后"结论)
 
@@ -36,10 +42,10 @@
 | `docs/SYSCALLS.md` | **本轮新建** | L1 ABI 唯一来源,登记 1-7 现有号 + 8/9 新增号,与 `kernel/src/syscall.rs` 常量一一对应;9 号(READ)本轮返回 -ENOSYS |
 | compat-baseline(对齐 LiteOS-A 的 POSIX 子集清单) | 延后 M3-2 | 等 uart_server/ramfs 服务定案后一起写,避免边写边改 |
 | M3-DESIGN(本文) | **本轮新建** | 设计基线 |
-| 服务注册机制(spawn 服务化) | 设计延后 M3-2 | M3-1 服务 = 独立进程,IPC 目标经 cap 槽解析 |
-| `Cap::Page` 发页能力 | 设计延后 M3-2 | M3-1 ELF 映射由内核加载器直接完成 |
-| spawn/init/shell 设计 | 设计延后 M3-2 | M3-1 只交付内核 `spawn_elf` 原语 |
-| uart_server 过渡方案 | **本轮定案** | M3-1 内核 `sys_write(fd=1)` → UART 为过渡占位,M3-2 落地 uart_server 后删除 |
+| 服务注册机制(spawn 服务化) | **M3-2 落地(§10 D2)** | 内核服务注册表:`service_register`(号 10)+ `service_connect`(号 11)双向授予;spawn 服务化本身延后 M3-3 |
+| `Cap::Page` 发页能力 | 设计延后 M3-3 | M3-2 只落地设备页授予(`map_device` 号 12,MMIO 白名单),内存发页单独一轮 |
+| spawn/init/shell 设计 | 延后 M3-3 | M3-2 落地内核服务注册表后,spawn 服务化顺理成章 |
+| uart_server 过渡方案 | **已落地(M3-2)** | M3-1 内核 `sys_write(fd=1)` → UART 过渡占位已删除,uart_server 独占 UART(§10) |
 | SCHED 锁缩放 / D1 / slab 水位 | **本轮评估后延后** | 评估结论见 §7,移入 DEFERRED.md |
 
 ## 3. ELF 加载器(固化 M2-DESIGN §7)
@@ -127,17 +133,16 @@ M2-DESIGN §7 仅提纲,本轮固化:**解析 + 校验 + 映射 + 用户栈 + ar
 | `shm_map` | 5 | a0=本槽, a1=对端槽, a2=len | 成功 a0=shm_id / 负 errno |
 | `cap_revoke` | 6 | a0=槽 | 成功 0 / 负 errno |
 | `cap_dup` | 7 | a0=源槽, a1=目标槽 | 成功 0 / 负 errno |
-| **`sys_write`** | **8(新增)** | a0=fd, a1=buf, a2=len | 成功 a0=len / 负 errno |
-| **`sys_read`** | **9(新增,占位)** | a0=fd, a1=buf, a2=len | 本轮返回 -ENOSYS(登记保留) |
+| ~~`sys_write`~~ | 8 | — | **M3-2 移除,号保留**(见 §10 D5) |
+| ~~`sys_read`~~ | 9 | — | **M3-2 移除,号保留**(读取经用户态库 `uart_read`,§10 D4) |
+| **`service_register`** | **10(新增)** | a0=服务 id | 成功 0 / -EINVAL / **-EEXIST** |
+| **`service_connect`** | **11(新增)** | a0=id, a1=client 槽, a2=server 槽 | 成功 0 / -EINVAL / -ENOENT / -EACCES |
+| **`map_device`** | **12(新增)** | a0=dev_id, a1=va | 成功 0 / -EINVAL / **-EEXIST** |
 
-**sys_write 语义(本轮)**:fd=1 → `uart::write_bytes(buf)`(NS16550,多核安全);
-fd≠1 → `-EBADF`(新 `SYS_ERR_EBADF = MAX-4`)。**逐页**校验 buf 在当前进程根表
-映射为**用户页**(`mmu::is_user_mapped`,限 U 位 —— 防跨页越界,亦防放行内核区
-页泄漏内核内存),`len > 4096` → `-EINVAL`(与 SYSCALLS.md/code 一致;`-EFAULT` 仅
-保留给"任一页未映射/缓冲不可访问")。
-拷贝须置 `sstatus.SUM=1`(S 模式直读 U 页;trap 恢复路径写回原值,临时置位
-不泄漏;SIE=0 无抢占)—— M3-T1 实测首版缺 SUM 时 S 模式对 U 页立即
-`scause=0xd`,此处为修复记录。
+**M3-1 的 `sys_write` 语义(历史记录,已删除)**:fd=1 → `uart::write_bytes(buf)`;
+fd≠1 → `-EBADF`;逐页校验 buf(限 U 位);`len > 4096` → `-EINVAL`;拷贝置
+`sstatus.SUM=1`。**M3-2 删除**:打印/读取一律走 IPC 到 uart_server,内核不再直碰
+UART(见 §10)。新 syscall 语义见 §10 与 `docs/SYSCALLS.md`(唯一来源)。
 
 ## 6. 跨核 IPI 停核 + Running 线程回收 + 跨核 TLB shootdown
 
@@ -233,9 +238,138 @@ ISR 内零分配零日志,只取 SCHED 锁,不碰 TABLE/IPC):
 | 内核线程栈守卫在进程根表失效(带 proc 内核线程) | M3-DESIGN 文档化残余局限:守卫只在内核根表生效,带 proc 内核线程运行于进程根表时守卫跨根表拆分传播延后(见 DEFERRED 关联) |
 | 守护页解映射破坏身份映射不变量(bring-up 实测) | 内核恒经 VA==PA 访问物理页,堆/页表页经 buddy 原样取用不自行映射;栈归还前必须 `remap_kernel_4k` 恢复守护页映射再 dealloc —— 否则该 PA 被复用为页表页后 memset 即 store page fault(实测 scause=0xf @ 守护 PA) |
 
+## 10. M3-2:uart_server 服务化(本轮)
+
+M3-1 已交付 ELF 加载器;服务化的第一步 = uart_server 进程独占 UART。打印走 IPC、
+内核不再直碰 UART(删除 M3-1 的 `sys_write(fd=1)→UART` 过渡占位),同时落地
+**内核服务注册表**(客户端如何找到 uart_server)与 **sys_read**(读取经服务),
+并实测 B1 跨核 IPC(审计点名"M3-2 落地后实测")。
+
+### 10.1 现状约束(设计前提)
+
+- **用户态无法访问 UART MMIO**:设备页(0x1000_0000)在所有根表 U=0,`map_user_page`
+  拒绝非分配器 paddr(mmu.rs:187)→ 需专用**设备页授予原语**。
+- **`destroy_root` 无条件释放 U=1 叶子**(mmu.rs:459-463):UART 页(非分配器)若 U-映射
+  进进程根表,销毁时会对 buddy 外页 free → **必须配套修复**。
+- **`ipc::recv` 要求本进程槽持 `Cap::Proc(src)`**(ipc.rs:202)→ 服务端必须持有
+  Cap::Proc(客户端)才能 recv → `service_connect` 须**双向授予(互认介绍)**。
+- **无头 CI 无法注入 UART 键盘**(Makefile `-nographic`)→ sys_read 自动测试只测
+  "无数据"路径;真实键盘在 `make qemu`。
+- **单 ELF 限制**:`kernel/build.rs` 只编译 `ignium-user-hello` → 需扩展多 ELF。
+
+### 10.2 设备页授予:`map_device(dev_id, va)`(号 12)+ `kernel/src/device.rs`
+
+- 白名单:`dev_id=0 → board::uart_base()`(0x1000_0000,页对齐);其它 → `-EINVAL`。
+- 校验:va 页对齐、`va < USER_VA_LIMIT`、va 未映射(拒覆盖)、设备未被其它进程 claim
+  (排他)。`MAX_DEVICES=8`,`slots: [Option<(pid, va)>; 8]`,独立 SpinLock。
+- 新 mmu 接口 `map_device_page(root, vaddr, paddr, flags)`:与 `map_user_page` 同构
+  (ensure_table + 拒覆盖 + 置 U 位 + 单地址 sfence),**跳过 `page_in_range`**;Safety
+  注释:调用方(device.rs)须白名单校验 paddr。
+- **destroy_root 耦合修复**:释放 U=1 叶子前先 `mem::page_in_range(pa)` 判断,设备页
+  (非分配器)只 unmap 不 free。
+- **不引入 `Cap::Dev`**:设备页生命周期随进程,`process::destroy` 调 `device::release_all(pid)`
+  清 claim;revoke/特权授予延后(M3-3)。
+- 锁序:`TABLE → DEVICES`,不逆序。安全局限(记录):任何进程可 claim UART(无特权校验),
+  M3-2 靠引导序(uart_server 先 spawn 先 claim)保证。
+
+### 10.3 内核服务注册表:`service_register`(号 10)/ `service_connect`(号 11)+ `kernel/src/services.rs`
+
+- `MAX_SERVICES=8`,`slots: [Option<ServiceEntry{id,pid}>; 8]`,独立 SpinLock;
+  `SERVICE_UART=1`(id 0 保留,1..=7 合法)。
+- `service_register(id)`(进程自报):id 范围 → `-EINVAL`;已占用 → **`-EEXIST`**(新 errno
+  MAX-6)。原子性:`process::register_service` 持 TABLE 锁校验进程存活再取 SERVICES 插入
+  (`services::register_locked`),与 destroy 的 TABLE 锁串行化 → 杜绝"注册于已亡进程
+  + pid 复用"竞态。
+- `service_connect(id, client_slot, server_slot)`:SERVICES 查 id → server_pid(无 →
+  `-ENOENT`);`server == caller` → `-EACCES`;槽越界 → `-EINVAL`;**双向授予**:
+  `grant_cap(caller, client_slot, server_pid)` 且 `grant_cap(server, server_slot, caller)`
+  (服务端无 Cap::Proc(客户端)则 recv 被拒)。
+- `process::destroy` 步骤 2(TABLE 锁内)调 `services::unregister_all_locked(pid)` +
+  `device::release_all(pid)`。锁序全程 `TABLE → SERVICES → DEVICES → IPC → SCHED`。
+
+### 10.4 uart_server 用户程序 + SHM 打印路径(user crate 重构)
+
+- user crate:包名 `ignium-user`,`[lib] lib.rs`(共享 syscall helper/常量/`#[panic_handler]`/
+  uart client 库 `uart_write`/`uart_read`)+ `[[bin]] hello` + `[[bin]] uart_server`。
+  `kernel/build.rs` 编译两 bin 拷 `hello.elf`/`uart_server.elf`;`elf.rs` 加 `UART_SERVER_ELF`。
+- 固定常量(lib.rs):`SERVER_ACCEPT_SLOT=0`、`SERVER_SHM_SLOT=1`、`CLIENT_IPC_SLOT=2`、
+  `CLIENT_SHM_SLOT=3`、`UART_MMIO_VA=0x6000_0000`(设备窗口,避开 ELF 0x4000_0000 /
+  SHM 0x5000_0000)、`UART_SERVICE_ID=1`。
+- uart_server 主流程:`sys_map_device(0, UART_MMIO_VA)` → `service_register(1)` → 循环
+  `ipc_recv(slot 0)` → 按 op 处理 → `ipc_send(slot 0, reply)`。
+- 打印数据路径:client 写字节到 `SHM_VA` → `ipc_send({op=WRITE, len})` → uart_server
+  读 `SHM_VA[0..len]` 逐字节 TX(`\n→\r\n`)→ reply → client `ipc_recv`。
+- 槽编排(client):connect 得 `Cap::Proc(server)`(槽 2)→ `cap_dup(2→3)` 保 IPC 槽 →
+  `shm_map(a_slot=3, b_slot=SERVER_SHM_SLOT, len=4096)` → 双槽变 `Cap::Shm(id)`。
+- RX:READ 请求时轮询 LSR bit0(DR)→ 读 RBR → 写 SHM_VA → reply nread;无数据 → nread=0。
+- 并发限制:accept 单槽 + SHM_VA 单页 → **本轮 1 并发 client**(多 client 延后 M3-3)。
+
+### 10.5 sys_read(号 9 移除 → 用户态库 `uart_read`)
+
+读取是 fd 型兼容接口,属用户态库(POSIX 兼容零进内核),与"打印走 IPC"对称;未来
+ramfs 读取同样走服务 IPC,内核无需 fd 命名空间。`lib.rs` 的 `uart_read(buf)`:
+send READ → recv reply → 从 SHM_VA 拷回 buf;越界由服务端 `clamp(len ≤ SHM_LEN)`
+防护;无数据返回 `nread=0`(EOF 语义,确定性,CI 可测)。
+
+### 10.6 sys_write 移除(号 8)
+
+内核删 `sys_write` 处理器 + `MAX_WRITE_LEN`;user 侧 `SYS_WRITE` 常量删;hello 重写为
+"连接服务 → SHM 写 → IPC 打印"。boot_elf_test 只断言 marker(服务未注册时 connect
+→ -ENOENT 非致命,marker 仍写)。
+
+### 10.7 跨核 IPC IPI 补强 + 实测
+
+`ipc_wake_with_msg/err`(sched.rs)Blocked 分支 enqueue 后补:
+`let tgt = threads[tid].hart; if tgt != my_hart && current[tgt] == idle[tgt] →
+sbi::send_ipi(1 << tgt, 0)`(仿 `wake()`,失败仅 warn 一次,降级 ≤1 tick)。B1 的
+"未阻塞存 `IpcWake`"分支不需发 IPI(目标在阻塞点消费,不切走)。
+
+### 10.8 消息协议(5 字 IPC + SHM 单页)
+
+```
+请求 = [op, arg1, 0, 0, 0]   op 0x01 WRITE:arg1=len,数据在 SHM_VA[0..len]
+                             op 0x02 READ :arg1=max_len,服务端读 RBR → SHM_VA
+                             op 0x03 PING :连通性(测试)
+回复 = [op|0x80, status, len, 0, 0]   status=0 成功 / 负 errno;len=读写字节数
+```
+
+### 10.9 测试与 banner
+
+- **T1(单核,boot_tests,协作式)** 仿 boot_ipc_test:spawn uart_server(ELF)→ yield_ 至
+  recv 阻塞 → spawn hello(client)→ 轮询 marker → 断言;destroy 后 `free_page_count`
+  断言(设备页不 free、无 double-free)。banner `M3-2 T1: uart_server service ok`。
+- **T2(smp 阶段)** `smp_uart_ipc_test()`:uart_server 亲和 A、client 亲和 B 阻塞配对;
+  单核退化仍打 banner `M3-2 T2: cross-core IPC ok (N harts)`。
+- 负面用例:register 重 → -EEXIST;connect 未注册 → -ENOENT;map_device 二次 claim →
+  -EEXIST;map_device 非法 va → -EINVAL。
+- **新 banner 同步 6 处 grep**(AGENTS.md 纪律):Makefile test/smp/rva23 +
+  ci.yml build/smp/rva23。
+
+### 10.10 提交切分(每提交过五门禁 + 6 grep 一致)
+
+1. `docs: M3-2 设计`(本节 + SYSCALLS + DEFERRED);
+2. `feat: 设备页授予 + destroy 修复`(device.rs + mmu + 号 12 + EEXIST);
+3. `feat: 内核服务注册表`(services.rs + 号 10/11 + destroy 钩子);
+4. `feat: uart_server 服务化`(user 重构 + build.rs 多 ELF + 删 sys_write/read + hello 重写);
+5. `feat: 跨核 IPC IPI + M3-2 测试`(ipc_wake 补 IPI + T1/T2 + 两 banner + 6 grep);
+6. `docs: M3-2 收官`(报告 + ROADMAP 勾选)。
+
+### 10.11 风险与遗留(登记 DEFERRED)
+
+- 服务端 client 消亡后 recv 永久阻塞(陈旧 Cap::Proc):不做恢复(purge_process 已可投
+  -ENOENT,预留 cap_revoke + 重连协议)。
+- 并发 client 受限(accept 单槽 + SHM_VA 单页):本轮 1 并发,多 client 需多 SHM VA + 槽池。
+- map_device 无特权校验:靠引导序保证;Cap::Dev/特权授予延后。
+- 设备页不可手动 revoke(无 Cap::Dev):生命周期随进程。
+- uart_server 崩溃即 UART 卡死(无看门狗)。
+- 锁内发 IPI:仿 wake() 同款(目标核 SSIP handler 自旋等 SCHED 锁),已证安全。
+- destroy_root 跳过非分配器 U 页:当前唯一来源是 map_device_page(白名单),安全。
+
 ## 关联登记
 
-- DEFERRED:M1(ELF 延至 M3)→ **本轮落地**;跨核 Running 线程回收/D20 内核栈
-  守护页 → **本轮落地**;SCHED 缩放 / D1 / slab → 评估后延后(§7 移入)。
-- docs/DESIGN.md 已知限制(§):跨核 shootdown/内核栈守护页 → 本轮消项。
-- ROADMAP.md 阶段 3:ELF 加载器 M3-1 勾选。
+- DEFERRED:M1(ELF 延至 M3)→ M3-1 落地;跨核 Running 线程回收/D20 内核栈
+  守护页 → M3-1 落地;SCHED 缩放 / D1 / slab → 评估后延后(§7 移入)。
+  M3-2 遗留(服务端 client 消亡恢复/并发 client/设备页特权与 revoke/uart_server
+  崩溃看门狗)→ 登记 DEFERRED 待办(M3-3+ 触发)。
+- docs/DESIGN.md 已知限制(§):跨核 shootdown/内核栈守护页 → M3-1 消项。
+- ROADMAP.md 阶段 3:ELF 加载器 M3-1 勾选;uart_server 服务化 M3-2 勾选(本轮)。
