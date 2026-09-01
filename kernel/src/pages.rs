@@ -72,6 +72,57 @@ pub fn init() {
     crate::arch::irq_restore(irq);
 }
 
+/// 分配一个物理页并登记为 `Cap::Page`(owner)—— **引导编排专用,无 syscall**。
+///
+/// 纯服务授权(M3-DESIGN §11.3):`alloc` 仅由**引导编排**(当前 = 测试 T1/T2)
+/// 在 mem_server spawn 后注入页池调用 —— 内核**不暴露**通用分配 syscall
+/// (避免 ambient 授权;页的申请/释放唯一入口是 mem_server 服务的 IPC)。
+/// 正式 spawn/init 服务落地后改为引导期自动授予(登记 DEFERRED D33)。
+///
+/// 流程:`alloc_pages(0)`(失败 → `-ENOMEM`)→ 入表(free 池优先槽位复用;
+/// 表满 → 回滚 `free_pages` + `-ENOMEM`)。返回 `Cap::Page` 的 id,调用方
+/// 以 `grant_typed_cap` 写入 mem_server 槽位。
+pub fn alloc(owner: usize) -> Result<usize, usize> {
+    let paddr = crate::mem::alloc_pages(0).ok_or(crate::syscall::SYS_ERR_ENOMEM)?;
+    let irq = crate::arch::irq_save();
+    let id = {
+        let mut t = PAGES.lock();
+        if t.pages.len() >= MAX_PAGES {
+            None // 表满 → 锁外回滚 free_pages(不重叠持锁)
+        } else {
+            match t.free.pop_front() {
+                Some(idx) => {
+                    t.pages[idx] = PageRecord {
+                        id: idx,
+                        paddr,
+                        owner,
+                        map_va: None,
+                    };
+                    Some(idx)
+                }
+                None => {
+                    let idx = t.pages.len();
+                    t.pages.push(PageRecord {
+                        id: idx,
+                        paddr,
+                        owner,
+                        map_va: None,
+                    });
+                    Some(idx)
+                }
+            }
+        }
+    }; // PAGES 锁在此释放
+    crate::arch::irq_restore(irq);
+    match id {
+        Some(idx) => Ok(idx),
+        None => {
+            crate::mem::free_pages(paddr).ok();
+            Err(crate::syscall::SYS_ERR_ENOMEM)
+        }
+    }
+}
+
 /// 撤销页(经 `process::cap_revoke` 对 `Cap::Page` 分派;以及 `destroy` 钩子)。
 ///
 /// 若页已映射(map_va Some)→ 先从持有者根表 unmap;释放物理页归还 buddy;

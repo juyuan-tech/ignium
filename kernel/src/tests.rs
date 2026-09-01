@@ -35,6 +35,7 @@ pub fn boot_tests() {
     boot_fault_recovery_test();
     boot_elf_test();
     boot_uart_service_test();
+    boot_memory_service_test();
     boot_ipc_latency_bench();
 }
 
@@ -809,6 +810,16 @@ const ELF_MARKER_VA: usize = 0x4000_2000;
 /// M3-2 T1/T2 负面用例以内核侧直调验证 UART claim 状态。
 const UART_MMIO_VA: usize = 0x6000_0000;
 
+/// M3-3 内存页固定 VA:须与 `user/src/lib.rs` 的 `MEM_VA`(0x7000_0000)一致
+/// (mem_client 经 `mem_map(槽3, MEM_VA)` 映射 Cap::Page 至此)。
+const MEM_VA: usize = 0x7000_0000;
+
+/// M3-3 服务端页池槽范围:须与 `user/src/lib.rs` 的 SERVER_POOL_START/END
+/// (1..=4,闭区间)一致。内核测试在 mem_server spawn 后经 `pages::alloc` +
+/// `grant_typed_cap` 注入槽 1..=4(引导编排,D33)。
+const SERVER_POOL_START: usize = 1;
+const SERVER_POOL_END: usize = 4;
+
 /// M3 T1:ELF 加载器冒烟(主交付)。
 ///
 /// 验证链路:建进程 → `elf::parse`(校验 + 段不侵占 marker 页)→
@@ -1034,6 +1045,233 @@ fn boot_uart_service_test() {
         "m32t1: address space not reclaimed (free {free_after} < {free_before})"
     );
     info!("M3-2 T1: uart_server service ok");
+}
+
+/// M3-3 T1:内存服务冒烟(单核,引导期协作式)。
+///
+/// 验证链路:建 mem_server 进程 → `elf::load`(MEMORY_SERVER_ELF)+ spawn →
+/// **注入页池**(`pages::alloc`×4 + `grant_typed_cap` 槽 1..=4,D33 引导编排)
+/// → yield 至 accept-any 阻塞 → 断言 `services::lookup(SERVICE_MEMORY)` →
+/// 建 mem_client 进程(marker 页)→ `elf::load`(MEM_CLIENT_ELF)+ spawn →
+/// 用户态 connect + ALLOC(mem_grant 移交 Cap::Page)→ mem_map(MEM_VA)→
+/// 写/读回校验 → FREE(mem_grant 归还,池位回填)→ 写 marker → 轮询断言
+/// (证明完整往返,否则 client 阻塞 recv 永不到)→ 负面用例(mem_grant/
+/// mem_map/cap_dup/cap_revoke + destroy 钩子回收)→ 清理(kill_process 收
+/// 阻塞服务线程)+ `free_page_count` 复原(池 4 页全回 buddy,无泄漏/无
+/// double-free)。
+/// banner:`M3-3 T1: memory service ok`(6 处 grep 同步)。
+fn boot_memory_service_test() {
+    // 1) 建 mem_server 进程 + 校验/加载 ELF(空 argv:服务不打印自身信息)。
+    let server_pid = crate::process::create().expect("m33t1: create memory_server process");
+    let server_info =
+        crate::elf::parse(crate::elf::MEMORY_SERVER_ELF).expect("m33t1: parse memory_server");
+    assert!(
+        server_info.entry != 0,
+        "m33t1: memory_server entry must be non-zero"
+    );
+    let loaded = crate::elf::load(server_pid, crate::elf::MEMORY_SERVER_ELF, &[])
+        .expect("m33t1: load server");
+    let server_tid = crate::sched::spawn_user_args(
+        server_pid,
+        loaded.entry,
+        loaded.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded.argc,
+        loaded.argv,
+    );
+    // 2) 注入页池:pages::alloc×4 → grant_typed_cap 写服务槽 1..=4(D33)。
+    //    页池由引导编排(测试)注入 —— 内核无通用分配 syscall(纯服务授权,
+    //    M3-DESIGN §11.3)。
+    for slot in SERVER_POOL_START..=SERVER_POOL_END {
+        let id = crate::pages::alloc(server_pid).expect("m33t1: pool alloc");
+        crate::process::grant_typed_cap(server_pid, slot, crate::process::Cap::Page(id))
+            .expect("m33t1: pool grant");
+    }
+    // 3) 协作式 yield 至 mem_server 阻塞在 accept-any recv(register 已发生)。
+    let mut guard = 0;
+    while !crate::sched::is_blocked(server_tid) {
+        assert!(
+            guard < 200_000,
+            "m33t1: memory_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 4) 内核侧断言:内存服务已注册。
+    assert!(
+        crate::services::lookup(crate::services::SERVICE_MEMORY).is_some(),
+        "m33t1: memory service must be registered"
+    );
+    // 5) 建 mem_client 进程:marker 页 + 加载 + spawn。
+    let client_pid = crate::process::create().expect("m33t1: create client process");
+    let client_root = crate::process::root(client_pid);
+    let marker_pa = crate::mem::alloc_pages_zeroed(0).expect("m33t1: marker page");
+    assert!(
+        crate::mmu::map_user_page(client_root, ELF_MARKER_VA, marker_pa, 0xC7).is_ok(),
+        "m33t1: map client marker page"
+    );
+    let args: [&[u8]; 1] = [b"mem_client"];
+    let loaded_client = crate::elf::load(client_pid, crate::elf::MEM_CLIENT_ELF, &args)
+        .expect("m33t1: load client");
+    crate::sched::spawn_user_args(
+        client_pid,
+        loaded_client.entry,
+        loaded_client.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_client.argc,
+        loaded_client.argv,
+    );
+    // 6) 轮询 client marker:connect + ALLOC→映射→读写→归还 往返完成即写
+    //    marker(否则 client 阻塞 recv,marker 永不到 → 断言失败)。
+    let marker = marker_pa as *const usize;
+    let expect = 0xC0DE_0000 | args.len();
+    guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(marker) };
+        if v == expect {
+            break;
+        }
+        assert!(
+            guard < 500_000,
+            "m33t1: client never completed memory roundtrip (value={v:#x}, expect={expect:#x})"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 7) 负面用例(服务仍注册、服务存活;内核侧直调)。
+    mem_negative_cases(server_pid);
+    // 8) 清理:kill_process 收 mem_server(阻塞线程 + pending recv + 4 池页
+    //    一并回收),destroy 收 client(线程已 sys_exit;槽 3 已清)。drain_reaper
+    //    后断言页不泄漏 —— 池 4 页全回 buddy,无 double-free。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    let free_before = crate::mem::free_page_count();
+    let _in_server = crate::sched::kill_process(server_pid);
+    crate::process::destroy(client_pid);
+    crate::sched::drain_reaper();
+    let free_after = crate::mem::free_page_count();
+    assert!(
+        free_after >= free_before,
+        "m33t1: memory pool not reclaimed (free {free_after} < {free_before})"
+    );
+    info!("M3-3 T1: memory service ok");
+}
+
+/// M3-3 T1 负面用例(mem_server 存活时内核侧直调;mem_grant/mem_map/
+/// cap_dup/cap_revoke 语义 + destroy 钩子回收)。
+fn mem_negative_cases(server_pid: usize) {
+    // 1) 服务注册重复 → -EEXIST。
+    assert_eq!(
+        crate::process::register_service(server_pid, crate::services::SERVICE_MEMORY),
+        Err(crate::syscall::SYS_ERR_EEXIST),
+        "m33n: duplicate memory service_register must be -EEXIST"
+    );
+    // 2) 建临时进程 tmp:授一页 + 注入 Cap::Proc(peer)(模拟 connect 后状态,
+    //    供 mem_grant 定对端)。
+    let tmp_pid = crate::process::create().expect("m33n: create tmp process");
+    let peer_pid = crate::process::create().expect("m33n: create peer process");
+    let page_id = crate::pages::alloc(tmp_pid).expect("m33n: alloc page for tmp");
+    crate::process::grant_typed_cap(tmp_pid, 1, crate::process::Cap::Page(page_id))
+        .expect("m33n: grant page to tmp");
+    crate::process::grant_typed_cap(tmp_pid, 3, crate::process::Cap::Proc(peer_pid))
+        .expect("m33n: inject proc cap to tmp");
+    // 3) mem_map 负面:
+    //    - 未对齐 va → -EINVAL(前置校验,先于槽检查)。
+    assert_eq!(
+        crate::pages::mem_map(tmp_pid, 1, MEM_VA + 1),
+        Err(crate::syscall::SYS_ERR_EINVAL),
+        "m33n: unaligned mem_map va must be -EINVAL"
+    );
+    //    - va ≥ USER_VA_LIMIT → -EINVAL。
+    assert_eq!(
+        crate::pages::mem_map(tmp_pid, 1, crate::mmu::USER_VA_LIMIT),
+        Err(crate::syscall::SYS_ERR_EINVAL),
+        "m33n: mem_map va beyond user limit must be -EINVAL"
+    );
+    //    - 空槽 → -EACCES(NotFound)。
+    assert_eq!(
+        crate::pages::mem_map(tmp_pid, 0, MEM_VA),
+        Err(crate::syscall::SYS_ERR_EACCES),
+        "m33n: mem_map empty slot must be -EACCES"
+    );
+    //    - 槽持非 Page(Cap::Proc)→ -EINVAL(WrongType)。
+    assert_eq!(
+        crate::pages::mem_map(tmp_pid, 3, MEM_VA),
+        Err(crate::syscall::SYS_ERR_EINVAL),
+        "m33n: mem_map non-Page slot must be -EINVAL"
+    );
+    //    - 成功映射 → Ok;二次映射(同页任何 VA)→ -EEXIST(单映射不变量)。
+    assert_eq!(
+        crate::pages::mem_map(tmp_pid, 1, MEM_VA),
+        Ok(()),
+        "m33n: mem_map must succeed once"
+    );
+    assert_eq!(
+        crate::pages::mem_map(tmp_pid, 1, MEM_VA + 0x1000),
+        Err(crate::syscall::SYS_ERR_EEXIST),
+        "m33n: second mem_map must be -EEXIST"
+    );
+    // 4) cap_dup 禁页 → WrongType(-EINVAL;单引用不变量)。
+    assert_eq!(
+        crate::process::cap_duplicate(tmp_pid, 1, 2),
+        Err(crate::process::CapError::WrongType),
+        "m33n: cap_duplicate of Cap::Page must be -EINVAL"
+    );
+    // 5) mem_grant 负面(占 peer 槽 4 防 dst 可写)。
+    crate::process::grant_typed_cap(peer_pid, 4, crate::process::Cap::Proc(server_pid))
+        .expect("m33n: occupy peer dst slot");
+    //    - src 空槽 → -EACCES(NotFound,先过 src 再查 peer)。
+    assert_eq!(
+        crate::pages::mem_grant(tmp_pid, 0, 3, 4),
+        Err(crate::syscall::SYS_ERR_EACCES),
+        "m33n: mem_grant empty src must be -EACCES"
+    );
+    //    - peer 空槽 → -EACCES。
+    assert_eq!(
+        crate::pages::mem_grant(tmp_pid, 1, 0, 4),
+        Err(crate::syscall::SYS_ERR_EACCES),
+        "m33n: mem_grant empty peer must be -EACCES"
+    );
+    //    - dst 越界 → -EINVAL。
+    assert_eq!(
+        crate::pages::mem_grant(tmp_pid, 1, 3, crate::process::MAX_CAPS),
+        Err(crate::syscall::SYS_ERR_EINVAL),
+        "m33n: mem_grant dst out of bounds must be -EINVAL"
+    );
+    //    - dst 槽被占 → -EEXIST(防静默丢 cap)。
+    assert_eq!(
+        crate::pages::mem_grant(tmp_pid, 1, 3, 4),
+        Err(crate::syscall::SYS_ERR_EEXIST),
+        "m33n: mem_grant occupied dst must be -EEXIST"
+    );
+    // 6) cap_revoke 释放页(含解除映射):页计数复原。
+    let free_before = crate::mem::free_page_count();
+    assert_eq!(
+        crate::process::cap_revoke(tmp_pid, 1),
+        Ok(()),
+        "m33n: cap_revoke of Cap::Page must succeed"
+    );
+    let free_after = crate::mem::free_page_count();
+    assert!(
+        free_after > free_before,
+        "m33n: cap_revoke did not free page (free {free_after} <= {free_before})"
+    );
+    // 7) destroy 钩子回收:授页给临时进程 → destroy → 页计数复原
+    //    (revoke-before-destroy_root,防 double-free 纪律,同 Cap::Shm)。
+    let tmp2_pid = crate::process::create().expect("m33n: create tmp2 process");
+    let pid2_page = crate::pages::alloc(tmp2_pid).expect("m33n: alloc page for tmp2");
+    crate::process::grant_typed_cap(tmp2_pid, 1, crate::process::Cap::Page(pid2_page))
+        .expect("m33n: grant page to tmp2");
+    let free_before2 = crate::mem::free_page_count();
+    crate::process::destroy(tmp2_pid);
+    crate::sched::drain_reaper();
+    let free_after2 = crate::mem::free_page_count();
+    assert!(
+        free_after2 > free_before2,
+        "m33n: destroy hook did not free page (free {free_after2} <= {free_before2})"
+    );
+    // 8) 清理 tmp/peer(proc cap 无资源,仅清槽)。
+    crate::process::destroy(tmp_pid);
+    crate::process::destroy(peer_pid);
 }
 
 /// 构造最小合法 ELF64(1 个 PT_LOAD),供负面用例逐字段破坏。
@@ -1631,4 +1869,100 @@ pub fn smp_uart_ipc_test() {
     crate::process::destroy(client_pid);
     crate::sched::drain_reaper();
     info!("M3-2 T2: cross-core IPC ok ({n} harts)");
+}
+
+/// M3-3 T2:跨核 mem_server 服务 IPC 冒烟(irq_enable 后、smp_uart_ipc_test
+/// 之后调用)。**D6 跨核 IPI + Cap::Page 移交实测**。
+///
+/// mem_server 亲和**副核 A**(页池注入 + register 后阻塞 accept-any recv),
+/// mem_client 亲和**副核 B**(A ≠ B):client 的 ALLOC send 经 D6 IPI 唤醒副核
+/// A 阻塞中的 mem_server → mem_grant 跨核移交 Cap::Page → 回复经 D6 IPI 唤醒
+/// 副核 B 阻塞中的 client → mem_map 写/读回校验 → FREE 归还 mem_grant 回副核
+/// A → marker 完成。双向跨核即时配对(非定时器轮询)。
+///
+/// 核选择:同 smp_uart_ipc_test(n≥3 用副核 1/2;n==2 用副核 1 + boot 核 0;
+/// n==1 同一核退化,协作式 + 抢占均验证)。
+/// banner:`M3-3 T2: cross-core mem IPC ok (N harts)`(6 处 grep 同步)。
+pub fn smp_memory_ipc_test() {
+    let n = crate::board::cpu_count().min(crate::arch::MAX_HARTS);
+    let (server_hart, client_hart) = if n >= 3 {
+        (1, 2)
+    } else if n == 2 {
+        (1, 0)
+    } else {
+        (0, 0)
+    };
+    // 1) mem_server 进程(亲和 server_hart)。
+    let server_pid = crate::process::create().expect("m33t2: create memory_server process");
+    let loaded = crate::elf::load(server_pid, crate::elf::MEMORY_SERVER_ELF, &[])
+        .expect("m33t2: load server");
+    let server_tid = crate::sched::spawn_user_args(
+        server_pid,
+        loaded.entry,
+        loaded.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded.argc,
+        loaded.argv,
+    );
+    crate::sched::set_affinity(server_tid, server_hart);
+    // 2) 注入页池(同 T1;跨核下发 Cap::Page 需服务端已就绪)。
+    for slot in SERVER_POOL_START..=SERVER_POOL_END {
+        let id = crate::pages::alloc(server_pid).expect("m33t2: pool alloc");
+        crate::process::grant_typed_cap(server_pid, slot, crate::process::Cap::Page(id))
+            .expect("m33t2: pool grant");
+    }
+    // 3) 等 mem_server 阻塞 accept-any recv(已注册;防 client 先跑连不上
+    //    服务 —— 确定性建立"服务端就绪"后再 spawn 客户端)。
+    let mut guard = 0;
+    while !crate::sched::is_blocked(server_tid) {
+        assert!(
+            guard < 500_000,
+            "m33t2: memory_server never blocked on accept"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 4) mem_client 进程(亲和 client_hart):marker 页 + 加载 + spawn。
+    let client_pid = crate::process::create().expect("m33t2: create client process");
+    let client_root = crate::process::root(client_pid);
+    let marker_pa = crate::mem::alloc_pages_zeroed(0).expect("m33t2: marker page");
+    assert!(
+        crate::mmu::map_user_page(client_root, ELF_MARKER_VA, marker_pa, 0xC7).is_ok(),
+        "m33t2: map client marker page"
+    );
+    let args: [&[u8]; 1] = [b"mem_client"];
+    let loaded_client = crate::elf::load(client_pid, crate::elf::MEM_CLIENT_ELF, &args)
+        .expect("m33t2: load client");
+    let client_tid = crate::sched::spawn_user_args(
+        client_pid,
+        loaded_client.entry,
+        loaded_client.stack_top,
+        crate::sched::PRIO_HIGH,
+        loaded_client.argc,
+        loaded_client.argv,
+    );
+    crate::sched::set_affinity(client_tid, client_hart);
+    // 5) 轮询 client marker(跨核双向 IPC + Cap::Page 移交完成的证明)。
+    let marker = marker_pa as *const usize;
+    let expect = 0xC0DE_0000 | args.len();
+    guard = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(marker) };
+        if v == expect {
+            break;
+        }
+        assert!(
+            guard < 1_000_000,
+            "m33t2: cross-core client never completed memory roundtrip (value={v:#x})"
+        );
+        crate::sched::yield_();
+        guard += 1;
+    }
+    // 6) 清理:kill_process 收阻塞服务端线程(含 4 池页),destroy 收客户端
+    //    (线程已 sys_exit);同 T1 的页回收语义。
+    crate::mmu::switch_root(crate::mmu::kernel_root());
+    let _in_server = crate::sched::kill_process(server_pid);
+    crate::process::destroy(client_pid);
+    crate::sched::drain_reaper();
+    info!("M3-3 T2: cross-core mem IPC ok ({n} harts)");
 }
