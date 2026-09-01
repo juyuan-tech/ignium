@@ -4,17 +4,19 @@
 > 本文为 M3 设计基线,先文档后代码(遵循 DESIGN.md「先读透 seL4/rCore,
 > 前 3 个月重文档轻代码」)。**M3-1(已落地,2026-09-01)**:ELF 加载器 +
 > 内核 `sys_write` 过渡占位 + 跨核 IPI 停核/Running 线程回收 + 跨核 TLB
-> shootdown + 内核线程栈守护页。**M3-2(本轮)**:uart_server 服务化(见 §10)
-> —— 设备页授予 + 内核服务注册表 + 移除 sys_write 占位 + sys_read 落地 +
-> 跨核 IPC 实测。M3-3 及以后:内存服务 Cap::Page、ramfs、virtio-blk、
-> spawn/init/shell、musl/busybox(L2)、服务崩溃恢复。
+> shootdown + 内核线程栈守护页。**M3-2(已落地,2026-09-01)**:uart_server
+> 服务化(见 §10)—— 设备页授予 + 内核服务注册表 + 移除 sys_write 占位 +
+> sys_read 落地 + 跨核 IPC 实测。**M3-3(本轮)**:内存服务 Cap::Page(见 §11)
+> —— 页能力 + 页注册表 + mem_server 服务 + 申请/释放 IPC(纯服务授权)。
+> M3-3 及以后:ramfs、virtio-blk、spawn/init/shell、musl/busybox(L2)、
+> 服务崩溃恢复。
 
 ## 1. 目标与验收(对齐 ROADMAP 阶段 3)
 
 | 任务 | 验收 | 处置 |
 |---|---|---|
 | uart_server 进程独占 UART,打印走 IPC | 内核不再直碰 UART | **已落地(M3-2,§10)**:uart_server 独占 UART(设备页授予 U 映射),内核 `sys_write` 占位已删除;打印/读取走 IPC |
-| 内存服务:cap 发页 + IPC 申请/释放 | 用户进程可申请页 | 延后 M3-3(M3-2 定案:聚焦 uart_server;`Cap::Page` 单独一轮) |
+| 内存服务:cap 发页 + IPC 申请/释放 | 用户进程可申请页 | **本轮(M3-3,§11)**:纯服务授权,mem_server 唯一发页入口 |
 | ramfs 文件系统服务(open/read/write/close) | IPC 客户端可读写删文件 | 延后 M3-3 |
 | virtio-blk 驱动服务 + 持久文件系统 | 重启数据仍在 | 延后 M3-3 |
 | spawn 服务化 + init 进程 + shell | shell 跑通 echo/cat 重定向 | 延后 M3-3(M3-2 只落地**内核服务注册表** §10 D2) |
@@ -43,7 +45,7 @@
 | compat-baseline(对齐 LiteOS-A 的 POSIX 子集清单) | 延后 M3-2 | 等 uart_server/ramfs 服务定案后一起写,避免边写边改 |
 | M3-DESIGN(本文) | **本轮新建** | 设计基线 |
 | 服务注册机制(spawn 服务化) | **M3-2 落地(§10 D2)** | 内核服务注册表:`service_register`(号 10)+ `service_connect`(号 11)双向授予;spawn 服务化本身延后 M3-3 |
-| `Cap::Page` 发页能力 | 设计延后 M3-3 | M3-2 只落地设备页授予(`map_device` 号 12,MMIO 白名单),内存发页单独一轮 |
+| `Cap::Page` 发页能力 | **M3-3 落地(§11)** | 页能力 + 页注册表;纯服务授权(仅 mem_server 发页,无公开分配 syscall);新增号 13/14 |
 | spawn/init/shell 设计 | 延后 M3-3 | M3-2 落地内核服务注册表后,spawn 服务化顺理成章 |
 | uart_server 过渡方案 | **已落地(M3-2)** | M3-1 内核 `sys_write(fd=1)` → UART 过渡占位已删除,uart_server 独占 UART(§10) |
 | SCHED 锁缩放 / D1 / slab 水位 | **本轮评估后延后** | 评估结论见 §7,移入 DEFERRED.md |
@@ -138,6 +140,8 @@ M2-DESIGN §7 仅提纲,本轮固化:**解析 + 校验 + 映射 + 用户栈 + ar
 | **`service_register`** | **10(新增)** | a0=服务 id | 成功 0 / -EINVAL / **-EEXIST** |
 | **`service_connect`** | **11(新增)** | a0=id, a1=client 槽, a2=server 槽 | 成功 0 / -EINVAL / -ENOENT / -EACCES |
 | **`map_device`** | **12(新增)** | a0=dev_id, a1=va | 成功 0 / -EINVAL / **-EEXIST** |
+| **`mem_grant`** | **13(新增)** | a0=源槽, a1=peer 槽, a2=对端目标槽 | 成功 0 / -EINVAL / -EACCES / -EEXIST |
+| **`mem_map`** | **14(新增)** | a0=槽, a1=va | 成功 0 / -EINVAL / -EACCES / -EEXIST |
 
 **M3-1 的 `sys_write` 语义(历史记录,已删除)**:fd=1 → `uart::write_bytes(buf)`;
 fd≠1 → `-EBADF`;逐页校验 buf(限 U 位);`len > 4096` → `-EINVAL`;拷贝置
@@ -365,11 +369,153 @@ sbi::send_ipi(1 << tgt, 0)`(仿 `wake()`,失败仅 warn 一次,降级 ≤1 tick)
 - 锁内发 IPI:仿 wake() 同款(目标核 SSIP handler 自旋等 SCHED 锁),已证安全。
 - destroy_root 跳过非分配器 U 页:当前唯一来源是 map_device_page(白名单),安全。
 
+## 11. M3-3:内存服务(Cap::Page,纯服务授权)—— 本轮
+
+M3-2 已交付 uart_server 服务化(打印/读取走 IPC)。阶段 3 的第二个服务 = **内存服务**:
+把物理页所有权能力化为 `Cap::Page`,并让用户态 **mem_server** 成为发页的唯一入口
+(纯服务授权,用户拍板):内核**不暴露**通用分配 syscall(避免 ambient 授权),客户端
+只能经 mem_server 的 IPC 申请/释放页;mem_server 创建后由引导编排(当前即测试)
+注入页池;客户端归还页经反向 `mem_grant` 送回服务,池可复用。最贴合
+「一切皆能力」,与 M3-2 纯服务化一脉相承。
+
+### 11.1 现状约束(设计前提)
+
+- **无跨进程 cap 转移原语**:现有跨进程授槽仅 shm::mmap_share(Cap::Shm 双槽)与
+  services::connect(Cap::Proc 双向),均属内核按白名单/服务表写对端槽。`Cap::Page`
+  需要新的**受控移交**接口(mem_grant,号 13)。
+- **发页内存安全约束**:`mmu::map_user_page` 强制 `page_in_range`(只映射 buddy 区)
+  + 拒覆盖;授予页必须来自 `mem::alloc_pages`。`mmu::destroy_root` 对分配器 U 叶子
+  会 `free_pages` → `Cap::Page` 必须在 `process::destroy` **revoke-before-
+  destroy_root**(与 Cap::Shm 同纪律),否则同页 double-free。
+- **类型分支非穷尽**:`ipc::send/recv` 对 `cap_target` 的 match 加 `Cap::Page` 后由
+  编译器强制补 `WrongType`;`cap_duplicate` 当前泛型复制任意 Cap → 页须禁复制
+  (单引用不变量)。
+- **无公开分配 syscall(设计选择)**:发页只经 mem_server 的 IPC;内核 `pages::alloc`
+  仅由引导编排(测试 T1/T2)在 spawn 后注入池。
+
+### 11.2 `Cap::Page` + 页注册表(`kernel/src/pages.rs`)
+
+- `Cap::Page(usize)`:1 cap = 1 个物理页(4KB),**单引用**(禁 dup)。`Cap` 枚举加变体。
+- `PageRegistry { pages: Vec<PageRecord>, free: VecDeque<usize> }`,`MAX_PAGES=64`,
+  `static PAGES: SpinLock`,`init()` 在 boot 期 `reserve(MAX_PAGES)`(仿 shm.rs)。
+- `PageRecord { id, paddr, owner: pid, map_va: Option<usize> }`(id = 槽索引;revoke 后
+  `paddr=0` 防陈旧,仿 SharedPage)。`owner` = 当前持有者(防御性不变量);`map_va` =
+  单映射 VA(revoke 时定位 unmap)。
+- 函数:`alloc(owner) -> Result<usize, usize>`(`alloc_pages(0)`,表满 → -ENOMEM +
+  回滚 free_pages)、`revoke(id) -> Result<(), ()>`(free_pages + 失效 + 入 free 池)、
+  `grant(id, to_pid)`(owner 移交)、`map(id, pid, va)`(map_va 置位,已映射 → -EEXIST)、
+  `unmap(id, pid, va)`(map_va 清除)。
+- 锁序:`TABLE → PAGES`(destroy 持 TABLE 取 PAGES,同 `TABLE → SHM`,不逆序)。
+
+### 11.3 纯服务授权:页池由引导编排注入
+
+- **无 `mem_alloc` syscall**。内核侧 `pages::alloc` 仅由引导编排(当前 = 测试 T1/T2)
+  在 mem_server spawn 后经 `grant_typed_cap` 注入其 cap 表(池 = 槽 1..=4,4 页)。
+- 正式 spawn/init 服务落地后改为引导期自动授予(登记 D33)。
+
+### 11.4 `mem_grant`(号 13):受控跨进程页移交
+
+- 签名:`mem_grant(a0=src_slot, a1=peer_slot, a2=dst_slot)`。
+- 语义:**move** Cap::Page(调用方 src_slot → peer 的 dst_slot);清调用方 src_slot
+  (单引用,防双持)。
+- 门禁:调用方 src_slot 持 `Cap::Page(id)`(否则 -EACCES);peer_slot 持 `Cap::Proc(peer)`
+  (否则 -EACCES)——**只能移交给已连接(持 Cap::Proc)的进程**,无 ambient 移交;页
+  未映射(map_va None,否则 -EINVAL);dst_slot 空(否则 -EEXIST,防静默丢 cap);
+  peer 存活。成功:`grant_typed_cap(peer, dst_slot, Cap::Page(id))` +
+  `clear_cap(caller, src_slot)` + `PageRecord.owner = peer_pid`。
+- 安全:接收方同意 = 其经 IPC 请求里声明的 dst_slot;发送方经 Cap::Proc 绑定对端。
+
+### 11.5 `mem_map`(号 14)+ cap_revoke 兼任释放 + cap_dup 禁页
+
+- `mem_map(a0=slot, a1=va)`:槽持 `Cap::Page(id)`;va 页对齐、`va < USER_VA_LIMIT`、
+  未映射(map_va None,否则 -EEXIST);`mmu::map_user_page(root, va, page_paddr, 0xC7)`
+  (U RW + 单地址 sfence;page_in_range 天然满足 → 分配器页);`pages::map` 记 map_va。
+- **释放 = cap_revoke(号 6)扩展**:`Cap::Page(id)` → 若 map_va Some 先 `unmap_4k` →
+  `pages::revoke`(free_pages + clear_cap)。unmap-without-free / remap 延后(D34)。
+- **cap_duplicate(号 7)禁页**:复制 `Cap::Page` → -EINVAL(单引用不变量;Proc/Shm
+  不受影响)。
+
+### 11.6 process::destroy 钩子 + ipc 类型分支
+
+- destroy 步骤 1(TABLE 锁内)收集本进程全部 `Cap::Page(id)`,锁外逐个 `pages::revoke`
+  (unmap+free+清槽)**在 destroy_root 之前**(同 Cap::Shm 纪律,防 double-free)。
+- `cap_revoke` 分派 match 加 `Cap::Page` 分支;`ipc::send/recv` 的 `cap_target` match
+  加 `Ok(Cap::Page(_)) => WrongType`(编译器强制)。
+
+### 11.7 memory_server 用户态服务 + 归还协议
+
+- user 常量(lib.rs):`SERVICE_MEMORY=2`、`MEM_VA=0x7000_0000`(避开 ELF 0x4000_0000 /
+  SHM 0x5000_0000 / UART 0x6000_0000)、`OP_ALLOC=0x04`、`OP_FREE=0x05`、
+  `OP_REPLY_FLAG=0x80`、`CLIENT_PAGE_SLOT=3`(client 收页槽)、`SERVER_POOL_SLOTS=1..=4`。
+- **memory_server**(bin):`sys_service_register(SERVICE_MEMORY)` → 循环 `ipc_recv(槽 0)`
+  → 按 op:
+  - `OP_ALLOC`[client_dst_slot]:选池内可用槽 i(持 Cap::Page)→ `mem_grant(i, peer=0,
+    client_dst_slot)` → 池位空 → reply `[OK]`;无可用页 → `[-ENOMEM]`。
+  - `OP_FREE`[client_page_slot]:选一个空池槽 r → reply `[OK, recv_slot=r]`;客户端随后
+    `mem_grant(client_page_slot, peer=2, r)` 归还,池位回填(乐观置位,崩溃边缘 D35)。
+  - 其它 op → `[PROTO_ERR]`。
+- **mem_client**(bin):`service_connect(MEMORY_SERVICE_ID, CLIENT_IPC_SLOT=2,
+  SERVER_ACCEPT_SLOT=0)` → send `[OP_ALLOC, 3]` → recv `[OK]` → `mem_map(3, MEM_VA)`
+  → 写/读回校验 → send `[OP_FREE, 3]` → recv `[OK, recv_slot]` →
+  `mem_grant(3, peer=2, recv_slot)` 归还 → 写 marker `0xC0DE_0000|argc`(置于 END,
+  复用 ELF_MARKER_VA 0x4000_2000)→ `sys_exit`。
+
+### 11.8 消息协议(5 字 IPC)
+
+```
+请求 = [op, arg1, 0, 0, 0]   op 0x04 ALLOC:arg1=client_dst_slot(收页槽)
+                             op 0x05 FREE :arg1=client_page_slot(归还页槽)
+回复 = [op|0x80, status, len, 0, 0]   status=0 成功 / 负 errno
+      ALLOC 成功 → [0x84, 0, 0];FREE 成功 → [0x85, 0, recv_slot]
+```
+
+### 11.9 测试与 banner
+
+- **T1(单核,boot_tests,协作式)** `boot_memory_service_test()`:spawn mem_server(ELF)→
+  **注入页池**(`pages::alloc`×4 + `grant_typed_cap` 槽 1..=4)→ yield_ 至 accept-any
+  recv 阻塞 → 断言 `services::lookup(SERVICE_MEMORY)` → spawn mem_client(marker 页)→
+  轮询 marker(申请→映射→读写→归还完整往返)→ 负面用例 → 清理(kill_process server +
+  destroy client + drain_reaper)+ `free_page_count` 复原(池 4 页 + 归还页全部回 buddy,
+  无泄漏/无 double-free)。banner `M3-3 T1: memory service ok`。
+- **T2(smp 阶段)** `smp_memory_ipc_test()`:mem_server 亲和副核 A、client 亲和副核 B,
+  完整往返(D6 IPI 跨核唤醒);单核退化仍打 banner `M3-3 T2: cross-core mem IPC ok (N harts)`。
+- 负面用例(内核直调):mem_grant 空 src_slot → -EACCES / 空 peer_slot → -EACCES /
+  dst 槽占用 → -EEXIST / 页已映射 → -EINVAL;mem_map 空槽 → -EACCES / 未对齐 va →
+  -EINVAL / va≥USER_VA_LIMIT → -EINVAL / 二次映射 → -EEXIST;cap_duplicate(页) →
+  -EINVAL;cap_revoke 释放后页计数复原;destroy 钩子回收:页授给临时进程→destroy→页计数
+  复原;register 重复 → -EEXIST。
+- **新 banner 同步 6 处 grep**(AGENTS.md 纪律):Makefile test/smp/rva23 + ci.yml
+  build/smp/rva23。
+
+### 11.10 提交切分(每提交过五门禁 + 6 grep 一致)
+
+1. `docs: M3-3 设计`(本节 + SYSCALLS 登记 13/14 + DEFERRED D33-35);
+2. `feat: Cap::Page + 页注册表`(pages.rs + 变体 + destroy 钩子 + revoke/dup/ipc 分支);
+3. `feat: mem_grant/mem_map(号 13/14)`(受控移交 + 映射);
+4. `feat: memory_server 用户态服务`(memory_server + mem_client + build.rs 多 ELF +
+   elf.rs 两 const + user lib helper + SERVICE_MEMORY);
+5. `feat: M3-3 测试 + banner`(T1/T2 + 两 banner + 6 grep);
+6. `docs: M3-3 收官`(报告 + ROADMAP 勾选)。
+
+### 11.11 风险与遗留(登记 DEFERRED D33-35)
+
+- **D33** 页池注入依赖引导编排(spawn 服务落地后改为引导期自动授予)。
+- **D34** 页无 unmap-without-free / remap(revoke=释放;重定位需重分配)。
+- **D35** OP_FREE 归还乐观置位:客户端归还前崩溃 → 池位空但服务误判可用
+  (mem_grant 失败可优雅降级;服务崩溃恢复里程碑统一处理)。
+- 页单引用(禁 dup):多引用/共享私有页延后(共享用 shm)。
+- MAX_PAGES=64 / 服务池 4 页的有界配额。
+- destroy 持 TABLE→PAGES 锁序,不破坏 TABLE→SERVICES→DEVICES→IPC→SCHED。
+
 ## 关联登记
 
 - DEFERRED:M1(ELF 延至 M3)→ M3-1 落地;跨核 Running 线程回收/D20 内核栈
   守护页 → M3-1 落地;SCHED 缩放 / D1 / slab → 评估后延后(§7 移入)。
   M3-2 遗留(服务端 client 消亡恢复/并发 client/设备页特权与 revoke/uart_server
   崩溃看门狗)→ 登记 DEFERRED 待办(M3-3+ 触发)。
-- docs/DESIGN.md 已知限制(§):跨核 shootdown/内核栈守护页 → M3-1 消项。
-- ROADMAP.md 阶段 3:ELF 加载器 M3-1 勾选;uart_server 服务化 M3-2 勾选(本轮)。
+  M3-3 遗留(页池注入依赖引导编排/页无 unmap-without-free/归还乐观置位)→
+  登记 DEFERRED 待办(D33-35,§11.11)。
+- docs/DESIGN.md 已知限制(§):跨核 shootdown/内核栈守护页 → M3-1 消项;
+  「物理页发配」能力化 → M3-3 落地(`Cap::Page`)。
+- ROADMAP.md 阶段 3:ELF 加载器 M3-1 勾选;uart_server 服务化 M3-2 勾选;
+  内存服务 M3-3 勾选(本轮)。

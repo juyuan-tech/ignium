@@ -23,6 +23,9 @@
 | D30 | 多并发 client 支持:accept 单槽 + SHM_VA 单页映射限制为 1 并发 client | M3-2 设计(§10.11) | M3-3(ramfs/init-shell 多进程交互) | 待办:需多 SHM VA + 服务端槽池;M3-2 明确面向单 client |
 | D31 | 设备页能力化:`Cap::Dev` + 手动 revoke + 特权授予(map_device 当前无特权校验,任何进程可 claim UART,靠引导序保证;设备页生命周期随进程不可单独 revoke) | M3-2 设计(§10.11) | M3-3(设备驱动服务化) | 待办:M3-2 靠「uart_server 先 spawn 先 claim」引导序保证;设备页非分配器,`destroy_root` 只 unmap 不 free |
 | D32 | uart_server 崩溃即 UART 卡死(无看门狗/服务重启) | M3-2 设计(§10.11) | M3-3+(服务崩溃恢复) | 待办:本轮无看门狗;崩溃恢复里程碑统一设计 |
+| D33 | 页池注入依赖引导编排:mem_server 页池由测试(T1/T2)在 spawn 后经内核侧 `pages::alloc` + `grant_typed_cap` 注入;正式 spawn/init 服务落地前无「引导期自动授予」通道 | M3-3 设计(§11.3) | spawn 服务化落地 | 待办:纯服务授权设计使然(无公开分配 syscall);spawn 服务落地后改为引导期授予 |
+| D34 | 页无 unmap-without-free / remap:`cap_revoke`(号 6)对 Cap::Page 语义即「释放」(先 unmap 再 free_pages);页重定位需先 revoke 再重分配 | M3-3 设计(§11.5) | 需要页重定位/内存整理 | 待办:内存整理(compact)里程碑统一设计 |
+| D35 | OP_FREE 归还乐观置位:memory_server 回填池位前假定客户端必归还;客户端在归还 mem_grant 前崩溃 → 池位空但服务误判可用(mem_grant 失败可优雅降级 -EACCES) | M3-3 设计(§11.7) | 服务崩溃恢复里程碑 | 待办:客户端消亡检测 + 池位重扫 |
 
 ## 已实现(落地)
 

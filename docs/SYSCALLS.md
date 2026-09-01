@@ -14,7 +14,7 @@ a0-a5  = 参数(按各调用定义)
 错误   : 负 errno,编码为 usize::MAX 附近(见 §错误码)
 ```
 
-## 系统调用表(现有 1-7 + M3 系列 8-12)
+## 系统调用表(现有 1-7 + M3 系列 8-14)
 
 | 号 | 名称 | 入参 | 返回 | 状态 |
 |---|---|---|---|---|
@@ -30,6 +30,8 @@ a0-a5  = 参数(按各调用定义)
 | 10 | `service_register` | a0 = 服务 id | 成功 a0=0;失败负 errno | **M3-2 新增** |
 | 11 | `service_connect` | a0 = id, a1 = client 槽, a2 = server 槽 | 成功 a0=0;失败负 errno | **M3-2 新增** |
 | 12 | `map_device` | a0 = dev_id, a1 = va | 成功 a0=0;失败负 errno | **M3-2 新增** |
+| 13 | `mem_grant` | a0 = 源槽, a1 = peer 槽, a2 = 对端目标槽 | 成功 a0=0;失败负 errno | **M3-3 新增** |
+| 14 | `mem_map` | a0 = 槽, a1 = va | 成功 a0=0;失败负 errno | **M3-3 新增** |
 
 ## 错误码(负 errno 的 usize 编码)
 
@@ -79,6 +81,29 @@ a0-a5  = 参数(按各调用定义)
 - 把白名单设备 MMIO 页以 U 位映射进调用进程根表(排他 claim,生命周期随进程)。
   dev_id 未知 → `-EINVAL`;va 非法/被占 → `-EINVAL`;设备已 claim → `-EEXIST`;
   成功 a0=0。uart_server 用 `map_device(0, 0x6000_0000)` 独占 UART。
+
+## mem_grant 语义(号 13,M3-3 新增)
+
+- a0 = 源槽(调用方持 `Cap::Page`), a1 = peer 槽(调用方持 `Cap::Proc(peer)`),
+  a2 = 对端目标槽。
+- **move** Cap::Page:调用方 src_slot → peer 的 dst_slot,并清调用方 src_slot
+  (单引用,防双持)。src_slot 空/非 Page → `-EACCES`;peer_slot 空/非 Proc → `-EACCES`;
+  页已映射 → `-EINVAL`;dst_slot 非空 → `-EEXIST`;peer 已亡 → `-EINVAL`;成功 a0=0。
+- 只允许移交给已连接(持 Cap::Proc)的进程,无 ambient 移交。见 M3-DESIGN §11.4。
+
+## mem_map 语义(号 14,M3-3 新增)
+
+- a0 = 槽(调用方持 `Cap::Page`), a1 = va(页对齐,< USER_VA_LIMIT)。
+- 把页以 U RW(0xC7)映射进调用进程根表并记 map_va。槽空/非 Page → `-EACCES`;
+  va 未对齐或 ≥ USER_VA_LIMIT → `-EINVAL`;页已映射 → `-EEXIST`;成功 a0=0。
+- 释放 = `cap_revoke`(号 6)扩展(先 unmap 再 free)。见 M3-DESIGN §11.5。
+
+## mem 服务消息协议(用户态,5 字 IPC)
+
+请求 `[op, arg1, 0, 0, 0]`:op 0x04 ALLOC(arg1=client_dst_slot,收页槽)/ 0x05 FREE
+(arg1=client_page_slot,归还页槽)。回复 `[op|0x80, status, recv_slot, 0, 0]`
+(ALLOC 成功 recv_slot=0;FREE 成功 recv_slot = 服务端归还接收槽)。详见
+M3-DESIGN §11.8。
 
 ## uart 服务消息协议(用户态,SHM_VA + 5 字 IPC)
 
