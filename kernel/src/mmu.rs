@@ -558,6 +558,85 @@ pub fn unmap_4k(root: usize, vaddr: usize) -> Result<(), ()> {
     Ok(())
 }
 
+/// 把 2MB 超页叶子拆成 512 个 4KB 叶子(幂等)。
+///
+/// M3 T3 守护页:内核 RAM 区以 2MB 超页映射(`map_kernel_region` 步骤 4),
+/// 而内核线程栈的守护页须**精确解映射单页** —— 超页叶子没有 L0 表,
+/// 不能只清一页;先拆超页再操作单页。
+///
+/// 拆分后 512 个叶子继承超页权限(除 PPN 外整条目保留,含 V/R/W/X/U/
+/// A/D/RSW),该 2MB 区域失去超页 TLB 效率 —— 换取栈溢出 fail-loudly
+/// (守护页数量有限,最多 ~3 个超页被拆,可接受)。
+///
+/// 幂等:若 L1 条目已是表指针(此前已拆),直接 Ok 不重复拆(重复拆会把
+/// 表指针当超页叶子,清掉 PPN 写回即毁表);若 L1 条目为空 → Err(未映射)。
+///
+/// 只操作 `root` 一张根表;每进程根表的内核区复制(`map_kernel_region`)
+/// 各自独立,拆分**不传播** —— 带 proc 内核线程的守护页为残余局限(内核
+/// 线程均 proc=None 运行于内核根表,守卫生效;见 docs/DESIGN.md 遗留项)。
+fn split_superpage(root: usize, vaddr: usize) -> Result<(), ()> {
+    let l2 = (vaddr >> 30) & 0x1FF;
+    let l1 = (vaddr >> 21) & 0x1FF;
+    let root_t = root as *const u64;
+    let l1_t = unsafe { ensure_table(root_t, l2)? };
+    let entry = pte_read(l1_t, l1);
+    if entry & PTE_V == 0 {
+        return Err(()); // 未映射
+    }
+    if entry & (PTE_R | PTE_W | PTE_X) == 0 {
+        return Ok(()); // 已是表指针(幂等,无需再拆)
+    }
+    // 超页叶子:分配 L0 表,逐 4KB 页继承超页权限(flags 掩掉 PPN 字段)。
+    let sub = mem::alloc_pages(0).ok_or(())?;
+    // SAFETY:`sub` 为 alloc_pages 原样返回(页对齐、可写)。
+    unsafe { mem::zero_page(sub) };
+    let flags = entry & !(PTE_PPN_MASK << PTE_PPN_SHIFT);
+    let base_pa = (((entry >> PTE_PPN_SHIFT) & PTE_PPN_MASK) << 12) as usize;
+    for i in 0..512 {
+        pte_write(sub as *const u64, i, pte(base_pa + i * 4096, flags));
+    }
+    // 中间级 PTE 仅 V 位(表指针,见 ensure_table_user 注释的规范要求)。
+    pte_write(l1_t, l1, pte(sub, PTE_V));
+    Ok(())
+}
+
+/// 取消映射内核区 4KB 页(超页先拆再清,`unmap_4k` + 自动拆分)。
+///
+/// M3 T3:内核线程栈分配后解映射栈底守护页。与 `unmap_4k` 的唯一区别是
+/// 目标地址可能落在 2MB 超页叶子内(内核 RAM 区)—— 先 `split_superpage`
+/// 下沉到 L0 再清 PTE + 单地址 sfence。已是 4KB 映射区域则行为与
+/// `unmap_4k` 完全一致(拆分幂等,仅多读一条 L1 PTE)。
+pub fn unmap_kernel_4k(root: usize, vaddr: usize) -> Result<(), ()> {
+    split_superpage(root, vaddr)?;
+    unmap_4k(root, vaddr)
+}
+
+/// 映射内核区 4KB 页(超页先拆再写,`unmap_kernel_4k` 的逆操作)。
+///
+/// M3 T3:自检与 `remap_kernel_4k` 用;验证"拆分 → 解映射 → 重映射"往返。
+pub fn map_kernel_4k(root: usize, vaddr: usize, paddr: usize, flags: u64) -> Result<(), ()> {
+    split_superpage(root, vaddr)?;
+    map_4k(root, vaddr, paddr, flags)
+}
+
+/// 恢复内核区 4KB 页的 RW 身份映射(M3 T3 栈归还前调用)。
+///
+/// **身份映射不变量**:内核恒经 VA==PA 访问物理页;堆/页表页经 buddy 原样
+/// 返回给使用者,**不自行建立映射**(沿用 map_kernel_region 的既有映射)。
+/// 守护页仅在栈生命周期内解映射,释放前必须恢复 —— 否则该 PA 被重新分配
+/// 为页表页/其它对象后,首次 memset 即命中断开的身份映射 → 页故障
+/// (bring-up 实测:栈归还后 buddy 把守护 PA 复用为页表页,ensure_table
+/// 清零即 store page fault)。
+pub fn remap_kernel_4k(root: usize, vaddr: usize) -> Result<(), ()> {
+    map_kernel_4k(root, vaddr, vaddr, PTE_LEAF_RW)?;
+    // 重映射后立即可见:unmap 时的单地址 sfence 已使 TLB 无陈旧项,此处
+    // 双保险 —— 随后的 memset/复用必须命中新映射(身份映射不变量)。
+    unsafe {
+        asm!("sfence.vma {}, zero", in(reg) vaddr, options(nostack));
+    }
+    Ok(())
+}
+
 /// 冲刷 TLB(全部)。
 ///
 /// arch 层契约接口(DESIGN.md arch_mmu_*):`map_user_page`/`unmap_4k`
@@ -601,5 +680,32 @@ pub fn self_test() -> Result<(), &'static str> {
     if entry & PTE_V == 0 {
         return Err("root L2[0] not valid");
     }
+    // 5) M3 T3:split_superpage / unmap_kernel_4k / map_kernel_4k 往返。
+    //    用临时根表 + 虚拟地址 0x8000_0000 建 2MB 超页;该根表**从不启用**
+    //    (satp 不切过去),不产生 TLB 状态。伪物理地址 = 真 RAM 起始,但
+    //    叶子 U=0 → destroy_root 跳过不释放(不 double-free 真 RAM);
+    //    仅 L0 表页与根页(buddy 真实分配)被归还。
+    let t_root = mem::alloc_pages(0).ok_or("guard selftest: root alloc failed")?;
+    // SAFETY:`t_root` 为 alloc_pages 原样返回(页对齐、可写)。
+    unsafe { mem::zero_page(t_root) };
+    let t_va = 0x8000_0000usize;
+    map_super(t_root, t_va, t_va, PTE_LEAF_RW).map_err(|_| "guard selftest: map_super failed")?;
+    // 拆分(超页叶子 → 512 个 4KB 叶子)+ 幂等(再拆不报错、不毁表)。
+    split_superpage(t_root, t_va).map_err(|_| "guard selftest: split failed")?;
+    split_superpage(t_root, t_va).map_err(|_| "guard selftest: split idempotent failed")?;
+    if !is_mapped(t_root, t_va) {
+        return Err("guard selftest: split lost mapping");
+    }
+    // 解映射单页 → 不可映射(守护页语义)。
+    unmap_kernel_4k(t_root, t_va).map_err(|_| "guard selftest: unmap failed")?;
+    if is_mapped(t_root, t_va) {
+        return Err("guard selftest: unmap did not take effect");
+    }
+    // 重映射单页 → 恢复可映射(往返完整)。
+    map_kernel_4k(t_root, t_va, t_va, PTE_LEAF_RW).map_err(|_| "guard selftest: remap failed")?;
+    if !is_mapped(t_root, t_va) {
+        return Err("guard selftest: remap did not take effect");
+    }
+    destroy_root(t_root);
     Ok(())
 }

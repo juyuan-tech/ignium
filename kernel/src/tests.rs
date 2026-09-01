@@ -1126,6 +1126,14 @@ static SMP_WAKE_RAN: AtomicBool = AtomicBool::new(false);
 /// (thread_entry → exit;副核上 exit 的 pick 回退选回 idle)。
 fn smp_thread() {
     let tid = crate::sched::current_id();
+    // 主线程 `spawn → SMP_TARGET_HART.store` 之间存在可被抢占的窗口:本测试
+    // 于 `irq_enable` 之后运行,PRIO_HIGH 线程可能被定时器中断(on_tick)在
+    // 亲和槽写入前提前调度 —— 读到未初始化哨兵 `usize::MAX` 会以
+    // `SMP_SLOT_HART[usize::MAX]` 越界 panic(实测,门禁误判)。主线程写槽
+    // 恒会完成(循环内不 yield),故自旋必然终止。
+    while SMP_TARGET_HART[tid].load(Ordering::Relaxed) == usize::MAX {
+        core::hint::spin_loop();
+    }
     let target = SMP_TARGET_HART[tid].load(Ordering::Relaxed);
     let ran_on = crate::arch::hartid();
     SMP_SLOT_HART[target].store(
@@ -1353,9 +1361,14 @@ fn smp_shootdown_phase(n: usize) {
         "ccsd: shm must be deregistered"
     );
     // 4) B 线程下一次访存 SHM_VA 须页故障 → D12 杀 B(证明核 1 TLB 已刷;
-    //    未刷则读陈旧数据、永不故障 → 超时断言失败)。
+    //    未刷则读陈旧数据、永不故障 → 超时断言失败)。fault_kill_count 在
+    //    kill 路径**入口**自增(先于 process::destroy),跨核下计数只能证明
+    //    "杀进程已启动";须同时轮询 pid_root 失效,否则会撞上"计数+1 而
+    //    目标核 destroy 未结束"的窗口(实测 ccsd 误判)。
     guard = 0;
-    while crate::sched::fault_kill_count() == kill_before {
+    while crate::sched::fault_kill_count() == kill_before
+        || crate::process::pid_root(b_pid).is_some()
+    {
         assert!(
             guard < 500_000,
             "ccsd: hart {tgt} read stale SHM (TLB not flushed)"

@@ -53,6 +53,10 @@ use crate::warn;
 
 /// 线程栈大小(16KB)。
 const THREAD_STACK_SIZE: usize = 16 * 1024;
+/// M3 T3:栈底守护页大小(4KB)。与 16KB 栈合计 20KB/次分配;分配后守护页
+/// 立即解映射(`alloc_free_stack`),内核线程栈溢出从"静默写坏相邻堆对象"
+/// 变为 S 模式页故障 fail-loudly。
+const STACK_GUARD_SIZE: usize = 4096;
 /// 时间片(tick 数,10 tick = 100ms)。
 const SLICE_TICKS: u64 = 10;
 /// 最大并发线程数(就绪队列按此预留容量 —— HIGH-5/审计 16 轮:
@@ -670,8 +674,9 @@ impl Scheduler {
         // memset —— 栈内容无需初始化(初始帧/上下文显式构造)。
         // V3 审计 #10:函数名不再误导为"zeroed"。
         let stack = alloc_free_stack();
-        // HIGH-4:sp 须 16 字节对齐(RISC-V ABI);堆指针仅保证 8 对齐。
-        let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
+        // HIGH-4:sp 须 16 字节对齐(RISC-V ABI);M3 T3 起栈顶 = 守护页
+        // 之上 16KB 顶端(见 KernelStack::sp)。
+        let sp = stack.sp();
         // 初始帧:sepc = 线程包装器,sstatus:SPIE=1(进线程后开中断)
         // + SPP=1(审计 17 轮:初始帧可能经**抢占路径 sret 首启**
         // (on_tick 选中未运行线程)—— SPP=0 会降入 U 模式,取指
@@ -835,11 +840,22 @@ fn __global_pointer() -> usize {
 
 /// 零化-free 线程栈(性能优化:免 16KB memset)。
 ///
-/// MED-8(审计 16 轮):Box<[u8]> 的 Drop 用 align=1 布局释放 ——
-/// 与分配时的 align=16 **不匹配(UB)**。自定义包装按同一布局
-/// (size=THREAD_STACK_SIZE, align=16)释放。
+/// M3 T3:布局改 20KB(16KB 栈 + 4KB 栈底守护页)、页对齐 —— 守护页须
+/// 与虚拟页边界重合才能精确解映射。`alloc` 返回指针对齐 4096(堆页路径
+/// 过量分配 + 对齐,见 heap.rs `page_alloc`),[ptr, ptr+4K) 恰为守护页。
+///
+/// MED-8(审计 16 轮):alloc/dealloc 必须用**同一 Layout**(size=20KB,
+/// align=4K),否则堆大对象路径按错 order 归还 buddy(UB)。自定义包装
+/// 持有该 Layout,防 Box<[u8]> 用 align=1 布局释放的旧缺陷回归。
 struct KernelStack {
     ptr: *mut u8,
+}
+
+impl KernelStack {
+    /// 栈顶(守护页之上 16KB 区域顶端,16 字节对齐 —— RISC-V ABI)。
+    fn sp(&self) -> usize {
+        (self.ptr as usize + THREAD_STACK_SIZE + STACK_GUARD_SIZE) & !0xF
+    }
 }
 
 // 含裸指针:单上下文调度下,指针生命周期由 Scheduler 管理 —— 安全。
@@ -847,16 +863,36 @@ unsafe impl Send for KernelStack {}
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let layout =
-            core::alloc::Layout::from_size_align(THREAD_STACK_SIZE, 16).expect("stack layout");
+        // M3 T3:**归还前恢复守护页身份映射**。内核恒经 VA==PA 访问物理页,
+        // 任何页被 buddy 取用都依赖既有身份映射(堆/页表页不自行映射);
+        // 守护页解映射只存在于栈生命周期内,释放前必须恢复 —— 否则该 PA
+        // 被重新分配后 memset 即页故障(bring-up 实测,见 mmu.rs
+        // `remap_kernel_4k` 注释)。恢复后以**同一 Layout** 归还 buddy
+        // (alloc/dealloc 布局不匹配为 UB,MED-8 审计 16 轮)。
+        let layout = core::alloc::Layout::from_size_align(
+            THREAD_STACK_SIZE + STACK_GUARD_SIZE,
+            crate::mem::PAGE_SIZE,
+        )
+        .expect("stack layout");
+        crate::mmu::remap_kernel_4k(crate::mmu::kernel_root(), self.ptr as usize)
+            .expect("kernel stack guard remap failed");
         unsafe { alloc::alloc::dealloc(self.ptr, layout) };
     }
 }
 
 fn alloc_free_stack() -> KernelStack {
-    let layout = core::alloc::Layout::from_size_align(THREAD_STACK_SIZE, 16).expect("stack layout");
+    let layout = core::alloc::Layout::from_size_align(
+        THREAD_STACK_SIZE + STACK_GUARD_SIZE,
+        crate::mem::PAGE_SIZE,
+    )
+    .expect("stack layout");
     let ptr = unsafe { alloc::alloc::alloc(layout) };
     assert!(!ptr.is_null(), "kernel heap: thread stack OOM");
+    // M3 T3:解映射栈底守护页。仅内核根表 —— 内核线程均 proc=None 运行
+    // 于内核根表(见 Thread.root),守卫生效;带 proc 内核线程的守护页传播
+    // 为残余局限(见 mmu.rs `split_superpage` 注释)。
+    crate::mmu::unmap_kernel_4k(crate::mmu::kernel_root(), ptr as usize)
+        .expect("kernel stack guard unmap failed");
     KernelStack { ptr }
 }
 
@@ -883,7 +919,7 @@ pub fn init() {
     for h in 0..MAX_HARTS {
         let idle_id = s.threads.len();
         let stack = alloc_free_stack();
-        let sp = (stack.ptr as usize + THREAD_STACK_SIZE) & !0xF;
+        let sp = stack.sp();
         let mut frame = [0usize; FRAME_WORDS];
         frame[FRAME_SEPC] = idle_entry as *const () as usize;
         frame[FRAME_SSTATUS] = (1 << 5) | (1 << 8); // SPIE | SPP
@@ -1998,6 +2034,28 @@ pub fn self_test() -> Result<(), &'static str> {
         return Err("PIP: donations not drained after pairing");
     }
     info!("M2 T2b: priority inheritance ok (PIP)");
+
+    // 8) M3 T3:内核线程栈守护页 —— 分配即解映射栈底 4KB,溢出写穿触发
+    //    S 模式页故障而非静默写坏相邻堆对象;栈区本身保持映射(顶部 16KB
+    //    供运行)。`drop` 归还前恢复守护页身份映射(见 KernelStack::drop),
+    //    下方两断言分别验证生命周期内解映射与归还后恢复。
+    let probe = alloc_free_stack();
+    let probe_guard = probe.ptr as usize;
+    let probe_body = probe.sp() - THREAD_STACK_SIZE; // 守护页之上(栈区首字节)
+    if crate::mmu::is_mapped(crate::mmu::kernel_root(), probe_guard) {
+        return Err("M3 T3: kernel thread stack guard not unmapped");
+    }
+    if !crate::mmu::is_mapped(crate::mmu::kernel_root(), probe_body) {
+        return Err("M3 T3: kernel thread stack body not mapped");
+    }
+    drop(probe);
+    // 归还后守护页须**恢复身份映射**(buddy 可能把该 PA 重新分配为页表页
+    // 等对象,内核恒经身份映射访问 —— 保持解映射会使其 memset 页故障,
+    // 见 KernelStack::drop / mmu::remap_kernel_4k 注释)。
+    if !crate::mmu::is_mapped(crate::mmu::kernel_root(), probe_guard) {
+        return Err("M3 T3: freed stack guard not remapped (identity mapping broken)");
+    }
+    info!("M3 T3: kernel thread stack guard page ok");
 
     Ok(())
 }

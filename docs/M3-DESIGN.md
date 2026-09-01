@@ -224,6 +224,7 @@ ISR 内零分配零日志,只取 SCHED 锁,不碰 TABLE/IPC):
 | 跨核 kill 死锁(SCHED 锁持有中发 IPI,远端 force_kill 取 SCHED) | 置位 + drop SCHED 后再 send_ipi;远端只取 SCHED 不取 TABLE/IPC |
 | force_kill 与 on_tick 竞态(同核 IPI vs 定时器) | SSIP 在 trap_handler 中先于 timer 分发;force_kill 与 on_tick 都只取 SCHED(同锁互斥) |
 | 内核线程栈守卫在进程根表失效(带 proc 内核线程) | M3-DESIGN 文档化残余局限:守卫只在内核根表生效,带 proc 内核线程运行于进程根表时守卫跨根表拆分传播延后(见 DEFERRED 关联) |
+| 守护页解映射破坏身份映射不变量(bring-up 实测) | 内核恒经 VA==PA 访问物理页,堆/页表页经 buddy 原样取用不自行映射;栈归还前必须 `remap_kernel_4k` 恢复守护页映射再 dealloc —— 否则该 PA 被复用为页表页后 memset 即 store page fault(实测 scause=0xf @ 守护 PA) |
 
 ## 关联登记
 
