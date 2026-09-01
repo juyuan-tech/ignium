@@ -303,6 +303,30 @@ pub fn clear_cap(pid: usize, slot: usize) -> Result<(), CapError> {
     result
 }
 
+/// M3-2:服务进程自报注册(syscall 10 `service_register` 的调用方)。
+///
+/// 原子性:TABLE 锁内校验进程存活 → 取 SERVICES 插入(`services::register_locked`)。
+/// 与 `destroy` 的 TABLE 锁串行化:服务进程销毁(槽失效 + 入 free 池)不会
+/// 与注册交错 —— 杜绝"注册于已亡进程 + pid 复用"竞态(注册条目持已亡/复用
+/// pid 令 connect 授给错误进程)。id 越界/已占用由 `register_locked` 判
+/// `-EINVAL`/`-EEXIST`;进程不存在 → `-EACCES`。
+pub fn register_service(pid: usize, id: usize) -> Result<(), usize> {
+    let irq = crate::arch::irq_save();
+    let result = {
+        let t = TABLE.lock();
+        // 进程存活校验(TABLE 锁内;destroy 的失效与此串行化)。
+        let alive = t.slots.get(pid).is_some_and(|p| p.id == pid);
+        if !alive {
+            Err(crate::syscall::SYS_ERR_EACCES)
+        } else {
+            // 持 TABLE 取 SERVICES(锁序 TABLE → SERVICES,不逆序)。
+            crate::services::register_locked(pid, id)
+        }
+    }; // TABLE 锁在此释放
+    crate::arch::irq_restore(irq);
+    result
+}
+
 /// 进程地址空间根表(**非 panic** 版)。
 ///
 /// syscall 路径的用户传入 pid(如 `mmap_share` 的对端)必须经本函数校验
@@ -371,10 +395,12 @@ pub fn destroy(pid: usize) {
                     let root = p.root;
                     p.id = usize::MAX;
                     p.caps = [None; MAX_CAPS];
-                    // M3-2:进程销毁时清设备 claim(设备页生命周期随进程)。
-                    // 锁序 TABLE → DEVICES(与 device::map 一致,不逆序);
-                    // 映射不在此解除,随 destroy_root(非分配器页只 unmap)。
+                    // M3-2:进程销毁时清设备 claim + 注销服务(生命周期随
+                    // 进程)。锁序 TABLE → DEVICES / TABLE → SERVICES(与
+                    // device::map / register_service 一致,不逆序);映射不在
+                    // 此解除,随 destroy_root(非分配器页只 unmap)。
                     crate::device::release_all(pid);
+                    crate::services::unregister_all_locked(pid);
                     t.free.push_back(pid);
                     Some(root)
                 }

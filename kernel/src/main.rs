@@ -32,6 +32,7 @@ mod panic;
 mod process;
 mod sbi;
 mod sched;
+mod services;
 mod shm;
 mod sync;
 mod syscall;

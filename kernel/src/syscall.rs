@@ -19,6 +19,12 @@ pub const SYSCALL_CAP_DUP: usize = 7;
 pub const SYSCALL_WRITE: usize = 8;
 /// M3 T1:`sys_read` 占位(本轮返回 -ENOSYS,号保留,见 SYSCALLS.md)。
 pub const SYSCALL_READ: usize = 9;
+/// M3-2:`service_register(id)` —— 服务进程自报注册(见 services.rs 与
+/// M3-DESIGN §10.3)。
+pub const SYSCALL_SERVICE_REGISTER: usize = 10;
+/// M3-2:`service_connect(id, client_slot, server_slot)` —— 客户端连接服务,
+/// 内核双向授予 `Cap::Proc`(见 services.rs 与 M3-DESIGN §10.3)。
+pub const SYSCALL_SERVICE_CONNECT: usize = 11;
 /// M3-2:`map_device(dev_id, va)` —— 白名单设备 MMIO 页以 U 权限映射进
 /// 调用进程(排他 claim;见 device.rs 与 M3-DESIGN §10.2)。
 pub const SYSCALL_MAP_DEVICE: usize = 12;
@@ -189,6 +195,47 @@ pub unsafe fn handle(frame: *mut usize) -> bool {
             unsafe { *frame.add(GPR_A0) = SYS_ERR_ENOSYS };
             unsafe { *frame.add(FRAME_SEPC) += 4 };
             false
+        }
+        SYSCALL_SERVICE_REGISTER => {
+            // a0=服务 id;成功 a0=0,失败负 errno(EINVAL/EEXIST/EACCES)。
+            // 注册原子性见 process::register_service(TABLE → SERVICES)。
+            let id = unsafe { *frame.add(GPR_A0) };
+            match crate::process::register_service(crate::sched::current_proc(), id) {
+                Ok(()) => {
+                    unsafe { *frame.add(GPR_A0) = 0 };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(code) => {
+                    unsafe { *frame.add(GPR_A0) = code };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
+        }
+        SYSCALL_SERVICE_CONNECT => {
+            // a0=id, a1=client 槽, a2=server 槽;成功 a0=0,失败负 errno
+            // (ENOENT/EACCES/EINVAL)。双向授予见 services::connect。
+            let id = unsafe { *frame.add(GPR_A0) };
+            let client_slot = unsafe { *frame.add(GPR_A1) };
+            let server_slot = unsafe { *frame.add(GPR_A2) };
+            match crate::services::connect(
+                crate::sched::current_proc(),
+                id,
+                client_slot,
+                server_slot,
+            ) {
+                Ok(()) => {
+                    unsafe { *frame.add(GPR_A0) = 0 };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+                Err(code) => {
+                    unsafe { *frame.add(GPR_A0) = code };
+                    unsafe { *frame.add(FRAME_SEPC) += 4 };
+                    false
+                }
+            }
         }
         SYSCALL_MAP_DEVICE => {
             // a0=dev_id, a1=va;成功 a0=0,失败负 errno。
